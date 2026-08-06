@@ -1,5 +1,9 @@
 #include "candle_ros2/md_node.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 MdNode::MdNode(const rclcpp::NodeOptions&   options,
                std::shared_ptr<mab::Candle> candle,
                const candleParams_S&        params)
@@ -58,6 +62,9 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     srvClose = this->create_service<candle_ros2::srv::Generic>(
         std::string(NODE_PREFIX) + "close_gripper",
         std::bind(&MdNode::cbCloseGripper, this, std::placeholders::_1, std::placeholders::_2));
+    srvSoftClose = this->create_service<candle_ros2::srv::SoftCloseGripper>(
+        std::string(NODE_PREFIX) + "soft_close_gripper",
+        std::bind(&MdNode::cbSoftCloseGripper, this, std::placeholders::_1, std::placeholders::_2));
 
     tmrPub = this->create_wall_timer(std::chrono::milliseconds(PUB_TIMER_MS),
                                      std::bind(&MdNode::publishJointStates, this));
@@ -72,6 +79,8 @@ MdNode::~MdNode()
 
 void MdNode::publishJointStates()
 {
+    tickSoftCloseJobs();
+
     sensor_msgs::msg::JointState msgJointStates;
 
     msgJointStates.name.reserve(m_mds.size());
@@ -124,6 +133,7 @@ void MdNode::cbMotionCmd(const candle_ros2::msg::MotionCmd& msg)
             RCLCPP_WARN(this->get_logger(),
                         "Failed to set Motion Command for drive with ID: %d",
                         msg.device_ids[i]);
+        clearErrorsIfAny(*md);
     }
     return;
 }
@@ -184,6 +194,7 @@ void MdNode::cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg)
                             msg.device_ids[i]);
             }
         }
+        clearErrorsIfAny(*md);
     }
     return;
 }
@@ -225,6 +236,7 @@ void MdNode::cbVelocityCmd(const candle_ros2::msg::VelocityPidCmd& msg)
                         "Failed to set Velocity PID parameters for drive with ID: %d",
                         msg.device_ids[i]);
         }
+        clearErrorsIfAny(*md);
     }
     return;
 }
@@ -262,6 +274,7 @@ void MdNode::cbImpedanceCmd(const candle_ros2::msg::ImpedanceCmd& msg)
                         "Failed to set Impedance parameters for drive with ID: %d",
                         msg.device_ids[i]);
         }
+        clearErrorsIfAny(*md);
     }
     return;
 }
@@ -280,6 +293,7 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
             continue;
         }
 
+        clearErrorsIfAny(md);
         m_mds.push_back(std::move(md));
         rsp->success.push_back(true);
     }
@@ -338,10 +352,9 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
             continue;
         }
 
-        if (md->zero() == mab::MD::Error_t::OK)
-            rsp->success.push_back(true);
-        else
-            rsp->success.push_back(false);
+        const bool ok = md->zero() == mab::MD::Error_t::OK;
+        clearErrorsIfAny(*md);
+        rsp->success.push_back(ok);
     }
     return;
 }
@@ -370,64 +383,202 @@ void MdNode::cbSetLimits(const std::shared_ptr<candle_ros2::srv::SetLimits::Requ
 
         mab::MDRegisters_S mdRegisters;
         mdRegisters.profileVelocity = req->velocity_limit[i];
-        mdRegisters.maxTorque = req->torque_limit[i];
-        if (md->writeRegisters(mdRegisters.profileVelocity,
-                       mdRegisters.maxTorque) == mab::MD::Error_t::OK)
-        {
-            rsp->success.push_back(true);
-        }
-        else
-        {
-            rsp->success.push_back(false);
-        }
+        mdRegisters.maxTorque       = req->torque_limit[i];
+        const bool ok =
+            md->writeRegisters(mdRegisters.profileVelocity, mdRegisters.maxTorque) ==
+            mab::MD::Error_t::OK;
+        clearErrorsIfAny(*md);
+        rsp->success.push_back(ok);
     }
     return;
 }
 
-bool MdNode::moveGripper(mab::MD& md, double targetPos)
+bool MdNode::configureGripper(mab::MD& md)
 {
+    if (m_gripperConfigured.count(md.m_canId) != 0)
+        return true;
+
     if (md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK)
     {
-        RCLCPP_WARN(this->get_logger(), "Failed to set IMPEDANCE mode for drive with ID: %d", md.m_canId);
-        return false;
-    }
-
-    mab::MDRegisters_S impedanceRegs;
-    impedanceRegs.motorImpPidKp = IMP_KP;
-    impedanceRegs.motorImpPidKd = IMP_KD;
-    impedanceRegs.maxTorque     = IMP_MAX_OUTPUT;
-    if (md.writeRegisters(impedanceRegs.motorImpPidKp,
-                          impedanceRegs.motorImpPidKd,
-                          impedanceRegs.maxTorque) != mab::MD::Error_t::OK)
-    {
-        RCLCPP_WARN(this->get_logger(), "Failed to set impedance gains for drive with ID: %d", md.m_canId);
-        return false;
-    }
-
-    mab::MDRegisters_S limitRegs;
-    limitRegs.profileVelocity = IMP_MAX_OUTPUT;
-    limitRegs.maxTorque       = IMP_MAX_OUTPUT;
-    if (md.writeRegisters(limitRegs.profileVelocity, limitRegs.maxTorque) != mab::MD::Error_t::OK)
-    {
-        RCLCPP_WARN(this->get_logger(), "Failed to set limits for drive with ID: %d", md.m_canId);
-        return false;
-    }
-
-    mab::MDRegisters_S motionRegs;
-    motionRegs.targetPosition = targetPos;
-    motionRegs.targetVelocity = 0.0;
-    motionRegs.targetTorque   = 0.0;
-    if (md.writeRegisters(motionRegs.targetPosition,
-                          motionRegs.targetVelocity,
-                          motionRegs.targetTorque) != mab::MD::Error_t::OK)
-    {
         RCLCPP_WARN(this->get_logger(),
-                    "Failed to set target position for drive with ID: %d",
+                    "Failed to set IMPEDANCE mode for drive with ID: %d",
                     md.m_canId);
         return false;
     }
 
+    mab::MDRegisters_S regs;
+    regs.motorImpPidKp = IMP_KP;
+    regs.motorImpPidKd = IMP_KD;
+    regs.maxTorque     = IMP_MAX_OUTPUT;
+    if (md.writeRegisters(regs.motorImpPidKp, regs.motorImpPidKd, regs.maxTorque) !=
+        mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to set impedance gains for drive with ID: %d",
+                    md.m_canId);
+        return false;
+    }
+
+    m_gripperConfigured.insert(md.m_canId);
     return true;
+}
+
+bool MdNode::writeImpedanceKd(mab::MD& md, float kd)
+{
+    mab::MDRegisters_S regs;
+    regs.motorImpPidKd = kd;
+    if (md.writeRegisters(regs.motorImpPidKd) != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to set impedance kd for drive with ID: %d",
+                    md.m_canId);
+        return false;
+    }
+    return true;
+}
+
+void MdNode::cancelSoftClose(u16 id)
+{
+    auto it = m_softCloseJobs.find(id);
+    if (it == m_softCloseJobs.end())
+        return;
+
+    auto md = findMd(m_mds, id);
+    if (md != m_mds.end())
+        writeImpedanceKd(*md, IMP_KD);
+
+    m_softCloseJobs.erase(it);
+}
+
+double MdNode::fingerGapToMotorPos(double gapMm)
+{
+    constexpr double deg2rad = M_PI / 180.0;
+
+    const double distMin =
+        AXIS_SPACING_MM - 2.0 * FINGER_LENGTH_MM * std::cos(KAT_MIN_DEG * deg2rad);
+    const double distMax =
+        AXIS_SPACING_MM - 2.0 * FINGER_LENGTH_MM * std::cos(KAT_MAX_DEG * deg2rad);
+
+    double angleDeg = 0.0;
+    if (gapMm < distMin)
+    {
+        angleDeg = KAT_MIN_DEG;
+    }
+    else if (gapMm > distMax)
+    {
+        angleDeg = KAT_MAX_DEG;
+    }
+    else
+    {
+        const double cosVal = (AXIS_SPACING_MM - gapMm) / (2.0 * FINGER_LENGTH_MM);
+        const double clamped = std::clamp(cosVal, -1.0, 1.0);
+        angleDeg             = std::acos(clamped) / deg2rad;
+    }
+
+    return (KAT_MAX_DEG - angleDeg) / (KAT_MAX_DEG - KAT_MIN_DEG) * CLOSED_POS;
+}
+
+bool MdNode::moveGripper(mab::MD& md, double targetPos)
+{
+    // Mode/gains only once — open/close should just update the target (1 CAN write).
+    if (!configureGripper(md))
+    {
+        clearErrorsIfAny(md);
+        return false;
+    }
+
+    const bool ok = md.setTargetPosition(static_cast<float>(targetPos)) == mab::MD::Error_t::OK;
+    if (!ok)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to set target position for drive with ID: %d",
+                    md.m_canId);
+    }
+
+    clearErrorsIfAny(md);
+    return ok;
+}
+
+void MdNode::tickSoftCloseJobs()
+{
+    if (m_softCloseJobs.empty())
+        return;
+
+    const auto now = this->now();
+    std::vector<u16> finished;
+
+    for (auto& [id, job] : m_softCloseJobs)
+    {
+        auto md = findMd(m_mds, id);
+        if (md == m_mds.end())
+        {
+            finished.push_back(id);
+            continue;
+        }
+
+        const auto [pos, posErr] = md->getPosition();
+        if (posErr != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                *this->get_clock(),
+                                1000,
+                                "Soft-close: failed to read position for drive %d",
+                                id);
+            continue;
+        }
+
+        const bool timedOut =
+            (now - job.stageStart) > rclcpp::Duration(std::chrono::milliseconds(STAGE_TIMEOUT_MS));
+
+        if (job.stage == SoftCloseStage::Fast)
+        {
+            if (std::abs(static_cast<double>(pos) - job.preClosePos) < PRE_CLOSE_TOL_RAD ||
+                timedOut)
+            {
+                if (timedOut)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Soft-close fast stage timed out for drive %d — starting slow stage",
+                                id);
+                }
+
+                if (!writeImpedanceKd(*md, SLOW_IMP_KD) ||
+                    md->setTargetPosition(static_cast<float>(CLOSED_POS)) != mab::MD::Error_t::OK)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Soft-close: failed to start slow stage for drive %d",
+                                id);
+                    writeImpedanceKd(*md, IMP_KD);
+                    clearErrorsIfAny(*md);
+                    finished.push_back(id);
+                    continue;
+                }
+
+                clearErrorsIfAny(*md);
+                job.stage      = SoftCloseStage::Slow;
+                job.stageStart = now;
+            }
+        }
+        else  // SoftCloseStage::Slow
+        {
+            if (std::abs(static_cast<double>(pos) - CLOSED_POS) < PRE_CLOSE_TOL_RAD || timedOut)
+            {
+                if (timedOut)
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Soft-close slow stage timed out for drive %d",
+                                id);
+                }
+
+                writeImpedanceKd(*md, IMP_KD);
+                clearErrorsIfAny(*md);
+                finished.push_back(id);
+            }
+        }
+    }
+
+    for (u16 id : finished)
+        m_softCloseJobs.erase(id);
 }
 
 void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
@@ -445,6 +596,7 @@ void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Requ
             continue;
         }
 
+        cancelSoftClose(id);
         rsp->success.push_back(moveGripper(*md, OPEN_POS));
     }
 }
@@ -464,7 +616,46 @@ void MdNode::cbCloseGripper(const std::shared_ptr<candle_ros2::srv::Generic::Req
             continue;
         }
 
+        cancelSoftClose(id);
         rsp->success.push_back(moveGripper(*md, CLOSED_POS));
+    }
+}
+
+void MdNode::cbSoftCloseGripper(
+    const std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Request> req,
+    std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Response>      rsp)
+{
+    rsp->success.reserve(req->device_ids.size());
+
+    const double preClosePos = fingerGapToMotorPos(static_cast<double>(req->pre_close_gap_mm));
+
+    for (auto id : req->device_ids)
+    {
+        auto md = findMd(m_mds, id);
+        if (md == m_mds.end())
+        {
+            RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", id);
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        cancelSoftClose(id);
+
+        // Ensure default (fast) kd before the rapid approach stage.
+        if (!configureGripper(*md) || !writeImpedanceKd(*md, IMP_KD) ||
+            md->setTargetPosition(static_cast<float>(preClosePos)) != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Soft-close: failed to start fast stage for drive %d",
+                        id);
+            clearErrorsIfAny(*md);
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        clearErrorsIfAny(*md);
+        m_softCloseJobs[id] = SoftCloseJob{SoftCloseStage::Fast, preClosePos, this->now()};
+        rsp->success.push_back(true);
     }
 }
 
@@ -510,10 +701,9 @@ void MdNode::cbSetMode(const std::shared_ptr<candle_ros2::srv::SetMode::Request>
             continue;
         }
 
-        if (md->setMotionMode(mode) == mab::MD::Error_t::OK)
-            rsp->success.push_back(true);
-        else
-            rsp->success.push_back(false);
+        const bool ok = md->setMotionMode(mode) == mab::MD::Error_t::OK;
+        clearErrorsIfAny(*md);
+        rsp->success.push_back(ok);
     }
     return;
 }
@@ -532,10 +722,9 @@ void MdNode::cbEnable(const std::shared_ptr<candle_ros2::srv::Generic::Request> 
             continue;
         }
 
-        if (md->enable() == mab::MD::Error_t::OK)
-            rsp->success.push_back(true);
-        else
-            rsp->success.push_back(false);
+        const bool ok = md->enable() == mab::MD::Error_t::OK;
+        clearErrorsIfAny(*md);
+        rsp->success.push_back(ok);
     }
     return;
 }
@@ -554,12 +743,50 @@ void MdNode::cbDisable(const std::shared_ptr<candle_ros2::srv::Generic::Request>
             continue;
         }
 
-        if (md->disable() == mab::MD::Error_t::OK)
-            rsp->success.push_back(true);
-        else
-            rsp->success.push_back(false);
+        const bool ok = md->disable() == mab::MD::Error_t::OK;
+        if (ok)
+        {
+            // MD clears motion mode on disable — force reconfigure on next gripper move
+            m_softCloseJobs.erase(id);
+            m_gripperConfigured.erase(id);
+        }
+        clearErrorsIfAny(*md);
+        rsp->success.push_back(ok);
     }
     return;
+}
+
+void MdNode::clearErrorsIfAny(mab::MD& md)
+{
+    using QS = mab::MDStatus::QuickStatusBits;
+
+    const auto [status, err] = md.getQuickStatus();
+    if (err != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to read quick status for drive with ID: %d",
+                    md.m_canId);
+        return;
+    }
+
+    const bool hasFault = status.at(QS::MainEncoderStatus) || status.at(QS::OutputEncoderStatus) ||
+                          status.at(QS::CalibrationEncoderStatus) ||
+                          status.at(QS::MosfetBridgeStatus) || status.at(QS::HardwareStatus) ||
+                          status.at(QS::MotionStatus);
+
+    if (!hasFault)
+        return;
+
+    RCLCPP_WARN(this->get_logger(),
+                "Drive with ID: %d reported errors — clearing via MD::clearErrors()",
+                md.m_canId);
+
+    if (md.clearErrors() != mab::MD::Error_t::OK)
+    {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Failed to clear errors on drive with ID: %d",
+                     md.m_canId);
+    }
 }
 
 std::vector<mab::MD>::iterator MdNode::findMd(std::vector<mab::MD>& mds, u16 id)

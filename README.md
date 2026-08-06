@@ -77,7 +77,7 @@ ros2 launch candle_ros2 md_node_launch.py bus:=SPI data_rate:=5M
 ## Example MD service calls - GRIPPER CONTROL
 
 Bring up one or more drives (add → set mode → zero → enable), then open or close the gripper.
-`init_devices` applies the same mode to all listed IDs. Gripper open/close use the impedance gains and positions defined in `md_node.hpp` (`IMP_KP`, `IMP_KD`, `IMP_MAX_OUTPUT`, `OPEN_POS`, `CLOSED_POS`).
+`init_devices` applies the same mode to all listed IDs. Gripper open/close use the impedance gains and positions defined in `md_node.hpp` (`IMP_KP`, `IMP_KD`, `IMP_MAX_OUTPUT`, `OPEN_POS`, `CLOSED_POS`). Mode/gains are applied once on the first open/close; later calls only write the target position. Raise `IMP_KP` if the motion itself feels soft/slow.
 
 ```bash
 # Bring up device 343 in impedance mode
@@ -87,6 +87,10 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
 # Close / open gripper
 ros2 service call /md/close_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
 ros2 service call /md/open_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
+
+# Soft close: fast to pre-close finger gap [mm], then slow (higher kd) to full close
+ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
+  "{device_ids: [343], pre_close_gap_mm: 25.0}"
 
 # Optional: set impedance gains explicitly (overwritten again by open/close)
 ros2 topic pub /md/impedance_command candle_ros2/msg/ImpedanceCmd \

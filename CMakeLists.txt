@@ -44,6 +44,7 @@ set(srv_files
   "srv/InitDevices.srv"
   "srv/SetLimits.srv"
   "srv/SetMode.srv"
+  "srv/SoftCloseGripper.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
