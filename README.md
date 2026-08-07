@@ -94,14 +94,19 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
 ros2 service call /md/close_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
 ros2 service call /md/open_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
 
-# Soft close: controlled fast move, hold at pre-close, then slow move after 500 ms
+# Soft close: POSITION_PROFILE fast move, then slow profile after 500 ms
 ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
   "{device_ids: [343], pre_close_gap_mm: 25.0}"
 
-# Optional soft-close tuning
+# Soft-close tuning example; the next /md/init_devices call also zeros the drive
 ros2 launch candle_ros2 md_node_launch.py \
-  soft_close_fast_kp:=5.0 \
-  soft_close_slow_kd:=0.10
+  soft_close_fast_velocity_rad_s:=10.0 \
+  soft_close_slow_velocity_rad_s:=2.6 \
+  soft_close_fast_torque_limit_nm:=4.0 \
+  soft_close_slow_torque_limit_nm:=4.0 \
+  soft_close_profile_acceleration_rad_s2:=20.0 \
+  soft_close_profile_deceleration_rad_s2:=30.0 \
+  init_devices_zero:=true
 
 # Optional: set impedance gains explicitly (overwritten again by open/close)
 ros2 topic pub /md/impedance_command candle_ros2/msg/ImpedanceCmd \
@@ -132,11 +137,10 @@ Relevant MD-node parameters are:
 - `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
 - `gripper_velocity_limit_rad_s` (`3.5`)
 - `gripper_torque_limit_nm` (`4.0`)
-- `soft_close_fast_kp` / `soft_close_fast_kd` (`6.0` / `0.05`)
-- `soft_close_slow_kp` / `soft_close_slow_kd` (`20.0` / `0.12`)
-- `soft_close_fast_tol_rad` (`0.015`)
+- `soft_close_fast_velocity_rad_s` / `soft_close_slow_velocity_rad_s` (`2.0` / `0.3`)
+- `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`3.0` / `3.0`)
+- `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`5.0` / `5.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
-- `soft_close_target_offset_rad` (`0.05`) — slow-stage overtravel that maintains closing force
 - `soft_close_fast_duration_ms` (`500`) — slow stage starts this long after the request
 - `init_devices_zero` (`false`)
 - `home_impedance_kp` / `home_impedance_kd` (`4.0` / `0.05`)
@@ -149,6 +153,11 @@ Relevant MD-node parameters are:
 - `home_stall_hold_ms` (`300`)
 - `home_timeout_ms` (`8000`)
 - `home_poll_ms` (`20`)
+
+Soft close uses the position and velocity PID gains stored in the drive. The
+service rejects the request when either position Kp or velocity Kp is not
+configured. It applies hard position limits between the configured open and
+closed positions and does not use target overtravel.
 
 ## Documentation
 

@@ -35,13 +35,13 @@ def generate_launch_description():
         DeclareLaunchArgument("gripper_impedance_kd", default_value="0.05"),
         DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="3.5"),
         DeclareLaunchArgument("gripper_torque_limit_nm", default_value="4.0"),
-        DeclareLaunchArgument("soft_close_fast_kp", default_value="6.0"),
-        DeclareLaunchArgument("soft_close_fast_kd", default_value="0.05"),
-        DeclareLaunchArgument("soft_close_slow_kp", default_value="20.0"),
-        DeclareLaunchArgument("soft_close_slow_kd", default_value="0.12"),
-        DeclareLaunchArgument("soft_close_fast_tol_rad", default_value="0.015"),
+        DeclareLaunchArgument("soft_close_fast_velocity_rad_s", default_value="2.0"),
+        DeclareLaunchArgument("soft_close_slow_velocity_rad_s", default_value="0.3"),
+        DeclareLaunchArgument("soft_close_fast_torque_limit_nm", default_value="3.0"),
+        DeclareLaunchArgument("soft_close_slow_torque_limit_nm", default_value="3.0"),
+        DeclareLaunchArgument("soft_close_profile_acceleration_rad_s2", default_value="5.0"),
+        DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="5.0"),
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
-        DeclareLaunchArgument("soft_close_target_offset_rad", default_value="0.05"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="500"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
         DeclareLaunchArgument("home_impedance_kp", default_value="4.0"),
@@ -103,26 +103,32 @@ def generate_launch_description():
                         "gripper_torque_limit_nm": ParameterValue(
                             LaunchConfiguration("gripper_torque_limit_nm"), value_type=float
                         ),
-                        "soft_close_fast_kp": ParameterValue(
-                            LaunchConfiguration("soft_close_fast_kp"), value_type=float
+                        "soft_close_fast_velocity_rad_s": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_velocity_rad_s"),
+                            value_type=float,
                         ),
-                        "soft_close_fast_kd": ParameterValue(
-                            LaunchConfiguration("soft_close_fast_kd"), value_type=float
+                        "soft_close_slow_velocity_rad_s": ParameterValue(
+                            LaunchConfiguration("soft_close_slow_velocity_rad_s"),
+                            value_type=float,
                         ),
-                        "soft_close_slow_kp": ParameterValue(
-                            LaunchConfiguration("soft_close_slow_kp"), value_type=float
+                        "soft_close_fast_torque_limit_nm": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_torque_limit_nm"),
+                            value_type=float,
                         ),
-                        "soft_close_slow_kd": ParameterValue(
-                            LaunchConfiguration("soft_close_slow_kd"), value_type=float
+                        "soft_close_slow_torque_limit_nm": ParameterValue(
+                            LaunchConfiguration("soft_close_slow_torque_limit_nm"),
+                            value_type=float,
                         ),
-                        "soft_close_fast_tol_rad": ParameterValue(
-                            LaunchConfiguration("soft_close_fast_tol_rad"), value_type=float
+                        "soft_close_profile_acceleration_rad_s2": ParameterValue(
+                            LaunchConfiguration("soft_close_profile_acceleration_rad_s2"),
+                            value_type=float,
+                        ),
+                        "soft_close_profile_deceleration_rad_s2": ParameterValue(
+                            LaunchConfiguration("soft_close_profile_deceleration_rad_s2"),
+                            value_type=float,
                         ),
                         "soft_close_closed_tol_rad": ParameterValue(
                             LaunchConfiguration("soft_close_closed_tol_rad"), value_type=float
-                        ),
-                        "soft_close_target_offset_rad": ParameterValue(
-                            LaunchConfiguration("soft_close_target_offset_rad"), value_type=float
                         ),
                         "soft_close_fast_duration_ms": ParameterValue(
                             LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int

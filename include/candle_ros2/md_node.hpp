@@ -28,6 +28,7 @@
 /* CANdle-SDK */
 #include "candle.hpp"
 #include "MD.hpp"
+#include "MDStatus.hpp"
 
 class MdNode : public rclcpp::Node
 {
@@ -41,7 +42,6 @@ class MdNode : public rclcpp::Node
     enum class SoftCloseStage
     {
         Fast,
-        Hold,
         Slow
     };
 
@@ -72,13 +72,13 @@ class MdNode : public rclcpp::Node
     float       gripperImpedanceKd;
     float       gripperVelocityLimitRadS;
     float       gripperTorqueLimitNm;
-    float       softCloseFastKp;
-    float       softCloseFastKd;
-    float       softCloseSlowKp;
-    float       softCloseSlowKd;
-    double      softCloseFastTolRad;
+    float       softCloseFastVelocityRadS;
+    float       softCloseSlowVelocityRadS;
+    float       softCloseFastTorqueLimitNm;
+    float       softCloseSlowTorqueLimitNm;
+    float       softCloseProfileAccelerationRadS2;
+    float       softCloseProfileDecelerationRadS2;
     double      softCloseClosedTolRad;
-    double      softCloseTargetOffsetRad;
     int         softCloseFastDurationMs;
     bool        initDevicesZero;
 
@@ -156,6 +156,8 @@ class MdNode : public rclcpp::Node
 
     bool configureGripper(
         mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit);
+    bool profilePidReady(mab::MD& md);
+    bool configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
     bool moveGripper(mab::MD& md, double targetPos);
     bool restoreNormalGripperConfig(mab::MD& md);

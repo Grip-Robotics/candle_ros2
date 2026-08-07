@@ -21,13 +21,15 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       gripperImpedanceKd(static_cast<float>(params.gripper_impedance_kd)),
       gripperVelocityLimitRadS(static_cast<float>(params.gripper_velocity_limit_rad_s)),
       gripperTorqueLimitNm(static_cast<float>(params.gripper_torque_limit_nm)),
-      softCloseFastKp(static_cast<float>(params.soft_close_fast_kp)),
-      softCloseFastKd(static_cast<float>(params.soft_close_fast_kd)),
-      softCloseSlowKp(static_cast<float>(params.soft_close_slow_kp)),
-      softCloseSlowKd(static_cast<float>(params.soft_close_slow_kd)),
-      softCloseFastTolRad(params.soft_close_fast_tol_rad),
+      softCloseFastVelocityRadS(static_cast<float>(params.soft_close_fast_velocity_rad_s)),
+      softCloseSlowVelocityRadS(static_cast<float>(params.soft_close_slow_velocity_rad_s)),
+      softCloseFastTorqueLimitNm(static_cast<float>(params.soft_close_fast_torque_limit_nm)),
+      softCloseSlowTorqueLimitNm(static_cast<float>(params.soft_close_slow_torque_limit_nm)),
+      softCloseProfileAccelerationRadS2(
+          static_cast<float>(params.soft_close_profile_acceleration_rad_s2)),
+      softCloseProfileDecelerationRadS2(
+          static_cast<float>(params.soft_close_profile_deceleration_rad_s2)),
       softCloseClosedTolRad(params.soft_close_closed_tol_rad),
-      softCloseTargetOffsetRad(params.soft_close_target_offset_rad),
       softCloseFastDurationMs(params.soft_close_fast_duration_ms),
       initDevicesZero(params.init_devices_zero),
       homeImpedanceKp(static_cast<float>(params.home_impedance_kp)),
@@ -51,13 +53,15 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         !std::isfinite(gripperImpedanceKd) || gripperImpedanceKd < 0.0f ||
         !std::isfinite(gripperVelocityLimitRadS) || gripperVelocityLimitRadS <= 0.0f ||
         !std::isfinite(gripperTorqueLimitNm) || gripperTorqueLimitNm <= 0.0f ||
-        !std::isfinite(softCloseFastKp) || softCloseFastKp < 0.0f ||
-        !std::isfinite(softCloseFastKd) || softCloseFastKd < 0.0f ||
-        !std::isfinite(softCloseSlowKp) || softCloseSlowKp < 0.0f ||
-        !std::isfinite(softCloseSlowKd) || softCloseSlowKd < 0.0f ||
-        !std::isfinite(softCloseFastTolRad) || softCloseFastTolRad <= 0.0 ||
+        !std::isfinite(softCloseFastVelocityRadS) || softCloseFastVelocityRadS <= 0.0f ||
+        !std::isfinite(softCloseSlowVelocityRadS) || softCloseSlowVelocityRadS <= 0.0f ||
+        !std::isfinite(softCloseFastTorqueLimitNm) || softCloseFastTorqueLimitNm <= 0.0f ||
+        !std::isfinite(softCloseSlowTorqueLimitNm) || softCloseSlowTorqueLimitNm <= 0.0f ||
+        !std::isfinite(softCloseProfileAccelerationRadS2) ||
+        softCloseProfileAccelerationRadS2 <= 0.0f ||
+        !std::isfinite(softCloseProfileDecelerationRadS2) ||
+        softCloseProfileDecelerationRadS2 <= 0.0f ||
         !std::isfinite(softCloseClosedTolRad) || softCloseClosedTolRad <= 0.0 ||
-        !std::isfinite(softCloseTargetOffsetRad) || softCloseTargetOffsetRad < 0.0 ||
         softCloseFastDurationMs <= 0 ||
         !std::isfinite(homeImpedanceKp) || homeImpedanceKp < 0.0f ||
         !std::isfinite(homeImpedanceKd) || homeImpedanceKd < 0.0f ||
@@ -231,15 +235,15 @@ void MdNode::cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg)
         }
 
         mab::MDRegisters_S mdRegisters;
-        mdRegisters.motorVelPidKp     = msg.position_pid[i].kp;
-        mdRegisters.motorVelPidKi     = msg.position_pid[i].ki;
-        mdRegisters.motorVelPidKd     = msg.position_pid[i].kd;
-        mdRegisters.motorVelPidWindup = msg.position_pid[i].i_windup;
+        mdRegisters.motorPosPidKp     = msg.position_pid[i].kp;
+        mdRegisters.motorPosPidKi     = msg.position_pid[i].ki;
+        mdRegisters.motorPosPidKd     = msg.position_pid[i].kd;
+        mdRegisters.motorPosPidWindup = msg.position_pid[i].i_windup;
         mdRegisters.profileVelocity   = msg.position_pid[i].max_output;
-        if (md->writeRegisters(mdRegisters.motorVelPidKp,
-                               mdRegisters.motorVelPidKi,
-                               mdRegisters.motorVelPidKd,
-                               mdRegisters.motorVelPidWindup,
+        if (md->writeRegisters(mdRegisters.motorPosPidKp,
+                               mdRegisters.motorPosPidKi,
+                               mdRegisters.motorPosPidKd,
+                               mdRegisters.motorPosPidWindup,
                                mdRegisters.profileVelocity) != mab::MD::Error_t::OK)
         {
             RCLCPP_WARN(this->get_logger(),
@@ -535,6 +539,103 @@ bool MdNode::configureGripper(
     return true;
 }
 
+bool MdNode::profilePidReady(mab::MD& md)
+{
+    mab::MDRegisters_S regs;
+    if (md.readRegisters(regs.motorPosPidKp,
+                         regs.motorPosPidKi,
+                         regs.motorPosPidKd,
+                         regs.motorPosPidWindup) != mab::MD::Error_t::OK ||
+        md.readRegisters(regs.motorVelPidKp,
+                         regs.motorVelPidKi,
+                         regs.motorVelPidKd,
+                         regs.motorVelPidWindup) != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: failed to read profile PID gains for drive %d",
+                    md.m_canId);
+        return false;
+    }
+
+    const bool finite =
+        std::isfinite(regs.motorPosPidKp.value) && std::isfinite(regs.motorPosPidKi.value) &&
+        std::isfinite(regs.motorPosPidKd.value) && std::isfinite(regs.motorPosPidWindup.value) &&
+        std::isfinite(regs.motorVelPidKp.value) && std::isfinite(regs.motorVelPidKi.value) &&
+        std::isfinite(regs.motorVelPidKd.value) && std::isfinite(regs.motorVelPidWindup.value);
+    if (!finite || regs.motorPosPidKp.value <= 0.0f || regs.motorVelPidKp.value <= 0.0f)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: POSITION_PROFILE PID is not configured for drive %d "
+                    "(position kp=%.3f, velocity kp=%.3f)",
+                    md.m_canId,
+                    regs.motorPosPidKp.value,
+                    regs.motorVelPidKp.value);
+        return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+                "Soft-close PID drive %d: position[kp=%.3f ki=%.3f kd=%.3f windup=%.3f] "
+                "velocity[kp=%.3f ki=%.3f kd=%.3f windup=%.3f]",
+                md.m_canId,
+                regs.motorPosPidKp.value,
+                regs.motorPosPidKi.value,
+                regs.motorPosPidKd.value,
+                regs.motorPosPidWindup.value,
+                regs.motorVelPidKp.value,
+                regs.motorVelPidKi.value,
+                regs.motorVelPidKd.value,
+                regs.motorVelPidWindup.value);
+
+    return true;
+}
+
+bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit)
+{
+    mab::MDRegisters_S regs;
+    regs.positionLimitMin = static_cast<float>(
+        std::min(gripperOpenPositionRad, gripperClosedPositionRad));
+    regs.positionLimitMax = static_cast<float>(
+        std::max(gripperOpenPositionRad, gripperClosedPositionRad));
+    regs.maxTorque = static_cast<float>(torqueLimit);
+    if (md.writeRegisters(regs.positionLimitMin, regs.positionLimitMax, regs.maxTorque) !=
+        mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: failed to set position/torque limits for drive %d",
+                    md.m_canId);
+        return false;
+    }
+
+    regs.maxVelocity     = static_cast<float>(velocityLimit);
+    regs.maxAcceleration = softCloseProfileAccelerationRadS2;
+    regs.maxDeceleration = softCloseProfileDecelerationRadS2;
+    if (md.writeRegisters(regs.maxVelocity, regs.maxAcceleration, regs.maxDeceleration) !=
+        mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: failed to set global profile limits for drive %d",
+                    md.m_canId);
+        return false;
+    }
+
+    regs.profileVelocity     = static_cast<float>(velocityLimit);
+    regs.profileAcceleration = softCloseProfileAccelerationRadS2;
+    regs.profileDeceleration = softCloseProfileDecelerationRadS2;
+    regs.positionWindow      = static_cast<float>(softCloseClosedTolRad);
+    if (md.writeRegisters(regs.profileVelocity,
+                          regs.profileAcceleration,
+                          regs.profileDeceleration,
+                          regs.positionWindow) != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: failed to configure position profile for drive %d",
+                    md.m_canId);
+        return false;
+    }
+
+    return true;
+}
+
 bool MdNode::setGripperTarget(mab::MD& md, double targetPos)
 {
     mab::MDRegisters_S motionRegs;
@@ -571,7 +672,8 @@ bool MdNode::moveGripper(mab::MD& md, double targetPos)
 
 bool MdNode::restoreNormalGripperConfig(mab::MD& md)
 {
-    return configureGripper(md,
+    return md.setMotionMode(mab::MdMode_E::IMPEDANCE) == mab::MD::Error_t::OK &&
+           configureGripper(md,
                             gripperImpedanceKp,
                             gripperImpedanceKd,
                             gripperVelocityLimitRadS,
@@ -586,7 +688,12 @@ void MdNode::cancelSoftClose(u16 id)
 
     auto md = findMd(m_mds, id);
     if (md != m_mds.end())
+    {
+        const auto [position, err] = md->getPosition();
+        if (err == mab::MD::Error_t::OK)
+            setGripperTarget(*md, static_cast<double>(position));
         restoreNormalGripperConfig(*md);
+    }
 
     m_softCloseJobs.erase(it);
 }
@@ -606,7 +713,7 @@ void MdNode::tickSoftCloseJobs()
     if (m_softCloseJobs.empty())
         return;
 
-    const auto       now = this->now();
+    const auto     now = this->now();
     std::vector<u16> finished;
 
     for (auto& [id, job] : m_softCloseJobs)
@@ -623,17 +730,9 @@ void MdNode::tickSoftCloseJobs()
 
         if (job.stage != SoftCloseStage::Slow && (now - job.requestStart) >= fastDuration)
         {
-            const double closeDirection =
-                gripperClosedPositionRad >= gripperOpenPositionRad ? 1.0 : -1.0;
-            const double slowTarget =
-                gripperClosedPositionRad + closeDirection * softCloseTargetOffsetRad;
-
-            if (!configureGripper(*md,
-                                  softCloseSlowKp,
-                                  softCloseSlowKd,
-                                  gripperVelocityLimitRadS,
-                                  gripperTorqueLimitNm) ||
-                !setGripperTarget(*md, slowTarget))
+            if (!configurePositionProfile(
+                    *md, softCloseSlowVelocityRadS, softCloseSlowTorqueLimitNm) ||
+                !setGripperTarget(*md, gripperClosedPositionRad))
             {
                 RCLCPP_WARN(this->get_logger(),
                             "Soft-close: failed to start slow stage for drive %d",
@@ -646,15 +745,14 @@ void MdNode::tickSoftCloseJobs()
             job.stage          = SoftCloseStage::Slow;
             job.slowStageStart = now;
             RCLCPP_INFO(this->get_logger(),
-                        "Soft-close: drive %d entered slow stage after %d ms, target=%.3f rad",
+                        "Soft-close: drive %d entered slow profile after %d ms "
+                        "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
                         id,
                         softCloseFastDurationMs,
-                        slowTarget);
+                        softCloseSlowVelocityRadS,
+                        softCloseSlowTorqueLimitNm);
             continue;
         }
-
-        if (job.stage == SoftCloseStage::Hold)
-            continue;
 
         const auto [pos, posErr] = md->getPosition();
         if (posErr != mab::MD::Error_t::OK)
@@ -681,32 +779,19 @@ void MdNode::tickSoftCloseJobs()
                              static_cast<double>(md->getTorque().first));
 
         if (job.stage == SoftCloseStage::Fast)
-        {
-            if (std::abs(static_cast<double>(pos) - job.preClosePos) < softCloseFastTolRad)
-            {
-                if (!restoreNormalGripperConfig(*md) || !setGripperTarget(*md, job.preClosePos))
-                {
-                    RCLCPP_WARN(this->get_logger(),
-                                "Soft-close: failed to enter hold stage for drive %d",
-                                id);
-                    restoreNormalGripperConfig(*md);
-                    finished.push_back(id);
-                    continue;
-                }
-
-                job.stage = SoftCloseStage::Hold;
-                RCLCPP_INFO(this->get_logger(),
-                            "Soft-close: drive %d reached pre-close target and entered hold",
-                            id);
-            }
             continue;
-        }
 
         const bool slowTimedOut =
             (now - job.slowStageStart) >
             rclcpp::Duration(std::chrono::milliseconds(SLOW_STAGE_TIMEOUT_MS));
+        const auto [quickStatus, statusErr] = md->getQuickStatus();
+        const bool statusReached =
+            statusErr == mab::MD::Error_t::OK &&
+            (now - job.slowStageStart) > rclcpp::Duration(std::chrono::milliseconds(20)) &&
+            quickStatus.at(mab::MDStatus::QuickStatusBits::TargetPositionReached).isSet();
 
-        if (std::abs(static_cast<double>(pos) - gripperClosedPositionRad) <
+        if (statusReached ||
+            std::abs(static_cast<double>(pos) - gripperClosedPositionRad) <
                 softCloseClosedTolRad ||
             slowTimedOut)
         {
@@ -717,7 +802,7 @@ void MdNode::tickSoftCloseJobs()
                             id);
             }
 
-            // Keep slow gains active so the gripper continues holding the closed target.
+            // Keep POSITION_PROFILE active so the controller holds the closed target.
             finished.push_back(id);
         }
     }
@@ -918,7 +1003,15 @@ void MdNode::cbSoftCloseGripper(
 {
     rsp->success.reserve(req->device_ids.size());
 
+    if (!std::isfinite(req->pre_close_gap_mm))
+    {
+        RCLCPP_WARN(this->get_logger(), "Soft-close: pre_close_gap_mm must be finite");
+        rsp->success.assign(req->device_ids.size(), false);
+        return;
+    }
+
     const double preClosePos = fingerGapToMotorPos(static_cast<double>(req->pre_close_gap_mm));
+    const auto   requestStart = this->now();
 
     RCLCPP_INFO(this->get_logger(),
                 "Soft-close: gap=%.1f mm -> motor %.3f rad (open %.1f mm / %.3f rad, closed %.1f "
@@ -942,25 +1035,31 @@ void MdNode::cbSoftCloseGripper(
 
         cancelSoftClose(id);
 
-        const auto requestStart = this->now();
-
-        if (md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-            !configureGripper(*md,
-                              softCloseFastKp,
-                              softCloseFastKd,
-                              gripperVelocityLimitRadS,
-                              gripperTorqueLimitNm) ||
-            !setGripperTarget(*md, preClosePos))
+        if (md->disable() != mab::MD::Error_t::OK ||
+            !profilePidReady(*md) ||
+            !configurePositionProfile(
+                *md, softCloseFastVelocityRadS, softCloseFastTorqueLimitNm) ||
+            !setGripperTarget(*md, preClosePos) ||
+            md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
+            md->enable() != mab::MD::Error_t::OK)
         {
             RCLCPP_WARN(this->get_logger(),
                         "Soft-close: failed to start fast stage for drive %d",
                         id);
+            restoreNormalGripperConfig(*md);
+            md->enable();
             rsp->success.push_back(false);
             continue;
         }
 
         m_softCloseJobs[id] =
             SoftCloseJob{SoftCloseStage::Fast, preClosePos, requestStart, requestStart};
+        RCLCPP_INFO(this->get_logger(),
+                    "Soft-close: drive %d entered fast profile "
+                    "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
+                    id,
+                    softCloseFastVelocityRadS,
+                    softCloseFastTorqueLimitNm);
         rsp->success.push_back(true);
     }
 }
@@ -1086,6 +1185,8 @@ void MdNode::cbSetMode(const std::shared_ptr<candle_ros2::srv::SetMode::Request>
             mode = mab::MdMode_E::IMPEDANCE;
         else if (reqMode == "POSITION_PID")
             mode = mab::MdMode_E::POSITION_PID;
+        else if (reqMode == "POSITION_PROFILE")
+            mode = mab::MdMode_E::POSITION_PROFILE;
         else if (reqMode == "VELOCITY_PID")
             mode = mab::MdMode_E::VELOCITY_PID;
         else if (reqMode == "RAW_TORQUE")
