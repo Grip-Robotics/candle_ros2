@@ -1,0 +1,6 @@
+# Two-stage gripper close: fast to pre_close_gap_mm, then slow (higher kd) to full close
+
+uint16[] device_ids
+float32 pre_close_gap_mm   # Finger gap at end of fast stage [mm]
+---
+bool[] success

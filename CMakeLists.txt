@@ -42,10 +42,12 @@ set(srv_files
   "srv/ConfigureGripper.srv"
   "srv/Generic.srv"
   "srv/GenericPds.srv"
+  "srv/HomeGripper.srv"
   "srv/InitDevices.srv"
   "srv/SetLimits.srv"
   "srv/SetGripperTargets.srv"
   "srv/SetMode.srv"
+  "srv/SoftCloseGripper.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

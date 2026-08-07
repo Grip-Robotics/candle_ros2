@@ -1,4 +1,7 @@
 #pragma once
+#include <cmath>
+#include <unordered_map>
+
 #include "rclcpp/rclcpp.hpp"
 
 /* Messages */
@@ -12,10 +15,12 @@
 #include "candle_ros2/srv/add_devices.hpp"
 #include "candle_ros2/srv/configure_gripper.hpp"
 #include "candle_ros2/srv/generic.hpp"
+#include "candle_ros2/srv/home_gripper.hpp"
 #include "candle_ros2/srv/init_devices.hpp"
 #include "candle_ros2/srv/set_limits.hpp"
 #include "candle_ros2/srv/set_gripper_targets.hpp"
 #include "candle_ros2/srv/set_mode.hpp"
+#include "candle_ros2/srv/soft_close_gripper.hpp"
 
 /* Utils */
 #include "candle_ros2/utils/candle_params.hpp"
@@ -33,20 +38,61 @@ class MdNode : public rclcpp::Node
     ~MdNode();
 
   private:
+    enum class SoftCloseStage
+    {
+        Fast,
+        Hold,
+        Slow
+    };
+
+    struct SoftCloseJob
+    {
+        SoftCloseStage stage;
+        double         preClosePos;
+        rclcpp::Time   requestStart;
+        rclcpp::Time   slowStageStart;
+    };
+
     std::shared_ptr<mab::Candle> m_candle;
     std::vector<mab::MD>         m_mds;
 
     static constexpr const char* NODE_PREFIX  = "md/";
     static constexpr int         PUB_TIMER_MS = 5;  // 200 Hz
 
+    static constexpr int    SLOW_STAGE_TIMEOUT_MS = 5000;
+
+    std::unordered_map<u16, SoftCloseJob> m_softCloseJobs;
+
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
     double      gripperClosedPositionRad;
+    double      gripperOpenGapMm;
+    double      gripperClosedGapMm;
     float       gripperImpedanceKp;
     float       gripperImpedanceKd;
     float       gripperVelocityLimitRadS;
     float       gripperTorqueLimitNm;
+    float       softCloseFastKp;
+    float       softCloseFastKd;
+    float       softCloseSlowKp;
+    float       softCloseSlowKd;
+    double      softCloseFastTolRad;
+    double      softCloseClosedTolRad;
+    double      softCloseTargetOffsetRad;
+    int         softCloseFastDurationMs;
     bool        initDevicesZero;
+
+    float homeImpedanceKp;
+    float homeImpedanceKd;
+    float homeTorqueLimitNm;
+    float homeVelocityLimitRadS;
+    double homeStepRad;
+    double homeStallVelocityRadS;
+    double homeStallPositionEpsRad;
+    double homeStallTorqueNm;
+    int    homeStallHoldMs;
+    int    homeTimeoutMs;
+    int    homePollMs;
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pubJointState;
 
@@ -66,10 +112,13 @@ class MdNode : public rclcpp::Node
     rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvClose;
     rclcpp::Service<candle_ros2::srv::ConfigureGripper>::SharedPtr  srvConfigureGripper;
     rclcpp::Service<candle_ros2::srv::SetGripperTargets>::SharedPtr srvSetGripperTargets;
+    rclcpp::Service<candle_ros2::srv::HomeGripper>::SharedPtr       srvHomeGripper;
+    rclcpp::Service<candle_ros2::srv::SoftCloseGripper>::SharedPtr srvSoftClose;
 
     rclcpp::TimerBase::SharedPtr tmrPub;
 
     void publishJointStates();
+    void tickSoftCloseJobs();
 
     void cbMotionCmd(const candle_ros2::msg::MotionCmd& msg);
     void cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg);
@@ -99,11 +148,22 @@ class MdNode : public rclcpp::Node
         std::shared_ptr<candle_ros2::srv::SetGripperTargets::Response>      rsp);
     void cbConfigureGripper(const std::shared_ptr<candle_ros2::srv::ConfigureGripper::Request> req,
                             std::shared_ptr<candle_ros2::srv::ConfigureGripper::Response>      rsp);
+    void cbHomeGripper(const std::shared_ptr<candle_ros2::srv::HomeGripper::Request> req,
+                       std::shared_ptr<candle_ros2::srv::HomeGripper::Response>      rsp);
+    void cbSoftCloseGripper(
+        const std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Request> req,
+        std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Response>      rsp);
 
     bool configureGripper(
         mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
     bool moveGripper(mab::MD& md, double targetPos);
+    bool restoreNormalGripperConfig(mab::MD& md);
+    bool homeGripper(mab::MD& md);
+    void cancelSoftClose(u16 id);
+
+    /** Inverse kinematics: finger gap [mm] → motor position [rad]. */
+    double fingerGapToMotorPos(double gapMm) const;
 
     std::vector<mab::MD>::iterator findMd(std::vector<mab::MD>& mds, u16 id);
 };

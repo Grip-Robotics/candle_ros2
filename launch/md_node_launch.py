@@ -28,12 +28,33 @@ def generate_launch_description():
     gripper_args = [
         DeclareLaunchArgument("joint_name_prefix", default_value="md_"),
         DeclareLaunchArgument("gripper_open_position_rad", default_value="0.0"),
-        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.83"),
-        DeclareLaunchArgument("gripper_impedance_kp", default_value="5.0"),
+        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.62"),
+        DeclareLaunchArgument("gripper_open_gap_mm", default_value="120.0"),
+        DeclareLaunchArgument("gripper_closed_gap_mm", default_value="0.0"),
+        DeclareLaunchArgument("gripper_impedance_kp", default_value="12.5"),
         DeclareLaunchArgument("gripper_impedance_kd", default_value="0.05"),
         DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="3.5"),
-        DeclareLaunchArgument("gripper_torque_limit_nm", default_value="3.5"),
+        DeclareLaunchArgument("gripper_torque_limit_nm", default_value="4.0"),
+        DeclareLaunchArgument("soft_close_fast_kp", default_value="6.0"),
+        DeclareLaunchArgument("soft_close_fast_kd", default_value="0.05"),
+        DeclareLaunchArgument("soft_close_slow_kp", default_value="20.0"),
+        DeclareLaunchArgument("soft_close_slow_kd", default_value="0.12"),
+        DeclareLaunchArgument("soft_close_fast_tol_rad", default_value="0.015"),
+        DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
+        DeclareLaunchArgument("soft_close_target_offset_rad", default_value="0.05"),
+        DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="500"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
+        DeclareLaunchArgument("home_impedance_kp", default_value="4.0"),
+        DeclareLaunchArgument("home_impedance_kd", default_value="0.05"),
+        DeclareLaunchArgument("home_torque_limit_nm", default_value="2.5"),
+        DeclareLaunchArgument("home_velocity_limit_rad_s", default_value="1.0"),
+        DeclareLaunchArgument("home_step_rad", default_value="0.05"),
+        DeclareLaunchArgument("home_stall_velocity_rad_s", default_value="0.02"),
+        DeclareLaunchArgument("home_stall_position_eps_rad", default_value="0.005"),
+        DeclareLaunchArgument("home_stall_torque_nm", default_value="0.25"),
+        DeclareLaunchArgument("home_stall_hold_ms", default_value="300"),
+        DeclareLaunchArgument("home_timeout_ms", default_value="8000"),
+        DeclareLaunchArgument("home_poll_ms", default_value="20"),
     ]
 
     bus = LaunchConfiguration("bus")
@@ -64,6 +85,12 @@ def generate_launch_description():
                         "gripper_closed_position_rad": ParameterValue(
                             LaunchConfiguration("gripper_closed_position_rad"), value_type=float
                         ),
+                        "gripper_open_gap_mm": ParameterValue(
+                            LaunchConfiguration("gripper_open_gap_mm"), value_type=float
+                        ),
+                        "gripper_closed_gap_mm": ParameterValue(
+                            LaunchConfiguration("gripper_closed_gap_mm"), value_type=float
+                        ),
                         "gripper_impedance_kp": ParameterValue(
                             LaunchConfiguration("gripper_impedance_kp"), value_type=float
                         ),
@@ -76,8 +103,65 @@ def generate_launch_description():
                         "gripper_torque_limit_nm": ParameterValue(
                             LaunchConfiguration("gripper_torque_limit_nm"), value_type=float
                         ),
+                        "soft_close_fast_kp": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_kp"), value_type=float
+                        ),
+                        "soft_close_fast_kd": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_kd"), value_type=float
+                        ),
+                        "soft_close_slow_kp": ParameterValue(
+                            LaunchConfiguration("soft_close_slow_kp"), value_type=float
+                        ),
+                        "soft_close_slow_kd": ParameterValue(
+                            LaunchConfiguration("soft_close_slow_kd"), value_type=float
+                        ),
+                        "soft_close_fast_tol_rad": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_tol_rad"), value_type=float
+                        ),
+                        "soft_close_closed_tol_rad": ParameterValue(
+                            LaunchConfiguration("soft_close_closed_tol_rad"), value_type=float
+                        ),
+                        "soft_close_target_offset_rad": ParameterValue(
+                            LaunchConfiguration("soft_close_target_offset_rad"), value_type=float
+                        ),
+                        "soft_close_fast_duration_ms": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int
+                        ),
                         "init_devices_zero": ParameterValue(
                             LaunchConfiguration("init_devices_zero"), value_type=bool
+                        ),
+                        "home_impedance_kp": ParameterValue(
+                            LaunchConfiguration("home_impedance_kp"), value_type=float
+                        ),
+                        "home_impedance_kd": ParameterValue(
+                            LaunchConfiguration("home_impedance_kd"), value_type=float
+                        ),
+                        "home_torque_limit_nm": ParameterValue(
+                            LaunchConfiguration("home_torque_limit_nm"), value_type=float
+                        ),
+                        "home_velocity_limit_rad_s": ParameterValue(
+                            LaunchConfiguration("home_velocity_limit_rad_s"), value_type=float
+                        ),
+                        "home_step_rad": ParameterValue(
+                            LaunchConfiguration("home_step_rad"), value_type=float
+                        ),
+                        "home_stall_velocity_rad_s": ParameterValue(
+                            LaunchConfiguration("home_stall_velocity_rad_s"), value_type=float
+                        ),
+                        "home_stall_position_eps_rad": ParameterValue(
+                            LaunchConfiguration("home_stall_position_eps_rad"), value_type=float
+                        ),
+                        "home_stall_torque_nm": ParameterValue(
+                            LaunchConfiguration("home_stall_torque_nm"), value_type=float
+                        ),
+                        "home_stall_hold_ms": ParameterValue(
+                            LaunchConfiguration("home_stall_hold_ms"), value_type=int
+                        ),
+                        "home_timeout_ms": ParameterValue(
+                            LaunchConfiguration("home_timeout_ms"), value_type=int
+                        ),
+                        "home_poll_ms": ParameterValue(
+                            LaunchConfiguration("home_poll_ms"), value_type=int
                         ),
                     }
                 ],

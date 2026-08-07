@@ -1,7 +1,11 @@
 #include "candle_ros2/md_node.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 MdNode::MdNode(const rclcpp::NodeOptions&   options,
                std::shared_ptr<mab::Candle> candle,
@@ -11,21 +15,61 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       jointNamePrefix(params.joint_name_prefix),
       gripperOpenPositionRad(params.gripper_open_position_rad),
       gripperClosedPositionRad(params.gripper_closed_position_rad),
+      gripperOpenGapMm(params.gripper_open_gap_mm),
+      gripperClosedGapMm(params.gripper_closed_gap_mm),
       gripperImpedanceKp(static_cast<float>(params.gripper_impedance_kp)),
       gripperImpedanceKd(static_cast<float>(params.gripper_impedance_kd)),
       gripperVelocityLimitRadS(static_cast<float>(params.gripper_velocity_limit_rad_s)),
       gripperTorqueLimitNm(static_cast<float>(params.gripper_torque_limit_nm)),
-      initDevicesZero(params.init_devices_zero)
+      softCloseFastKp(static_cast<float>(params.soft_close_fast_kp)),
+      softCloseFastKd(static_cast<float>(params.soft_close_fast_kd)),
+      softCloseSlowKp(static_cast<float>(params.soft_close_slow_kp)),
+      softCloseSlowKd(static_cast<float>(params.soft_close_slow_kd)),
+      softCloseFastTolRad(params.soft_close_fast_tol_rad),
+      softCloseClosedTolRad(params.soft_close_closed_tol_rad),
+      softCloseTargetOffsetRad(params.soft_close_target_offset_rad),
+      softCloseFastDurationMs(params.soft_close_fast_duration_ms),
+      initDevicesZero(params.init_devices_zero),
+      homeImpedanceKp(static_cast<float>(params.home_impedance_kp)),
+      homeImpedanceKd(static_cast<float>(params.home_impedance_kd)),
+      homeTorqueLimitNm(static_cast<float>(params.home_torque_limit_nm)),
+      homeVelocityLimitRadS(static_cast<float>(params.home_velocity_limit_rad_s)),
+      homeStepRad(params.home_step_rad),
+      homeStallVelocityRadS(params.home_stall_velocity_rad_s),
+      homeStallPositionEpsRad(params.home_stall_position_eps_rad),
+      homeStallTorqueNm(params.home_stall_torque_nm),
+      homeStallHoldMs(params.home_stall_hold_ms),
+      homeTimeoutMs(params.home_timeout_ms),
+      homePollMs(params.home_poll_ms)
 {
     if (jointNamePrefix.empty())
         throw std::invalid_argument("joint_name_prefix must not be empty");
     if (!std::isfinite(gripperOpenPositionRad) || !std::isfinite(gripperClosedPositionRad) ||
+        !std::isfinite(gripperOpenGapMm) || !std::isfinite(gripperClosedGapMm) ||
+        gripperOpenGapMm <= gripperClosedGapMm ||
         !std::isfinite(gripperImpedanceKp) || gripperImpedanceKp < 0.0f ||
         !std::isfinite(gripperImpedanceKd) || gripperImpedanceKd < 0.0f ||
         !std::isfinite(gripperVelocityLimitRadS) || gripperVelocityLimitRadS <= 0.0f ||
-        !std::isfinite(gripperTorqueLimitNm) || gripperTorqueLimitNm <= 0.0f)
+        !std::isfinite(gripperTorqueLimitNm) || gripperTorqueLimitNm <= 0.0f ||
+        !std::isfinite(softCloseFastKp) || softCloseFastKp < 0.0f ||
+        !std::isfinite(softCloseFastKd) || softCloseFastKd < 0.0f ||
+        !std::isfinite(softCloseSlowKp) || softCloseSlowKp < 0.0f ||
+        !std::isfinite(softCloseSlowKd) || softCloseSlowKd < 0.0f ||
+        !std::isfinite(softCloseFastTolRad) || softCloseFastTolRad <= 0.0 ||
+        !std::isfinite(softCloseClosedTolRad) || softCloseClosedTolRad <= 0.0 ||
+        !std::isfinite(softCloseTargetOffsetRad) || softCloseTargetOffsetRad < 0.0 ||
+        softCloseFastDurationMs <= 0 ||
+        !std::isfinite(homeImpedanceKp) || homeImpedanceKp < 0.0f ||
+        !std::isfinite(homeImpedanceKd) || homeImpedanceKd < 0.0f ||
+        !std::isfinite(homeTorqueLimitNm) || homeTorqueLimitNm <= 0.0f ||
+        !std::isfinite(homeVelocityLimitRadS) || homeVelocityLimitRadS <= 0.0f ||
+        !std::isfinite(homeStepRad) || homeStepRad <= 0.0 ||
+        !std::isfinite(homeStallVelocityRadS) || homeStallVelocityRadS < 0.0 ||
+        !std::isfinite(homeStallPositionEpsRad) || homeStallPositionEpsRad < 0.0 ||
+        !std::isfinite(homeStallTorqueNm) || homeStallTorqueNm < 0.0 || homeStallHoldMs <= 0 ||
+        homeTimeoutMs <= 0 || homePollMs <= 0)
         throw std::invalid_argument(
-            "invalid gripper position, gain, velocity, or torque parameter");
+            "invalid gripper position, gain, velocity, torque, soft-close, or home parameter");
 
     rclcpp::QoS defaultQoS(10);
     defaultQoS.reliable();
@@ -87,6 +131,12 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         std::string(NODE_PREFIX) + "set_gripper_targets",
         std::bind(
             &MdNode::cbSetGripperTargets, this, std::placeholders::_1, std::placeholders::_2));
+    srvHomeGripper = this->create_service<candle_ros2::srv::HomeGripper>(
+        std::string(NODE_PREFIX) + "home_gripper",
+        std::bind(&MdNode::cbHomeGripper, this, std::placeholders::_1, std::placeholders::_2));
+    srvSoftClose = this->create_service<candle_ros2::srv::SoftCloseGripper>(
+        std::string(NODE_PREFIX) + "soft_close_gripper",
+        std::bind(&MdNode::cbSoftCloseGripper, this, std::placeholders::_1, std::placeholders::_2));
 
     tmrPub = this->create_wall_timer(std::chrono::milliseconds(PUB_TIMER_MS),
                                      std::bind(&MdNode::publishJointStates, this));
@@ -101,6 +151,8 @@ MdNode::~MdNode()
 
 void MdNode::publishJointStates()
 {
+    tickSoftCloseJobs();
+
     sensor_msgs::msg::JointState msgJointStates;
 
     msgJointStates.name.reserve(m_mds.size());
@@ -351,6 +403,35 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         zeroRsp->success.assign(n, true);
     }
 
+    // Prevent a previously latched target (for example soft-close overtravel)
+    // from moving the mechanism as soon as the drive is enabled.
+    std::vector<bool> targetPrepared(n, false);
+    for (size_t i = 0; i < n; ++i)
+    {
+        auto md = findMd(m_mds, req->device_ids[i]);
+        if (md == m_mds.end())
+            continue;
+
+        const auto [currentPos, posErr] = md->getPosition();
+        if (posErr != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Init devices: failed to read current position for drive %d",
+                        req->device_ids[i]);
+            continue;
+        }
+
+        const bool configured =
+            req->mode != "IMPEDANCE" ||
+            configureGripper(*md,
+                             gripperImpedanceKp,
+                             gripperImpedanceKd,
+                             gripperVelocityLimitRadS,
+                             gripperTorqueLimitNm);
+        targetPrepared[i] =
+            configured && setGripperTarget(*md, static_cast<double>(currentPos));
+    }
+
     auto enableReq        = std::make_shared<candle_ros2::srv::Generic::Request>();
     auto enableRsp        = std::make_shared<candle_ros2::srv::Generic::Response>();
     enableReq->device_ids = req->device_ids;
@@ -362,7 +443,7 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         const bool modeOk  = i < modeRsp->success.size() && modeRsp->success[i];
         const bool zeroed  = i < zeroRsp->success.size() && zeroRsp->success[i];
         const bool enabled = i < enableRsp->success.size() && enableRsp->success[i];
-        rsp->success[i]    = added && modeOk && zeroed && enabled;
+        rsp->success[i]    = added && modeOk && zeroed && targetPrepared[i] && enabled;
     }
 }
 
@@ -488,6 +569,309 @@ bool MdNode::moveGripper(mab::MD& md, double targetPos)
            setGripperTarget(md, targetPos);
 }
 
+bool MdNode::restoreNormalGripperConfig(mab::MD& md)
+{
+    return configureGripper(md,
+                            gripperImpedanceKp,
+                            gripperImpedanceKd,
+                            gripperVelocityLimitRadS,
+                            gripperTorqueLimitNm);
+}
+
+void MdNode::cancelSoftClose(u16 id)
+{
+    auto it = m_softCloseJobs.find(id);
+    if (it == m_softCloseJobs.end())
+        return;
+
+    auto md = findMd(m_mds, id);
+    if (md != m_mds.end())
+        restoreNormalGripperConfig(*md);
+
+    m_softCloseJobs.erase(it);
+}
+
+double MdNode::fingerGapToMotorPos(double gapMm) const
+{
+    const double gapSpan = gripperOpenGapMm - gripperClosedGapMm;
+    const double clampedGap = std::clamp(gapMm, gripperClosedGapMm, gripperOpenGapMm);
+    const double closeFraction = (gripperOpenGapMm - clampedGap) / gapSpan;
+
+    return gripperOpenPositionRad +
+           closeFraction * (gripperClosedPositionRad - gripperOpenPositionRad);
+}
+
+void MdNode::tickSoftCloseJobs()
+{
+    if (m_softCloseJobs.empty())
+        return;
+
+    const auto       now = this->now();
+    std::vector<u16> finished;
+
+    for (auto& [id, job] : m_softCloseJobs)
+    {
+        auto md = findMd(m_mds, id);
+        if (md == m_mds.end())
+        {
+            finished.push_back(id);
+            continue;
+        }
+
+        const auto fastDuration =
+            rclcpp::Duration(std::chrono::milliseconds(softCloseFastDurationMs));
+
+        if (job.stage != SoftCloseStage::Slow && (now - job.requestStart) >= fastDuration)
+        {
+            const double closeDirection =
+                gripperClosedPositionRad >= gripperOpenPositionRad ? 1.0 : -1.0;
+            const double slowTarget =
+                gripperClosedPositionRad + closeDirection * softCloseTargetOffsetRad;
+
+            if (!configureGripper(*md,
+                                  softCloseSlowKp,
+                                  softCloseSlowKd,
+                                  gripperVelocityLimitRadS,
+                                  gripperTorqueLimitNm) ||
+                !setGripperTarget(*md, slowTarget))
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Soft-close: failed to start slow stage for drive %d",
+                            id);
+                restoreNormalGripperConfig(*md);
+                finished.push_back(id);
+                continue;
+            }
+
+            job.stage          = SoftCloseStage::Slow;
+            job.slowStageStart = now;
+            RCLCPP_INFO(this->get_logger(),
+                        "Soft-close: drive %d entered slow stage after %d ms, target=%.3f rad",
+                        id,
+                        softCloseFastDurationMs,
+                        slowTarget);
+            continue;
+        }
+
+        if (job.stage == SoftCloseStage::Hold)
+            continue;
+
+        const auto [pos, posErr] = md->getPosition();
+        if (posErr != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                 *this->get_clock(),
+                                 1000,
+                                 "Soft-close: failed to read position for drive %d",
+                                 id);
+            continue;
+        }
+
+        const char* stageName = job.stage == SoftCloseStage::Fast ? "fast" : "slow";
+        RCLCPP_INFO_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             500,
+                             "Soft-close drive %d: stage=%s pos=%.3f preclose=%.3f closed=%.3f "
+                             "torque=%.3f Nm",
+                             id,
+                             stageName,
+                             static_cast<double>(pos),
+                             job.preClosePos,
+                             gripperClosedPositionRad,
+                             static_cast<double>(md->getTorque().first));
+
+        if (job.stage == SoftCloseStage::Fast)
+        {
+            if (std::abs(static_cast<double>(pos) - job.preClosePos) < softCloseFastTolRad)
+            {
+                if (!restoreNormalGripperConfig(*md) || !setGripperTarget(*md, job.preClosePos))
+                {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Soft-close: failed to enter hold stage for drive %d",
+                                id);
+                    restoreNormalGripperConfig(*md);
+                    finished.push_back(id);
+                    continue;
+                }
+
+                job.stage = SoftCloseStage::Hold;
+                RCLCPP_INFO(this->get_logger(),
+                            "Soft-close: drive %d reached pre-close target and entered hold",
+                            id);
+            }
+            continue;
+        }
+
+        const bool slowTimedOut =
+            (now - job.slowStageStart) >
+            rclcpp::Duration(std::chrono::milliseconds(SLOW_STAGE_TIMEOUT_MS));
+
+        if (std::abs(static_cast<double>(pos) - gripperClosedPositionRad) <
+                softCloseClosedTolRad ||
+            slowTimedOut)
+        {
+            if (slowTimedOut)
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Soft-close slow stage timed out for drive %d",
+                            id);
+            }
+
+            // Keep slow gains active so the gripper continues holding the closed target.
+            finished.push_back(id);
+        }
+    }
+
+    for (u16 id : finished)
+        m_softCloseJobs.erase(id);
+}
+
+bool MdNode::homeGripper(mab::MD& md)
+{
+    const auto [startPos, startPosErr] = md.getPosition();
+    if (startPosErr != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Home gripper: failed to read position for drive %d",
+                    md.m_canId);
+        return false;
+    }
+
+    const double startPosition = static_cast<double>(startPos);
+    // Crawl toward the configured open position, not simply "down" in encoder space.
+    const double openDir =
+        (startPosition > gripperOpenPositionRad) ? -1.0 : 1.0;
+
+    RCLCPP_INFO(this->get_logger(),
+                "Home gripper: drive %d start=%.3f rad, direction=%s, open target=%.3f rad, "
+                "kp=%.1f, max_torque=%.1f Nm",
+                md.m_canId,
+                startPosition,
+                openDir > 0.0 ? "positive" : "negative",
+                gripperOpenPositionRad,
+                homeImpedanceKp,
+                homeTorqueLimitNm);
+
+    auto restoreOnFail = [this, &md]()
+    {
+        if (!restoreNormalGripperConfig(md))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Home gripper: failed to restore normal gains for drive %d",
+                        md.m_canId);
+        }
+    };
+
+    if (md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Home gripper: failed to set IMPEDANCE for drive %d",
+                    md.m_canId);
+        return false;
+    }
+
+    if (!configureGripper(
+            md, homeImpedanceKp, homeImpedanceKd, homeVelocityLimitRadS, homeTorqueLimitNm))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Home gripper: failed to apply soft gains for drive %d",
+                    md.m_canId);
+        restoreOnFail();
+        return false;
+    }
+
+    double lastPos      = startPosition;
+    int    stallAccumMs = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(homeTimeoutMs);
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const auto [pos, posErr] = md.getPosition();
+        const auto [vel, velErr] = md.getVelocity();
+        const auto [tau, tauErr] = md.getTorque();
+        if (posErr != mab::MD::Error_t::OK || velErr != mab::MD::Error_t::OK ||
+            tauErr != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Home gripper: failed to read feedback for drive %d",
+                        md.m_canId);
+            restoreOnFail();
+            return false;
+        }
+
+        const double position = static_cast<double>(pos);
+        const double velocity = static_cast<double>(vel);
+        const double torque   = static_cast<double>(tau);
+        const double target   = position + openDir * homeStepRad;
+
+        if (!setGripperTarget(md, target))
+        {
+            restoreOnFail();
+            return false;
+        }
+
+        const bool stalled =
+            std::abs(velocity) <= homeStallVelocityRadS &&
+            std::abs(position - lastPos) <= homeStallPositionEpsRad &&
+            std::abs(torque) >= homeStallTorqueNm;
+
+        if (stalled)
+            stallAccumMs += homePollMs;
+        else
+            stallAccumMs = 0;
+
+        lastPos = position;
+
+        if (stallAccumMs >= homeStallHoldMs)
+        {
+            if (md.zero() != mab::MD::Error_t::OK)
+            {
+                RCLCPP_WARN(
+                    this->get_logger(), "Home gripper: zero failed for drive %d", md.m_canId);
+                restoreOnFail();
+                return false;
+            }
+
+            if (!restoreNormalGripperConfig(md))
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Home gripper: failed to restore normal gains for drive %d",
+                            md.m_canId);
+                return false;
+            }
+
+            if (md.save() != mab::MD::Error_t::OK)
+            {
+                RCLCPP_WARN(
+                    this->get_logger(), "Home gripper: save failed for drive %d", md.m_canId);
+                return false;
+            }
+
+            if (!setGripperTarget(md, 0.0))
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Home gripper: failed to hold zero for drive %d",
+                            md.m_canId);
+                return false;
+            }
+
+            RCLCPP_INFO(this->get_logger(),
+                        "Home gripper: drive %d zeroed at open endstop and saved",
+                        md.m_canId);
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(homePollMs));
+    }
+
+    RCLCPP_WARN(this->get_logger(),
+                "Home gripper: timed out waiting for open endstop on drive %d",
+                md.m_canId);
+    restoreOnFail();
+    return false;
+}
+
 void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
                            std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp)
 {
@@ -503,6 +887,7 @@ void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Requ
             continue;
         }
 
+        cancelSoftClose(id);
         rsp->success.push_back(moveGripper(*md, gripperOpenPositionRad));
     }
 }
@@ -522,7 +907,85 @@ void MdNode::cbCloseGripper(const std::shared_ptr<candle_ros2::srv::Generic::Req
             continue;
         }
 
+        cancelSoftClose(id);
         rsp->success.push_back(moveGripper(*md, gripperClosedPositionRad));
+    }
+}
+
+void MdNode::cbSoftCloseGripper(
+    const std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Request> req,
+    std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Response>      rsp)
+{
+    rsp->success.reserve(req->device_ids.size());
+
+    const double preClosePos = fingerGapToMotorPos(static_cast<double>(req->pre_close_gap_mm));
+
+    RCLCPP_INFO(this->get_logger(),
+                "Soft-close: gap=%.1f mm -> motor %.3f rad (open %.1f mm / %.3f rad, closed %.1f "
+                "mm / %.3f rad)",
+                req->pre_close_gap_mm,
+                preClosePos,
+                gripperOpenGapMm,
+                gripperOpenPositionRad,
+                gripperClosedGapMm,
+                gripperClosedPositionRad);
+
+    for (auto id : req->device_ids)
+    {
+        auto md = findMd(m_mds, id);
+        if (md == m_mds.end())
+        {
+            RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", id);
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        cancelSoftClose(id);
+
+        const auto requestStart = this->now();
+
+        if (md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+            !configureGripper(*md,
+                              softCloseFastKp,
+                              softCloseFastKd,
+                              gripperVelocityLimitRadS,
+                              gripperTorqueLimitNm) ||
+            !setGripperTarget(*md, preClosePos))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Soft-close: failed to start fast stage for drive %d",
+                        id);
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        m_softCloseJobs[id] =
+            SoftCloseJob{SoftCloseStage::Fast, preClosePos, requestStart, requestStart};
+        rsp->success.push_back(true);
+    }
+}
+
+void MdNode::cbHomeGripper(const std::shared_ptr<candle_ros2::srv::HomeGripper::Request> req,
+                           std::shared_ptr<candle_ros2::srv::HomeGripper::Response>      rsp)
+{
+    const size_t n = req->device_ids.size();
+    rsp->success.assign(n, false);
+    if (n == 0)
+    {
+        RCLCPP_WARN(this->get_logger(), "HomeGripper request device_ids must be non-empty");
+        return;
+    }
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        auto md = findMd(m_mds, req->device_ids[i]);
+        if (md == m_mds.end())
+        {
+            RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", req->device_ids[i]);
+            continue;
+        }
+
+        rsp->success[i] = homeGripper(*md);
     }
 }
 
@@ -687,9 +1150,14 @@ void MdNode::cbDisable(const std::shared_ptr<candle_ros2::srv::Generic::Request>
         }
 
         if (md->disable() == mab::MD::Error_t::OK)
+        {
+            m_softCloseJobs.erase(id);
             rsp->success.push_back(true);
+        }
         else
+        {
             rsp->success.push_back(false);
+        }
     }
     return;
 }

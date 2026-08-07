@@ -94,17 +94,31 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
 ros2 service call /md/close_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
 ros2 service call /md/open_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
 
+# Soft close: controlled fast move, hold at pre-close, then slow move after 500 ms
+ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
+  "{device_ids: [343], pre_close_gap_mm: 25.0}"
+
+# Optional soft-close tuning
+ros2 launch candle_ros2 md_node_launch.py \
+  soft_close_fast_kp:=5.0 \
+  soft_close_slow_kd:=0.10
+
 # Optional: set impedance gains explicitly (overwritten again by open/close)
 ros2 topic pub /md/impedance_command candle_ros2/msg/ImpedanceCmd \
-  "{device_ids: [343], kp: [5.0], kd: [0.05], max_output: [3.5]}" --once
+  "{device_ids: [343], kp: [12.5], kd: [0.05], max_output: [4.0]}" --once
 
 # Three independently calibrated motors in one acknowledged batch request
 ros2 service call /md/configure_gripper candle_ros2/srv/ConfigureGripper \
-  "{device_ids: [343, 344, 345], kp: [5.0, 5.0, 5.0], kd: [0.05, 0.05, 0.05],
+  "{device_ids: [343, 344, 345], kp: [12.5, 12.5, 12.5], kd: [0.05, 0.05, 0.05],
     velocity_limit_rad_s: [3.5, 3.5, 3.5],
-    torque_limit_nm: [3.5, 3.5, 3.5]}"
+    torque_limit_nm: [4.0, 4.0, 4.0]}"
 ros2 service call /md/set_gripper_targets candle_ros2/srv/SetGripperTargets \
-  "{device_ids: [343, 344, 345], target_position_rad: [0.83, 0.83, 0.83]}"
+  "{device_ids: [343, 344, 345], target_position_rad: [0.62, 0.62, 0.62]}"
+
+# Home at the mechanical open endstop (gentle open → zero → restore gains → save)
+# Unlike /md/zero, this persists the zero (and restored config) across power cycles.
+ros2 service call /md/home_gripper candle_ros2/srv/HomeGripper \
+  "{device_ids: [343, 344, 345]}"
 ```
 
 Individual steps are also available as `/md/add_mds`, `/md/set_mode`, `/md/zero`, and `/md/enable`.
@@ -113,11 +127,28 @@ Relevant MD-node parameters are:
 
 - `joint_name_prefix` (`md_`)
 - `gripper_open_position_rad` (`0.0`)
-- `gripper_closed_position_rad` (`0.83`)
-- `gripper_impedance_kp` / `gripper_impedance_kd` (`5.0` / `0.05`)
+- `gripper_closed_position_rad` (`0.62`)
+- `gripper_open_gap_mm` / `gripper_closed_gap_mm` (`120.0` / `0.0`) — measured finger gap at open/close; used by soft close
+- `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
 - `gripper_velocity_limit_rad_s` (`3.5`)
-- `gripper_torque_limit_nm` (`3.5`)
+- `gripper_torque_limit_nm` (`4.0`)
+- `soft_close_fast_kp` / `soft_close_fast_kd` (`6.0` / `0.05`)
+- `soft_close_slow_kp` / `soft_close_slow_kd` (`20.0` / `0.12`)
+- `soft_close_fast_tol_rad` (`0.015`)
+- `soft_close_closed_tol_rad` (`0.005`)
+- `soft_close_target_offset_rad` (`0.05`) — slow-stage overtravel that maintains closing force
+- `soft_close_fast_duration_ms` (`500`) — slow stage starts this long after the request
 - `init_devices_zero` (`false`)
+- `home_impedance_kp` / `home_impedance_kd` (`4.0` / `0.05`)
+- `home_torque_limit_nm` (`2.5`)
+- `home_velocity_limit_rad_s` (`1.0`)
+- `home_step_rad` (`0.05`)
+- `home_stall_velocity_rad_s` (`0.02`)
+- `home_stall_position_eps_rad` (`0.005`)
+- `home_stall_torque_nm` (`0.25`)
+- `home_stall_hold_ms` (`300`)
+- `home_timeout_ms` (`8000`)
+- `home_poll_ms` (`20`)
 
 ## Documentation
 
