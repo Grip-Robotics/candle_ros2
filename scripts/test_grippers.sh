@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 readonly DEVICE_IDS=(342 343 345)
 readonly DEVICE_IDS_YAML="[342, 343, 345]"
-readonly SOFT_CLOSE_GAPS=(40 30 20)
+readonly SOFT_CLOSE_GAPS=(40 30 25)
 
 MOVE_WAIT_SECONDS="${MOVE_WAIT_SECONDS:-2}"
 SOFT_CLOSE_WAIT_SECONDS="${SOFT_CLOSE_WAIT_SECONDS:-7}"
@@ -21,7 +21,7 @@ Runs the calibrated service test for drives 342, 343, and 345:
   1. Initialize all drives while preserving their encoder zeros.
   2. Apply calibrated position and velocity PID gains.
   3. Close/open each gripper individually.
-  4. Soft-close each gripper individually with transition gaps 40, 30, and 20 mm.
+  4. Soft-close each gripper individually with transition gaps 40, 30, and 25 mm.
 
 Options:
   --zero    Explicitly zero all drives at their current mechanical positions.
@@ -237,7 +237,8 @@ for gap in "${SOFT_CLOSE_GAPS[@]}"; do
     for id in "${DEVICE_IDS[@]}"; do
         printf '\nTesting drive %d with a %d mm fast-to-slow transition gap.\n' "$id" "$gap"
         call_service /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-            "{device_ids: [${id}], pre_close_gap_mm: ${gap}.0}"
+            "{device_ids: [${id}], pre_close_enabled: true, pre_close_gap_mm: ${gap}.0,
+              fast_speed: 1.0, slow_speed: 0.4}"
         sleep "$SOFT_CLOSE_WAIT_SECONDS"
         call_service /md/open_gripper candle_ros2/srv/Generic \
             "{device_ids: [${id}]}"

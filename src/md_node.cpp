@@ -14,14 +14,12 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       jointNamePrefix(params.joint_name_prefix),
       gripperOpenPositionRad(params.gripper_open_position_rad),
       gripperClosedPositionRad(params.gripper_closed_position_rad),
-      gripperOpenGapMm(params.gripper_open_gap_mm),
-      gripperClosedGapMm(params.gripper_closed_gap_mm),
+      fingerLengthMm(params.finger_length_mm),
+      axisSpacingMm(params.axis_spacing_mm),
       gripperImpedanceKp(static_cast<float>(params.gripper_impedance_kp)),
       gripperImpedanceKd(static_cast<float>(params.gripper_impedance_kd)),
       gripperVelocityLimitRadS(static_cast<float>(params.gripper_velocity_limit_rad_s)),
       gripperTorqueLimitNm(static_cast<float>(params.gripper_torque_limit_nm)),
-      softCloseFastVelocityRadS(static_cast<float>(params.soft_close_fast_velocity_rad_s)),
-      softCloseSlowVelocityRadS(static_cast<float>(params.soft_close_slow_velocity_rad_s)),
       softCloseFastTorqueLimitNm(static_cast<float>(params.soft_close_fast_torque_limit_nm)),
       softCloseSlowTorqueLimitNm(static_cast<float>(params.soft_close_slow_torque_limit_nm)),
       softCloseProfileAccelerationRadS2(
@@ -35,14 +33,12 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     if (jointNamePrefix.empty())
         throw std::invalid_argument("joint_name_prefix must not be empty");
     if (!std::isfinite(gripperOpenPositionRad) || !std::isfinite(gripperClosedPositionRad) ||
-        !std::isfinite(gripperOpenGapMm) || !std::isfinite(gripperClosedGapMm) ||
-        gripperOpenGapMm <= gripperClosedGapMm ||
+        !std::isfinite(fingerLengthMm) || fingerLengthMm <= 0.0 ||
+        !std::isfinite(axisSpacingMm) || axisSpacingMm <= 0.0 ||
         !std::isfinite(gripperImpedanceKp) || gripperImpedanceKp < 0.0f ||
         !std::isfinite(gripperImpedanceKd) || gripperImpedanceKd < 0.0f ||
         !std::isfinite(gripperVelocityLimitRadS) || gripperVelocityLimitRadS <= 0.0f ||
         !std::isfinite(gripperTorqueLimitNm) || gripperTorqueLimitNm <= 0.0f ||
-        !std::isfinite(softCloseFastVelocityRadS) || softCloseFastVelocityRadS <= 0.0f ||
-        !std::isfinite(softCloseSlowVelocityRadS) || softCloseSlowVelocityRadS <= 0.0f ||
         !std::isfinite(softCloseFastTorqueLimitNm) || softCloseFastTorqueLimitNm <= 0.0f ||
         !std::isfinite(softCloseSlowTorqueLimitNm) || softCloseSlowTorqueLimitNm <= 0.0f ||
         !std::isfinite(softCloseProfileAccelerationRadS2) ||
@@ -365,7 +361,6 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
     addReq->device_ids = req->device_ids;
     cbAddMd(addReq, addRsp);
 
-    std::vector<bool> resetOk(n, false);
     for (size_t i = 0; i < n; ++i)
     {
         const bool added = i < addRsp->success.size() && addRsp->success[i];
@@ -373,35 +368,29 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
             continue;
 
         auto md = findMd(m_mds, req->device_ids[i]);
-        resetOk[i] = md != m_mds.end() && resetDriveErrorsIfNeeded(*md);
-    }
-
-    auto modeReq        = std::make_shared<candle_ros2::srv::SetMode::Request>();
-    auto modeRsp        = std::make_shared<candle_ros2::srv::SetMode::Response>();
-    modeReq->device_ids = req->device_ids;
-    modeReq->mode.assign(n, req->mode);
-    cbSetMode(modeReq, modeRsp);
-
-    auto zeroRsp = std::make_shared<candle_ros2::srv::Generic::Response>();
-    if (initDevicesZero)
-    {
-        auto zeroReq        = std::make_shared<candle_ros2::srv::Generic::Request>();
-        zeroReq->device_ids = req->device_ids;
-        cbZero(zeroReq, zeroRsp);
-    }
-    else
-    {
-        zeroRsp->success.assign(n, true);
-    }
-
-    // Prevent a previously latched target (for example soft-close overtravel)
-    // from moving the mechanism as soon as the drive is enabled.
-    std::vector<bool> targetPrepared(n, false);
-    for (size_t i = 0; i < n; ++i)
-    {
-        auto md = findMd(m_mds, req->device_ids[i]);
         if (md == m_mds.end())
             continue;
+
+        // Reinitialization must not allow a previously scheduled soft-close
+        // stage to command this drive again after it is enabled.
+        m_softCloseJobs.erase(req->device_ids[i]);
+
+        // A drive may still be enabled with a target latched in non-volatile
+        // registers. Disable it before setting either the mode or target.
+        if (!resetDriveErrorsIfNeeded(*md) || md->disable() != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Init devices: failed to prepare drive %d for safe configuration",
+                        req->device_ids[i]);
+            continue;
+        }
+
+        if (initDevicesZero && md->zero() != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(
+                this->get_logger(), "Init devices: failed to zero drive %d", req->device_ids[i]);
+            continue;
+        }
 
         const auto [currentPos, posErr] = md->getPosition();
         if (posErr != mab::MD::Error_t::OK)
@@ -419,23 +408,18 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
                              gripperImpedanceKd,
                              gripperVelocityLimitRadS,
                              gripperTorqueLimitNm);
-        targetPrepared[i] =
-            configured && setGripperTarget(*md, static_cast<double>(currentPos));
-    }
+        if (!configured || !setGripperTarget(*md, static_cast<double>(currentPos)))
+            continue;
 
-    auto enableReq        = std::make_shared<candle_ros2::srv::Generic::Request>();
-    auto enableRsp        = std::make_shared<candle_ros2::srv::Generic::Response>();
-    enableReq->device_ids = req->device_ids;
-    cbEnable(enableReq, enableRsp);
+        auto modeReq        = std::make_shared<candle_ros2::srv::SetMode::Request>();
+        auto modeRsp        = std::make_shared<candle_ros2::srv::SetMode::Response>();
+        modeReq->device_ids = {req->device_ids[i]};
+        modeReq->mode       = {req->mode};
+        cbSetMode(modeReq, modeRsp);
+        if (modeRsp->success.empty() || !modeRsp->success.front())
+            continue;
 
-    for (size_t i = 0; i < n; i++)
-    {
-        const bool added   = i < addRsp->success.size() && addRsp->success[i];
-        const bool modeOk  = i < modeRsp->success.size() && modeRsp->success[i];
-        const bool zeroed  = i < zeroRsp->success.size() && zeroRsp->success[i];
-        const bool enabled = i < enableRsp->success.size() && enableRsp->success[i];
-        rsp->success[i] =
-            added && resetOk[i] && modeOk && zeroed && targetPrepared[i] && enabled;
+        rsp->success[i] = md->enable() == mab::MD::Error_t::OK;
     }
 }
 
@@ -742,12 +726,32 @@ void MdNode::cancelSoftClose(u16 id)
 
 double MdNode::fingerGapToMotorPos(double gapMm) const
 {
-    const double gapSpan = gripperOpenGapMm - gripperClosedGapMm;
-    const double clampedGap = std::clamp(gapMm, gripperClosedGapMm, gripperOpenGapMm);
-    const double closeFraction = (gripperOpenGapMm - clampedGap) / gapSpan;
+    constexpr double PI = 3.14159265358979323846;
+    constexpr double DEG_TO_RAD = PI / 180.0;
+    constexpr double RAD_TO_DEG = 180.0 / PI;
+
+    const double minGapMm =
+        axisSpacingMm -
+        2.0 * fingerLengthMm * std::cos(FINGER_ANGLE_MIN_DEG * DEG_TO_RAD);
+    const double maxGapMm =
+        axisSpacingMm -
+        2.0 * fingerLengthMm * std::cos(FINGER_ANGLE_MAX_DEG * DEG_TO_RAD);
+    const double clampedGapMm = std::clamp(gapMm, minGapMm, maxGapMm);
+    const double cosineValue =
+        std::clamp((axisSpacingMm - clampedGapMm) / (2.0 * fingerLengthMm), -1.0, 1.0);
+    const double fingerAngleDeg = std::acos(cosineValue) * RAD_TO_DEG;
+    const double closeFraction =
+        (FINGER_ANGLE_MAX_DEG - fingerAngleDeg) /
+        (FINGER_ANGLE_MAX_DEG - FINGER_ANGLE_MIN_DEG);
 
     return gripperOpenPositionRad +
            closeFraction * (gripperClosedPositionRad - gripperOpenPositionRad);
+}
+
+double MdNode::normalizedSpeedToRadS(double normalizedSpeed)
+{
+    return SOFT_CLOSE_MIN_SPEED_RAD_S +
+           normalizedSpeed * (SOFT_CLOSE_MAX_SPEED_RAD_S - SOFT_CLOSE_MIN_SPEED_RAD_S);
 }
 
 void MdNode::tickSoftCloseJobs()
@@ -772,14 +776,18 @@ void MdNode::tickSoftCloseJobs()
 
         if (job.stage != SoftCloseStage::Slow && (now - job.requestStart) >= fastDuration)
         {
-            if (!configurePositionProfile(
-                    *md, softCloseSlowVelocityRadS, softCloseSlowTorqueLimitNm) ||
-                !setGripperTarget(*md, gripperClosedPositionRad))
+            if (md->disable() != mab::MD::Error_t::OK ||
+                !configurePositionProfile(
+                    *md, job.slowVelocityRadS, softCloseSlowTorqueLimitNm) ||
+                !setGripperTarget(*md, gripperClosedPositionRad) ||
+                md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
+                md->enable() != mab::MD::Error_t::OK)
             {
                 RCLCPP_WARN(this->get_logger(),
                             "Soft-close: failed to start slow stage for drive %d",
                             id);
                 restoreNormalGripperConfig(*md);
+                md->enable();
                 finished.push_back(id);
                 continue;
             }
@@ -791,7 +799,7 @@ void MdNode::tickSoftCloseJobs()
                         "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
                         id,
                         softCloseFastDurationMs,
-                        softCloseSlowVelocityRadS,
+                        job.slowVelocityRadS,
                         softCloseSlowTorqueLimitNm);
             continue;
         }
@@ -909,25 +917,56 @@ void MdNode::cbSoftCloseGripper(
 {
     rsp->success.reserve(req->device_ids.size());
 
-    if (!std::isfinite(req->pre_close_gap_mm))
+    const double normalizedFastSpeed = static_cast<double>(req->fast_speed);
+    const double normalizedSlowSpeed = static_cast<double>(req->slow_speed);
+    const bool speedsValid =
+        std::isfinite(normalizedFastSpeed) && normalizedFastSpeed >= 0.0 &&
+        normalizedFastSpeed <= 1.0 && std::isfinite(normalizedSlowSpeed) &&
+        normalizedSlowSpeed >= 0.0 && normalizedSlowSpeed <= 1.0;
+    if (!speedsValid)
     {
-        RCLCPP_WARN(this->get_logger(), "Soft-close: pre_close_gap_mm must be finite");
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: fast_speed and slow_speed must be finite values in [0, 1]");
         rsp->success.assign(req->device_ids.size(), false);
         return;
     }
 
-    const double preClosePos = fingerGapToMotorPos(static_cast<double>(req->pre_close_gap_mm));
-    const auto   requestStart = this->now();
+    if (req->pre_close_enabled && !std::isfinite(req->pre_close_gap_mm))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Soft-close: pre_close_gap_mm must be finite when pre-close is enabled");
+        rsp->success.assign(req->device_ids.size(), false);
+        return;
+    }
 
-    RCLCPP_INFO(this->get_logger(),
-                "Soft-close: gap=%.1f mm -> motor %.3f rad (open %.1f mm / %.3f rad, closed %.1f "
-                "mm / %.3f rad)",
-                req->pre_close_gap_mm,
-                preClosePos,
-                gripperOpenGapMm,
-                gripperOpenPositionRad,
-                gripperClosedGapMm,
-                gripperClosedPositionRad);
+    const double fastVelocityRadS = normalizedSpeedToRadS(normalizedFastSpeed);
+    const double slowVelocityRadS = normalizedSpeedToRadS(normalizedSlowSpeed);
+    const double fastTarget =
+        req->pre_close_enabled
+            ? fingerGapToMotorPos(static_cast<double>(req->pre_close_gap_mm))
+            : gripperClosedPositionRad;
+    const auto requestStart = this->now();
+
+    if (req->pre_close_enabled)
+    {
+        RCLCPP_INFO(this->get_logger(),
+                    "Soft-close: pre-close enabled, gap=%.1f mm -> motor %.3f rad, "
+                    "normalized speeds fast=%.3f (%.3f rad/s), slow=%.3f (%.3f rad/s)",
+                    req->pre_close_gap_mm,
+                    fastTarget,
+                    normalizedFastSpeed,
+                    fastVelocityRadS,
+                    normalizedSlowSpeed,
+                    slowVelocityRadS);
+    }
+    else
+    {
+        RCLCPP_INFO(this->get_logger(),
+                    "Soft-close: pre-close disabled, direct close at normalized speed %.3f "
+                    "(%.3f rad/s)",
+                    normalizedFastSpeed,
+                    fastVelocityRadS);
+    }
 
     for (auto id : req->device_ids)
     {
@@ -945,8 +984,8 @@ void MdNode::cbSoftCloseGripper(
             md->disable() != mab::MD::Error_t::OK ||
             !profilePidReady(*md) ||
             !configurePositionProfile(
-                *md, softCloseFastVelocityRadS, softCloseFastTorqueLimitNm) ||
-            !setGripperTarget(*md, preClosePos) ||
+                *md, fastVelocityRadS, softCloseFastTorqueLimitNm) ||
+            !setGripperTarget(*md, fastTarget) ||
             md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
             md->enable() != mab::MD::Error_t::OK)
         {
@@ -959,14 +998,26 @@ void MdNode::cbSoftCloseGripper(
             continue;
         }
 
-        m_softCloseJobs[id] =
-            SoftCloseJob{SoftCloseStage::Fast, preClosePos, requestStart, requestStart};
-        RCLCPP_INFO(this->get_logger(),
-                    "Soft-close: drive %d entered fast profile "
-                    "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
-                    id,
-                    softCloseFastVelocityRadS,
-                    softCloseFastTorqueLimitNm);
+        if (req->pre_close_enabled)
+        {
+            m_softCloseJobs[id] = SoftCloseJob{
+                SoftCloseStage::Fast, fastTarget, slowVelocityRadS, requestStart, requestStart};
+            RCLCPP_INFO(this->get_logger(),
+                        "Soft-close: drive %d entered fast profile "
+                        "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
+                        id,
+                        fastVelocityRadS,
+                        softCloseFastTorqueLimitNm);
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(),
+                        "Soft-close: drive %d started single profile to closed target "
+                        "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
+                        id,
+                        fastVelocityRadS,
+                        softCloseFastTorqueLimitNm);
+        }
         rsp->success.push_back(true);
     }
 }

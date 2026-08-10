@@ -15,20 +15,18 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<std::string>("joint_name_prefix", "md_");
     node->declare_parameter<double>("gripper_open_position_rad", 0.0);
     node->declare_parameter<double>("gripper_closed_position_rad", 0.62);
-    node->declare_parameter<double>("gripper_open_gap_mm", 120.0);
-    node->declare_parameter<double>("gripper_closed_gap_mm", 0.0);
+    node->declare_parameter<double>("finger_length_mm", 75.0);
+    node->declare_parameter<double>("axis_spacing_mm", 80.0);
     node->declare_parameter<double>("gripper_impedance_kp", 12.5);
     node->declare_parameter<double>("gripper_impedance_kd", 0.05);
     node->declare_parameter<double>("gripper_velocity_limit_rad_s", 3.5);
     node->declare_parameter<double>("gripper_torque_limit_nm", 4.0);
-    node->declare_parameter<double>("soft_close_fast_velocity_rad_s", 2.0);
-    node->declare_parameter<double>("soft_close_slow_velocity_rad_s", 0.3);
-    node->declare_parameter<double>("soft_close_fast_torque_limit_nm", 3.0);
-    node->declare_parameter<double>("soft_close_slow_torque_limit_nm", 3.0);
-    node->declare_parameter<double>("soft_close_profile_acceleration_rad_s2", 5.0);
-    node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 5.0);
+    node->declare_parameter<double>("soft_close_fast_torque_limit_nm", 4.0);
+    node->declare_parameter<double>("soft_close_slow_torque_limit_nm", 4.0);
+    node->declare_parameter<double>("soft_close_profile_acceleration_rad_s2", 100.0);
+    node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
-    node->declare_parameter<int>("soft_close_fast_duration_ms", 200);
+    node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
     node->declare_parameter<bool>("init_devices_zero", false);
 
     candleParams_S params;
@@ -40,18 +38,14 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("gripper_open_position_rad").as_double();
     params.gripper_closed_position_rad =
         node->get_parameter("gripper_closed_position_rad").as_double();
-    params.gripper_open_gap_mm = node->get_parameter("gripper_open_gap_mm").as_double();
-    params.gripper_closed_gap_mm = node->get_parameter("gripper_closed_gap_mm").as_double();
+    params.finger_length_mm = node->get_parameter("finger_length_mm").as_double();
+    params.axis_spacing_mm = node->get_parameter("axis_spacing_mm").as_double();
     params.gripper_impedance_kp = node->get_parameter("gripper_impedance_kp").as_double();
     params.gripper_impedance_kd = node->get_parameter("gripper_impedance_kd").as_double();
     params.gripper_velocity_limit_rad_s =
         node->get_parameter("gripper_velocity_limit_rad_s").as_double();
     params.gripper_torque_limit_nm =
         node->get_parameter("gripper_torque_limit_nm").as_double();
-    params.soft_close_fast_velocity_rad_s =
-        node->get_parameter("soft_close_fast_velocity_rad_s").as_double();
-    params.soft_close_slow_velocity_rad_s =
-        node->get_parameter("soft_close_slow_velocity_rad_s").as_double();
     params.soft_close_fast_torque_limit_nm =
         node->get_parameter("soft_close_fast_torque_limit_nm").as_double();
     params.soft_close_slow_torque_limit_nm =

@@ -33,15 +33,7 @@ reference.
 In terminal 1, launch the node and keep it running:
 
 ```bash
-ros2 launch candle_ros2 md_node_launch.py \
-  soft_close_fast_velocity_rad_s:=10.0 \
-  soft_close_slow_velocity_rad_s:=2.6 \
-  soft_close_fast_torque_limit_nm:=4.0 \
-  soft_close_slow_torque_limit_nm:=4.0 \
-  soft_close_profile_acceleration_rad_s2:=20.0 \
-  soft_close_profile_deceleration_rad_s2:=30.0 \
-  soft_close_fast_duration_ms:=200 \
-  init_devices_zero:=false
+ros2 launch candle_ros2 md_node_launch.py
 ```
 
 In terminal 2, source the workspace and run the remaining commands in order:
@@ -94,7 +86,17 @@ ros2 service call /md/open_gripper candle_ros2/srv/Generic \
 
 ```bash
 ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-  "{device_ids: [342], pre_close_gap_mm: 3.0}"
+  "{device_ids: [342], pre_close_enabled: true, pre_close_gap_mm: 30.0,
+    fast_speed: 1.0, slow_speed: 0.4}"
+```
+
+Set `pre_close_enabled: false` for one direct profile to the closed position.
+In this mode `pre_close_gap_mm` and `slow_speed` do not affect motion:
+
+```bash
+ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
+  "{device_ids: [342], pre_close_enabled: false, pre_close_gap_mm: 0.0,
+    fast_speed: 1.0, slow_speed: 0.0}"
 ```
 
 1. Or close one drive all the way using impedance mode:
@@ -125,7 +127,7 @@ By default, the script preserves existing encoder zeros and requires typing
 
 1. Applies the calibrated position and velocity PID gains.
 2. Closes and opens each gripper individually.
-3. Soft-closes each gripper individually with `40`, `30`, and `20` mm
+3. Soft-closes each gripper individually with `40`, `30`, and `25` mm
   transition gaps, reopening after every test.
 
 The soft-close values are the gaps where motion changes from fast to slow; they
@@ -187,19 +189,30 @@ Relevant MD-node parameters are:
 - `joint_name_prefix` (`md_`)
 - `gripper_open_position_rad` (`0.0`)
 - `gripper_closed_position_rad` (`0.62`)
-- `gripper_open_gap_mm` / `gripper_closed_gap_mm` (`120.0` / `0.0`) — measured finger gap at open/close; used by soft close
+- `finger_length_mm` (`75.0`) — finger length used by soft-close inverse kinematics
+- `axis_spacing_mm` (`80.0`) — distance between finger axes used by soft-close inverse kinematics
 - `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
 - `gripper_velocity_limit_rad_s` (`3.5`)
 - `gripper_torque_limit_nm` (`4.0`)
-- `soft_close_fast_velocity_rad_s` / `soft_close_slow_velocity_rad_s` (`2.0` / `0.3`)
-- `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`3.0` / `3.0`)
-- `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`5.0` / `5.0`)
+- `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`4.0` / `4.0`)
+- `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
-- `soft_close_fast_duration_ms` (`200`) — slow stage starts this long after the request
+- `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
 - `init_devices_zero` (`false`)
 
-The slow-stage monitoring timeout is `500 ms`. Reaching the timeout ends the
+Soft-close converts `pre_close_gap_mm` to a finger angle using the configured
+finger length and axis spacing. Finger angles are limited to `68°` (closed) and
+`112°` (open), then mapped between `gripper_closed_position_rad` and
+`gripper_open_position_rad`. With the default geometry, requested gaps are
+clamped to approximately `23.8`–`136.2 mm`.
+
+The slow-stage monitoring timeout is `1000 ms`. Reaching the timeout ends the
 software job, but leaves the position profile active and holding its target.
+
+Soft-close speed fields are normalized request values in `[0, 1]`. They map
+linearly to physical velocity using `velocity = 0.4 + speed * 5.6` rad/s, so
+`0.0` means `0.4 rad/s` and `1.0` means `6.0 rad/s`. Requests outside this
+range are rejected.
 
 Soft close uses the position and velocity PID gains stored in the drive. The
 service rejects the request when either position Kp or velocity Kp is not
