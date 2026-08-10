@@ -1,5 +1,0 @@
-# Gently open toward the mechanical endstop, zero the encoder, restore normal
-# impedance parameters, then save configuration to flash.
-uint16[] device_ids
----
-bool[] success

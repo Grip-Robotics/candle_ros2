@@ -30,17 +30,6 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 500);
     node->declare_parameter<bool>("init_devices_zero", false);
-    node->declare_parameter<double>("home_impedance_kp", 4.0);
-    node->declare_parameter<double>("home_impedance_kd", 0.05);
-    node->declare_parameter<double>("home_torque_limit_nm", 2.5);
-    node->declare_parameter<double>("home_velocity_limit_rad_s", 1.0);
-    node->declare_parameter<double>("home_step_rad", 0.05);
-    node->declare_parameter<double>("home_stall_velocity_rad_s", 0.02);
-    node->declare_parameter<double>("home_stall_position_eps_rad", 0.005);
-    node->declare_parameter<double>("home_stall_torque_nm", 0.25);
-    node->declare_parameter<int>("home_stall_hold_ms", 300);
-    node->declare_parameter<int>("home_timeout_ms", 8000);
-    node->declare_parameter<int>("home_poll_ms", 20);
 
     candleParams_S params;
     params.data_rate   = node->get_parameter("data_rate").as_string();
@@ -76,20 +65,6 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.soft_close_fast_duration_ms =
         node->get_parameter("soft_close_fast_duration_ms").as_int();
     params.init_devices_zero = node->get_parameter("init_devices_zero").as_bool();
-    params.home_impedance_kp = node->get_parameter("home_impedance_kp").as_double();
-    params.home_impedance_kd = node->get_parameter("home_impedance_kd").as_double();
-    params.home_torque_limit_nm = node->get_parameter("home_torque_limit_nm").as_double();
-    params.home_velocity_limit_rad_s =
-        node->get_parameter("home_velocity_limit_rad_s").as_double();
-    params.home_step_rad = node->get_parameter("home_step_rad").as_double();
-    params.home_stall_velocity_rad_s =
-        node->get_parameter("home_stall_velocity_rad_s").as_double();
-    params.home_stall_position_eps_rad =
-        node->get_parameter("home_stall_position_eps_rad").as_double();
-    params.home_stall_torque_nm = node->get_parameter("home_stall_torque_nm").as_double();
-    params.home_stall_hold_ms = node->get_parameter("home_stall_hold_ms").as_int();
-    params.home_timeout_ms = node->get_parameter("home_timeout_ms").as_int();
-    params.home_poll_ms = node->get_parameter("home_poll_ms").as_int();
     return params;
 }
 

@@ -24,15 +24,4 @@ struct candleParams_S
     double      soft_close_closed_tol_rad;
     int         soft_close_fast_duration_ms;
     bool        init_devices_zero;
-    double      home_impedance_kp;
-    double      home_impedance_kd;
-    double      home_torque_limit_nm;
-    double      home_velocity_limit_rad_s;
-    double      home_step_rad;
-    double      home_stall_velocity_rad_s;
-    double      home_stall_position_eps_rad;
-    double      home_stall_torque_nm;
-    int         home_stall_hold_ms;
-    int         home_timeout_ms;
-    int         home_poll_ms;
 };

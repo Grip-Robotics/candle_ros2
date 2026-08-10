@@ -11,94 +11,28 @@ For configuration, please use:
 ## Features
 
 ### MD Node
+
 - Control MD drive controllers
 - Publish joint state data
 - Accept position, velocity, motion, and impedance commands
 - Provide enable/disable/zero/mode setup services
 
-### PDS Node
-- Manage PDS devices and their modules
-- Monitor modules such as the Control Board, Isolated Converter, Brake Resistor, and Power Stage
 
-## Installation
-
-Go to your ROS2 workspace and clone the repository:
-
-```bash
-git clone git@github.com:mabrobotics/candle_ros2.git src/candle_ros2
-```
-
-Initialize submodules:
-
-```bash
-git -C src/candle_ros2/ submodule update --init --recursive
-```
-
-Build:
-
-```bash
-colcon build
-```
-
-Source the environment:
-
-```bash
-source install/setup.bash
-```
-
-## Running
-
-### MD Node
-```bash
-ros2 launch candle_ros2 md_node_launch.py
-```
-
-### PDS Node
-```bash
-ros2 launch candle_ros2 pds_node_launch.py
-```
-
-### Both Nodes
-```bash
-ros2 launch candle_ros2 both_launch.py
-```
-
-### Launch arguments
-
-- `bus` — desired communication bus with CANdle device, possible values: `USB` and `SPI` (default: `USB`).
-- `data_rate` — data rate of CAN network, possible values: `1M`, `2M`, `5M` and `8M` (default: `1M`).
-- `default_qos` — ROS message quality of service for node's publishers, possible values: `Reliable` and `BestEffort` (default: `Reliable`).
-
-Example launch command with custom arguments:
-```bash
-ros2 launch candle_ros2 md_node_launch.py bus:=SPI data_rate:=5M
-```
 
 ## Example MD service calls - GRIPPER CONTROL
 
-Bring up one or more drives, then open or close the gripper. `init_devices`
-adds each drive, applies the requested mode, and enables it. Encoder zeroing is
-disabled by default: zero only when the mechanism is at a known reference, or
-launch with `init_devices_zero:=true` when that condition is guaranteed.
 
-The legacy open/close services use the node-wide gripper parameters. A
-multi-motor gripper should instead use `/md/set_gripper_targets`, which accepts
-one independently calibrated target and limit set per drive.
+
+### Calibrated three-drive soft close
+
+The following commands are the calibrated sequence for drives `343`, `344`, and
+`345`. Before starting, place every gripper at its known mechanical open
+reference. The launch uses `init_devices_zero:=true`, so the subsequent
+`/md/init_devices` call records each current position as zero.
+
+In terminal 1, launch the node and keep it running:
 
 ```bash
-# Bring up device 343 in impedance mode
-ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
-  "{device_ids: [343], mode: 'IMPEDANCE'}"
-
-# Close / open gripper
-ros2 service call /md/close_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
-ros2 service call /md/open_gripper candle_ros2/srv/Generic "{device_ids: [343]}"
-
-# Soft close: POSITION_PROFILE fast move, then slow profile after 500 ms
-ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-  "{device_ids: [343], pre_close_gap_mm: 25.0}"
-
-# Soft-close tuning example; the next /md/init_devices call also zeros the drive
 ros2 launch candle_ros2 md_node_launch.py \
   soft_close_fast_velocity_rad_s:=10.0 \
   soft_close_slow_velocity_rad_s:=2.6 \
@@ -107,24 +41,85 @@ ros2 launch candle_ros2 md_node_launch.py \
   soft_close_profile_acceleration_rad_s2:=20.0 \
   soft_close_profile_deceleration_rad_s2:=30.0 \
   init_devices_zero:=true
+```
 
-# Optional: set impedance gains explicitly (overwritten again by open/close)
+In terminal 2, source the workspace and run the remaining commands in order:
+
+```bash
+source install/setup.bash
+```
+
+1. Add, zero, configure, and enable all drives in impedance mode:
+
+```bash
+ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
+  "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
+```
+
+1. Apply the calibrated runtime position and velocity PID gains:
+
+```bash
+ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
+  "{device_ids: [342, 343, 345],
+    position_pid: [
+      {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0},
+      {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0},
+      {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0}
+    ],
+    velocity_pid: [
+      {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0},
+      {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0},
+      {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0}
+    ]}"
+```
+
+1. Open all grippers:
+
+```bash
+ros2 service call /md/open_gripper candle_ros2/srv/Generic \
+  "{device_ids: [342, 343, 345]}"
+```
+
+1. Run the calibrated two-stage close. Adjust `pre_close_gap_mm` when a
+  different transition gap is required:
+
+```bash
+ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
+  "{device_ids: [343, 344, 345], pre_close_gap_mm: 3.0}"
+```
+
+1. Or just close all the way using impedance mode:
+
+```bash
+ros2 service call /md/close_gripper candle_ros2/srv/Generic \
+  "{device_ids: [342, 343, 345]}"
+```
+
+The PID command above changes runtime registers and may need to be repeated
+after a drive reset or power cycle. Never use `init_devices_zero:=true` unless
+all mechanisms are physically at the intended zero reference.
+
+### Additional gripper commands
+
+Set impedance gains explicitly when needed; normal open/close writes the
+node-wide impedance settings again:
+
+```bash
 ros2 topic pub /md/impedance_command candle_ros2/msg/ImpedanceCmd \
   "{device_ids: [343], kp: [12.5], kd: [0.05], max_output: [4.0]}" --once
 
 # Three independently calibrated motors in one acknowledged batch request
 ros2 service call /md/configure_gripper candle_ros2/srv/ConfigureGripper \
-  "{device_ids: [343, 344, 345], kp: [12.5, 12.5, 12.5], kd: [0.05, 0.05, 0.05],
+  "{device_ids: [342, 343, 345], kp: [12.5, 12.5, 12.5], kd: [0.05, 0.05, 0.05],
     velocity_limit_rad_s: [3.5, 3.5, 3.5],
     torque_limit_nm: [4.0, 4.0, 4.0]}"
 ros2 service call /md/set_gripper_targets candle_ros2/srv/SetGripperTargets \
-  "{device_ids: [343, 344, 345], target_position_rad: [0.62, 0.62, 0.62]}"
-
-# Home at the mechanical open endstop (gentle open → zero → restore gains → save)
-# Unlike /md/zero, this persists the zero (and restored config) across power cycles.
-ros2 service call /md/home_gripper candle_ros2/srv/HomeGripper \
-  "{device_ids: [343, 344, 345]}"
+  "{device_ids: [342, 343, 345], target_position_rad: [0.62, 0.62, 0.62]}"
 ```
+
+The legacy open/close services use the node-wide gripper parameters. A
+multi-motor gripper with independently calibrated targets should use
+`/md/set_gripper_targets`, which accepts one target and limit set per drive.
 
 Individual steps are also available as `/md/add_mds`, `/md/set_mode`, `/md/zero`, and `/md/enable`.
 
@@ -143,16 +138,8 @@ Relevant MD-node parameters are:
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`500`) — slow stage starts this long after the request
 - `init_devices_zero` (`false`)
-- `home_impedance_kp` / `home_impedance_kd` (`4.0` / `0.05`)
-- `home_torque_limit_nm` (`2.5`)
-- `home_velocity_limit_rad_s` (`1.0`)
-- `home_step_rad` (`0.05`)
-- `home_stall_velocity_rad_s` (`0.02`)
-- `home_stall_position_eps_rad` (`0.005`)
-- `home_stall_torque_nm` (`0.25`)
-- `home_stall_hold_ms` (`300`)
-- `home_timeout_ms` (`8000`)
-- `home_poll_ms` (`20`)
+
+```
 
 Soft close uses the position and velocity PID gains stored in the drive. The
 service rejects the request when either position Kp or velocity Kp is not
@@ -166,3 +153,5 @@ Full CANdle ROS2 documentation:
 
 MAB controllers manuals:
 ➡️ [MAB documentation](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/intro.html)
+```
+

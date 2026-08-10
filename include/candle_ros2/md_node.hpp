@@ -15,7 +15,6 @@
 #include "candle_ros2/srv/add_devices.hpp"
 #include "candle_ros2/srv/configure_gripper.hpp"
 #include "candle_ros2/srv/generic.hpp"
-#include "candle_ros2/srv/home_gripper.hpp"
 #include "candle_ros2/srv/init_devices.hpp"
 #include "candle_ros2/srv/set_limits.hpp"
 #include "candle_ros2/srv/set_gripper_targets.hpp"
@@ -82,18 +81,6 @@ class MdNode : public rclcpp::Node
     int         softCloseFastDurationMs;
     bool        initDevicesZero;
 
-    float homeImpedanceKp;
-    float homeImpedanceKd;
-    float homeTorqueLimitNm;
-    float homeVelocityLimitRadS;
-    double homeStepRad;
-    double homeStallVelocityRadS;
-    double homeStallPositionEpsRad;
-    double homeStallTorqueNm;
-    int    homeStallHoldMs;
-    int    homeTimeoutMs;
-    int    homePollMs;
-
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pubJointState;
 
     rclcpp::Subscription<candle_ros2::msg::MotionCmd>::SharedPtr      subMotionCmd;
@@ -112,7 +99,6 @@ class MdNode : public rclcpp::Node
     rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvClose;
     rclcpp::Service<candle_ros2::srv::ConfigureGripper>::SharedPtr  srvConfigureGripper;
     rclcpp::Service<candle_ros2::srv::SetGripperTargets>::SharedPtr srvSetGripperTargets;
-    rclcpp::Service<candle_ros2::srv::HomeGripper>::SharedPtr       srvHomeGripper;
     rclcpp::Service<candle_ros2::srv::SoftCloseGripper>::SharedPtr srvSoftClose;
 
     rclcpp::TimerBase::SharedPtr tmrPub;
@@ -148,8 +134,6 @@ class MdNode : public rclcpp::Node
         std::shared_ptr<candle_ros2::srv::SetGripperTargets::Response>      rsp);
     void cbConfigureGripper(const std::shared_ptr<candle_ros2::srv::ConfigureGripper::Request> req,
                             std::shared_ptr<candle_ros2::srv::ConfigureGripper::Response>      rsp);
-    void cbHomeGripper(const std::shared_ptr<candle_ros2::srv::HomeGripper::Request> req,
-                       std::shared_ptr<candle_ros2::srv::HomeGripper::Response>      rsp);
     void cbSoftCloseGripper(
         const std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Request> req,
         std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Response>      rsp);
@@ -161,7 +145,7 @@ class MdNode : public rclcpp::Node
     bool setGripperTarget(mab::MD& md, double targetPos);
     bool moveGripper(mab::MD& md, double targetPos);
     bool restoreNormalGripperConfig(mab::MD& md);
-    bool homeGripper(mab::MD& md);
+    bool resetDriveErrorsIfNeeded(mab::MD& md);
     void cancelSoftClose(u16 id);
 
     /** Inverse kinematics: finger gap [mm] → motor position [rad]. */

@@ -44,17 +44,6 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="500"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
-        DeclareLaunchArgument("home_impedance_kp", default_value="4.0"),
-        DeclareLaunchArgument("home_impedance_kd", default_value="0.05"),
-        DeclareLaunchArgument("home_torque_limit_nm", default_value="2.5"),
-        DeclareLaunchArgument("home_velocity_limit_rad_s", default_value="1.0"),
-        DeclareLaunchArgument("home_step_rad", default_value="0.05"),
-        DeclareLaunchArgument("home_stall_velocity_rad_s", default_value="0.02"),
-        DeclareLaunchArgument("home_stall_position_eps_rad", default_value="0.005"),
-        DeclareLaunchArgument("home_stall_torque_nm", default_value="0.25"),
-        DeclareLaunchArgument("home_stall_hold_ms", default_value="300"),
-        DeclareLaunchArgument("home_timeout_ms", default_value="8000"),
-        DeclareLaunchArgument("home_poll_ms", default_value="20"),
     ]
 
     bus = LaunchConfiguration("bus")
@@ -135,39 +124,6 @@ def generate_launch_description():
                         ),
                         "init_devices_zero": ParameterValue(
                             LaunchConfiguration("init_devices_zero"), value_type=bool
-                        ),
-                        "home_impedance_kp": ParameterValue(
-                            LaunchConfiguration("home_impedance_kp"), value_type=float
-                        ),
-                        "home_impedance_kd": ParameterValue(
-                            LaunchConfiguration("home_impedance_kd"), value_type=float
-                        ),
-                        "home_torque_limit_nm": ParameterValue(
-                            LaunchConfiguration("home_torque_limit_nm"), value_type=float
-                        ),
-                        "home_velocity_limit_rad_s": ParameterValue(
-                            LaunchConfiguration("home_velocity_limit_rad_s"), value_type=float
-                        ),
-                        "home_step_rad": ParameterValue(
-                            LaunchConfiguration("home_step_rad"), value_type=float
-                        ),
-                        "home_stall_velocity_rad_s": ParameterValue(
-                            LaunchConfiguration("home_stall_velocity_rad_s"), value_type=float
-                        ),
-                        "home_stall_position_eps_rad": ParameterValue(
-                            LaunchConfiguration("home_stall_position_eps_rad"), value_type=float
-                        ),
-                        "home_stall_torque_nm": ParameterValue(
-                            LaunchConfiguration("home_stall_torque_nm"), value_type=float
-                        ),
-                        "home_stall_hold_ms": ParameterValue(
-                            LaunchConfiguration("home_stall_hold_ms"), value_type=int
-                        ),
-                        "home_timeout_ms": ParameterValue(
-                            LaunchConfiguration("home_timeout_ms"), value_type=int
-                        ),
-                        "home_poll_ms": ParameterValue(
-                            LaunchConfiguration("home_poll_ms"), value_type=int
                         ),
                     }
                 ],
