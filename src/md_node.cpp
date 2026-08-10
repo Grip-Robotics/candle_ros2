@@ -365,6 +365,17 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
     addReq->device_ids = req->device_ids;
     cbAddMd(addReq, addRsp);
 
+    std::vector<bool> resetOk(n, false);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const bool added = i < addRsp->success.size() && addRsp->success[i];
+        if (!added)
+            continue;
+
+        auto md = findMd(m_mds, req->device_ids[i]);
+        resetOk[i] = md != m_mds.end() && resetDriveErrorsIfNeeded(*md);
+    }
+
     auto modeReq        = std::make_shared<candle_ros2::srv::SetMode::Request>();
     auto modeRsp        = std::make_shared<candle_ros2::srv::SetMode::Response>();
     modeReq->device_ids = req->device_ids;
@@ -423,7 +434,8 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         const bool modeOk  = i < modeRsp->success.size() && modeRsp->success[i];
         const bool zeroed  = i < zeroRsp->success.size() && zeroRsp->success[i];
         const bool enabled = i < enableRsp->success.size() && enableRsp->success[i];
-        rsp->success[i]    = added && modeOk && zeroed && targetPrepared[i] && enabled;
+        rsp->success[i] =
+            added && resetOk[i] && modeOk && zeroed && targetPrepared[i] && enabled;
     }
 }
 
@@ -659,27 +671,32 @@ bool MdNode::restoreNormalGripperConfig(mab::MD& md)
 bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
 {
     const auto [quickStatus, statusErr] = md.getQuickStatus();
-    if (statusErr != mab::MD::Error_t::OK)
+    using Bits = mab::MDStatus::QuickStatusBits;
+    const bool statusUnavailable = statusErr != mab::MD::Error_t::OK;
+    const bool inError =
+        !statusUnavailable &&
+        (quickStatus.at(Bits::MainEncoderStatus).isSet() ||
+         quickStatus.at(Bits::OutputEncoderStatus).isSet() ||
+         quickStatus.at(Bits::CalibrationEncoderStatus).isSet() ||
+         quickStatus.at(Bits::MosfetBridgeStatus).isSet() ||
+         quickStatus.at(Bits::HardwareStatus).isSet() ||
+         quickStatus.at(Bits::MotionStatus).isSet());
+    if (!inError)
+    {
+        if (!statusUnavailable)
+            return true;
+
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to read quick status for drive %d; attempting error reset before "
+                    "motion command",
+                    md.m_canId);
+    }
+    else
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Failed to read quick status for drive %d before motion command",
+                    "Drive %d is in error state; clearing errors before motion command",
                     md.m_canId);
-        return true;
     }
-
-    using Bits = mab::MDStatus::QuickStatusBits;
-    const bool inError = quickStatus.at(Bits::MainEncoderStatus).isSet() ||
-                         quickStatus.at(Bits::OutputEncoderStatus).isSet() ||
-                         quickStatus.at(Bits::CalibrationEncoderStatus).isSet() ||
-                         quickStatus.at(Bits::MosfetBridgeStatus).isSet() ||
-                         quickStatus.at(Bits::HardwareStatus).isSet() ||
-                         quickStatus.at(Bits::MotionStatus).isSet();
-    if (!inError)
-        return true;
-
-    RCLCPP_WARN(this->get_logger(),
-                "Drive %d is in error state; clearing errors before motion command",
-                md.m_canId);
 
     if (md.clearErrors() != mab::MD::Error_t::OK)
     {
@@ -688,6 +705,8 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
         return false;
     }
 
+    // Error recovery does not call zero(), so the calibrated encoder reference
+    // remains unchanged.
     // Faults typically drop the enable latch; restore it so the command can run.
     if (md.enable() != mab::MD::Error_t::OK)
     {

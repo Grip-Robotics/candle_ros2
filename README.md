@@ -25,10 +25,10 @@ For configuration, please use:
 
 ### Calibrated three-drive soft close
 
-The following commands are the calibrated sequence for drives `343`, `344`, and
-`345`. Before starting, place every gripper at its known mechanical open
-reference. The launch uses `init_devices_zero:=true`, so the subsequent
-`/md/init_devices` call records each current position as zero.
+The following commands are the calibrated sequence for drives `342`, `343`, and
+`345`. Encoder zeros are preserved during normal initialization. Zero a drive
+only as a deliberate calibration step while it is at its known mechanical open
+reference.
 
 In terminal 1, launch the node and keep it running:
 
@@ -40,7 +40,7 @@ ros2 launch candle_ros2 md_node_launch.py \
   soft_close_slow_torque_limit_nm:=4.0 \
   soft_close_profile_acceleration_rad_s2:=20.0 \
   soft_close_profile_deceleration_rad_s2:=30.0 \
-  init_devices_zero:=true
+  init_devices_zero:=false
 ```
 
 In terminal 2, source the workspace and run the remaining commands in order:
@@ -49,14 +49,22 @@ In terminal 2, source the workspace and run the remaining commands in order:
 source install/setup.bash
 ```
 
-1. Add, zero, configure, and enable all drives in impedance mode:
+1. Add, configure, and enable all drives in impedance mode without changing
+   their encoder zeros:
 
 ```bash
 ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
   "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
 ```
 
-1. Apply the calibrated runtime position and velocity PID gains:
+2. With every gripper at its known mechanical open reference, zero all drives:
+
+```bash
+ros2 service call /md/zero candle_ros2/srv/Generic \
+  "{device_ids: [342, 343, 345]}"
+```
+
+3. Apply the calibrated runtime position and velocity PID gains:
 
 ```bash
 ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
@@ -73,31 +81,81 @@ ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
     ]}"
 ```
 
-1. Open all grippers:
+4. Open all grippers:
 
 ```bash
 ros2 service call /md/open_gripper candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-1. Run the calibrated two-stage close. Adjust `pre_close_gap_mm` when a
-  different transition gap is required:
+5. Run the calibrated two-stage close for one drive at a time. Adjust
+   `pre_close_gap_mm` when a different transition gap is required:
 
 ```bash
 ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-  "{device_ids: [343, 344, 345], pre_close_gap_mm: 3.0}"
+  "{device_ids: [342], pre_close_gap_mm: 3.0}"
 ```
 
-1. Or just close all the way using impedance mode:
+6. Or close one drive all the way using impedance mode:
 
 ```bash
 ros2 service call /md/close_gripper candle_ros2/srv/Generic \
-  "{device_ids: [342, 343, 345]}"
+  "{device_ids: [342]}"
 ```
 
 The PID command above changes runtime registers and may need to be repeated
 after a drive reset or power cycle. Never use `init_devices_zero:=true` unless
 all mechanisms are physically at the intended zero reference.
+
+### Automated service test
+
+The installed test script runs the complete calibrated procedure for drives
+`342`, `343`, and `345`. Build and source the package, keep the calibrated node
+launch above running in another terminal, then execute:
+
+```bash
+colcon build --packages-select candle_ros2
+source install/setup.bash
+ros2 run candle_ros2 test_grippers.sh
+```
+
+By default, the script preserves existing encoder zeros and requires typing
+`RUN` before moving. After confirmation, it automatically:
+
+1. Applies the calibrated position and velocity PID gains.
+2. Closes and opens each gripper individually.
+3. Soft-closes each gripper individually with `40`, `30`, and `20` mm
+   transition gaps, reopening after every test.
+
+The soft-close values are the gaps where motion changes from fast to slow; they
+are not final commanded widths. The script intentionally avoids simultaneous
+closing because the combined current draw can cause an undervoltage fault.
+
+Use `--zero` only for deliberate encoder calibration after placing every
+mechanism at its mechanical open reference:
+
+```bash
+ros2 run candle_ros2 test_grippers.sh --zero
+```
+
+Use `--yes` only when it is safe to skip the interactive motion confirmation:
+
+```bash
+ros2 run candle_ros2 test_grippers.sh --yes
+```
+
+Motion delays and service timeout can be overridden when slower hardware needs
+more time:
+
+```bash
+MOVE_WAIT_SECONDS=3 \
+SOFT_CLOSE_WAIT_SECONDS=9 \
+SERVICE_TIMEOUT_SECONDS=20 \
+ros2 run candle_ros2 test_grippers.sh
+```
+
+If a service reports failure, times out, or the script is interrupted, the
+script requests `/md/disable` for all three drives.
 
 ### Additional gripper commands
 

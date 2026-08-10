@@ -91,4 +91,8 @@ install(TARGETS
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
+install(PROGRAMS
+  scripts/test_grippers.sh
+  DESTINATION lib/${PROJECT_NAME})
+
 ament_package()
