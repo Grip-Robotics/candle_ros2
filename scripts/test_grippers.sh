@@ -238,6 +238,7 @@ for gap in "${SOFT_CLOSE_GAPS[@]}"; do
         printf '\nTesting drive %d with a %d mm fast-to-slow transition gap.\n' "$id" "$gap"
         call_service /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
             "{device_ids: [${id}], pre_close_enabled: true, pre_close_gap_mm: ${gap}.0,
+              pre_close_offset_mm: 0.0,
               fast_speed: 1.0, slow_speed: 0.4}"
         sleep "$SOFT_CLOSE_WAIT_SECONDS"
         call_service /md/open_gripper candle_ros2/srv/Generic \

@@ -1,8 +1,10 @@
 #include "candle_ros2/md_node.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -14,8 +16,6 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       jointNamePrefix(params.joint_name_prefix),
       gripperOpenPositionRad(params.gripper_open_position_rad),
       gripperClosedPositionRad(params.gripper_closed_position_rad),
-      fingerLengthMm(params.finger_length_mm),
-      axisSpacingMm(params.axis_spacing_mm),
       gripperImpedanceKp(static_cast<float>(params.gripper_impedance_kp)),
       gripperImpedanceKd(static_cast<float>(params.gripper_impedance_kd)),
       gripperVelocityLimitRadS(static_cast<float>(params.gripper_velocity_limit_rad_s)),
@@ -33,8 +33,6 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     if (jointNamePrefix.empty())
         throw std::invalid_argument("joint_name_prefix must not be empty");
     if (!std::isfinite(gripperOpenPositionRad) || !std::isfinite(gripperClosedPositionRad) ||
-        !std::isfinite(fingerLengthMm) || fingerLengthMm <= 0.0 ||
-        !std::isfinite(axisSpacingMm) || axisSpacingMm <= 0.0 ||
         !std::isfinite(gripperImpedanceKp) || gripperImpedanceKp < 0.0f ||
         !std::isfinite(gripperImpedanceKd) || gripperImpedanceKd < 0.0f ||
         !std::isfinite(gripperVelocityLimitRadS) || gripperVelocityLimitRadS <= 0.0f ||
@@ -726,26 +724,24 @@ void MdNode::cancelSoftClose(u16 id)
 
 double MdNode::fingerGapToMotorPos(double gapMm) const
 {
-    constexpr double PI = 3.14159265358979323846;
-    constexpr double DEG_TO_RAD = PI / 180.0;
-    constexpr double RAD_TO_DEG = 180.0 / PI;
+    static constexpr std::array<double, 5> GAPS_MM = {0.0, 15.0, 30.0, 50.0, 90.0};
+    static constexpr std::array<double, 5> MOTOR_POS_RAD = {0.63, 0.44, 0.366, 0.228, 0.05};
 
-    const double minGapMm =
-        axisSpacingMm -
-        2.0 * fingerLengthMm * std::cos(FINGER_ANGLE_MIN_DEG * DEG_TO_RAD);
-    const double maxGapMm =
-        axisSpacingMm -
-        2.0 * fingerLengthMm * std::cos(FINGER_ANGLE_MAX_DEG * DEG_TO_RAD);
-    const double clampedGapMm = std::clamp(gapMm, minGapMm, maxGapMm);
-    const double cosineValue =
-        std::clamp((axisSpacingMm - clampedGapMm) / (2.0 * fingerLengthMm), -1.0, 1.0);
-    const double fingerAngleDeg = std::acos(cosineValue) * RAD_TO_DEG;
-    const double closeFraction =
-        (FINGER_ANGLE_MAX_DEG - fingerAngleDeg) /
-        (FINGER_ANGLE_MAX_DEG - FINGER_ANGLE_MIN_DEG);
+    const double clampedGapMm = std::clamp(gapMm, GAPS_MM.front(), GAPS_MM.back());
+    const auto upper = std::upper_bound(GAPS_MM.begin(), GAPS_MM.end(), clampedGapMm);
+    if (upper == GAPS_MM.begin())
+        return MOTOR_POS_RAD.front();
+    if (upper == GAPS_MM.end())
+        return MOTOR_POS_RAD.back();
 
-    return gripperOpenPositionRad +
-           closeFraction * (gripperClosedPositionRad - gripperOpenPositionRad);
+    const size_t upperIndex = static_cast<size_t>(std::distance(GAPS_MM.begin(), upper));
+    const size_t lowerIndex = upperIndex - 1;
+    const double fraction =
+        (clampedGapMm - GAPS_MM[lowerIndex]) /
+        (GAPS_MM[upperIndex] - GAPS_MM[lowerIndex]);
+
+    return MOTOR_POS_RAD[lowerIndex] +
+           fraction * (MOTOR_POS_RAD[upperIndex] - MOTOR_POS_RAD[lowerIndex]);
 }
 
 double MdNode::normalizedSpeedToRadS(double normalizedSpeed)
@@ -777,10 +773,13 @@ void MdNode::tickSoftCloseJobs()
         if (job.stage != SoftCloseStage::Slow && (now - job.requestStart) >= fastDuration)
         {
             if (md->disable() != mab::MD::Error_t::OK ||
-                !configurePositionProfile(
-                    *md, job.slowVelocityRadS, softCloseSlowTorqueLimitNm) ||
+                !configureGripper(*md,
+                                  gripperImpedanceKp,
+                                  gripperImpedanceKd,
+                                  job.slowVelocityRadS,
+                                  softCloseSlowTorqueLimitNm) ||
                 !setGripperTarget(*md, gripperClosedPositionRad) ||
-                md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
+                md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
                 md->enable() != mab::MD::Error_t::OK)
             {
                 RCLCPP_WARN(this->get_logger(),
@@ -795,7 +794,7 @@ void MdNode::tickSoftCloseJobs()
             job.stage          = SoftCloseStage::Slow;
             job.slowStageStart = now;
             RCLCPP_INFO(this->get_logger(),
-                        "Soft-close: drive %d entered slow profile after %d ms "
+                        "Soft-close: drive %d entered slow impedance stage after %d ms "
                         "(velocity=%.3f rad/s, torque limit=%.3f Nm)",
                         id,
                         softCloseFastDurationMs,
@@ -852,7 +851,7 @@ void MdNode::tickSoftCloseJobs()
                             id);
             }
 
-            // Keep POSITION_PROFILE active so the controller holds the closed target.
+            // Keep IMPEDANCE active so the controller holds the closed target.
             finished.push_back(id);
         }
     }
@@ -931,28 +930,34 @@ void MdNode::cbSoftCloseGripper(
         return;
     }
 
-    if (req->pre_close_enabled && !std::isfinite(req->pre_close_gap_mm))
+    if (req->pre_close_enabled &&
+        (!std::isfinite(req->pre_close_gap_mm) || !std::isfinite(req->pre_close_offset_mm)))
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: pre_close_gap_mm must be finite when pre-close is enabled");
+                    "Soft-close: pre_close_gap_mm and pre_close_offset_mm must be finite when "
+                    "pre-close is enabled");
         rsp->success.assign(req->device_ids.size(), false);
         return;
     }
 
     const double fastVelocityRadS = normalizedSpeedToRadS(normalizedFastSpeed);
     const double slowVelocityRadS = normalizedSpeedToRadS(normalizedSlowSpeed);
+    const double effectiveGapMm =
+        static_cast<double>(req->pre_close_gap_mm) +
+        static_cast<double>(req->pre_close_offset_mm);
     const double fastTarget =
-        req->pre_close_enabled
-            ? fingerGapToMotorPos(static_cast<double>(req->pre_close_gap_mm))
-            : gripperClosedPositionRad;
+        req->pre_close_enabled ? fingerGapToMotorPos(effectiveGapMm) : gripperClosedPositionRad;
     const auto requestStart = this->now();
 
     if (req->pre_close_enabled)
     {
         RCLCPP_INFO(this->get_logger(),
-                    "Soft-close: pre-close enabled, gap=%.1f mm -> motor %.3f rad, "
+                    "Soft-close: pre-close enabled, gap=%.1f mm, offset=%+.1f mm, "
+                    "effective gap=%.1f mm -> motor %.3f rad, "
                     "normalized speeds fast=%.3f (%.3f rad/s), slow=%.3f (%.3f rad/s)",
                     req->pre_close_gap_mm,
+                    req->pre_close_offset_mm,
+                    effectiveGapMm,
                     fastTarget,
                     normalizedFastSpeed,
                     fastVelocityRadS,

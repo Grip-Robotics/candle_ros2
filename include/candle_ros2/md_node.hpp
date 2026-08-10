@@ -62,16 +62,12 @@ class MdNode : public rclcpp::Node
     static constexpr int SLOW_STAGE_TIMEOUT_MS = 1000;
     static constexpr double SOFT_CLOSE_MIN_SPEED_RAD_S = 0.4;
     static constexpr double SOFT_CLOSE_MAX_SPEED_RAD_S = 6.0;
-    static constexpr double FINGER_ANGLE_MIN_DEG = 68.0;
-    static constexpr double FINGER_ANGLE_MAX_DEG = 112.0;
 
     std::unordered_map<u16, SoftCloseJob> m_softCloseJobs;
 
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
     double      gripperClosedPositionRad;
-    double      fingerLengthMm;
-    double      axisSpacingMm;
     float       gripperImpedanceKp;
     float       gripperImpedanceKd;
     float       gripperVelocityLimitRadS;
@@ -151,7 +147,7 @@ class MdNode : public rclcpp::Node
     bool resetDriveErrorsIfNeeded(mab::MD& md);
     void cancelSoftClose(u16 id);
 
-    /** Inverse kinematics: finger gap [mm] → motor position [rad]. */
+    /** Piecewise-linear calibration: finger gap [mm] → motor position [rad]. */
     double fingerGapToMotorPos(double gapMm) const;
     static double normalizedSpeedToRadS(double normalizedSpeed);
 

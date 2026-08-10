@@ -3,6 +3,7 @@
 uint16[] device_ids
 bool pre_close_enabled     # true: fast to gap, then slow; false: one fast profile to closed
 float32 pre_close_gap_mm   # Fast-to-slow transition gap [mm], ignored when disabled
+float32 pre_close_offset_mm # Signed offset added to pre_close_gap_mm [mm], ignored when disabled
 float32 fast_speed         # Normalized [0, 1], mapped linearly to [0.4, 6.0] rad/s
 float32 slow_speed         # Normalized [0, 1], mapped linearly to [0.4, 6.0] rad/s
 ---

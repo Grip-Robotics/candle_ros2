@@ -15,8 +15,6 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<std::string>("joint_name_prefix", "md_");
     node->declare_parameter<double>("gripper_open_position_rad", 0.0);
     node->declare_parameter<double>("gripper_closed_position_rad", 0.62);
-    node->declare_parameter<double>("finger_length_mm", 75.0);
-    node->declare_parameter<double>("axis_spacing_mm", 80.0);
     node->declare_parameter<double>("gripper_impedance_kp", 12.5);
     node->declare_parameter<double>("gripper_impedance_kd", 0.05);
     node->declare_parameter<double>("gripper_velocity_limit_rad_s", 3.5);
@@ -38,8 +36,6 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("gripper_open_position_rad").as_double();
     params.gripper_closed_position_rad =
         node->get_parameter("gripper_closed_position_rad").as_double();
-    params.finger_length_mm = node->get_parameter("finger_length_mm").as_double();
-    params.axis_spacing_mm = node->get_parameter("axis_spacing_mm").as_double();
     params.gripper_impedance_kp = node->get_parameter("gripper_impedance_kp").as_double();
     params.gripper_impedance_kd = node->get_parameter("gripper_impedance_kd").as_double();
     params.gripper_velocity_limit_rad_s =

@@ -28,9 +28,7 @@ def generate_launch_description():
     gripper_args = [
         DeclareLaunchArgument("joint_name_prefix", default_value="md_"),
         DeclareLaunchArgument("gripper_open_position_rad", default_value="0.0"),
-        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.65"),
-        DeclareLaunchArgument("finger_length_mm", default_value="75.0"),
-        DeclareLaunchArgument("axis_spacing_mm", default_value="80.0"),
+        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.63"),
         DeclareLaunchArgument("gripper_impedance_kp", default_value="12.5"),
         DeclareLaunchArgument("gripper_impedance_kd", default_value="0.05"),
         DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="3.5"),
@@ -71,12 +69,6 @@ def generate_launch_description():
                         ),
                         "gripper_closed_position_rad": ParameterValue(
                             LaunchConfiguration("gripper_closed_position_rad"), value_type=float
-                        ),
-                        "finger_length_mm": ParameterValue(
-                            LaunchConfiguration("finger_length_mm"), value_type=float
-                        ),
-                        "axis_spacing_mm": ParameterValue(
-                            LaunchConfiguration("axis_spacing_mm"), value_type=float
                         ),
                         "gripper_impedance_kp": ParameterValue(
                             LaunchConfiguration("gripper_impedance_kp"), value_type=float

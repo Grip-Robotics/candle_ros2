@@ -9,8 +9,6 @@ struct candleParams_S
     std::string joint_name_prefix;
     double      gripper_open_position_rad;
     double      gripper_closed_position_rad;
-    double      finger_length_mm;
-    double      axis_spacing_mm;
     double      gripper_impedance_kp;
     double      gripper_impedance_kd;
     double      gripper_velocity_limit_rad_s;
