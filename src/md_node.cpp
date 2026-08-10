@@ -644,18 +644,30 @@ bool MdNode::setGripperTarget(mab::MD& md, double targetPos)
 
 bool MdNode::moveGripper(mab::MD& md, double targetPos)
 {
-    if (md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK)
+    if (md.disable() != mab::MD::Error_t::OK)
     {
-        RCLCPP_WARN(
-            this->get_logger(), "Failed to set IMPEDANCE mode for drive with ID: %d", md.m_canId);
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to disable drive with ID: %d before impedance move",
+                    md.m_canId);
         return false;
     }
-    return configureGripper(md,
-                            gripperImpedanceKp,
-                            gripperImpedanceKd,
-                            gripperVelocityLimitRadS,
-                            gripperTorqueLimitNm) &&
-           setGripperTarget(md, targetPos);
+
+    if (!configureGripper(md,
+                          gripperImpedanceKp,
+                          gripperImpedanceKd,
+                          gripperVelocityLimitRadS,
+                          gripperTorqueLimitNm) ||
+        !setGripperTarget(md, targetPos) ||
+        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+        md.enable() != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to start impedance move for drive with ID: %d",
+                    md.m_canId);
+        return false;
+    }
+
+    return true;
 }
 
 bool MdNode::restoreNormalGripperConfig(mab::MD& md)
@@ -705,17 +717,8 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
         return false;
     }
 
-    // Error recovery does not call zero(), so the calibrated encoder reference
-    // remains unchanged.
-    // Faults typically drop the enable latch; restore it so the command can run.
-    if (md.enable() != mab::MD::Error_t::OK)
-    {
-        RCLCPP_WARN(this->get_logger(),
-                    "Failed to re-enable drive %d after clearing errors",
-                    md.m_canId);
-        return false;
-    }
-
+    // Do not enable here: the caller must first configure its mode and target,
+    // then enable the drive. Error recovery never calls zero().
     return true;
 }
 

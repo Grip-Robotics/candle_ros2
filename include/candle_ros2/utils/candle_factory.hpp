@@ -28,7 +28,7 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_profile_acceleration_rad_s2", 5.0);
     node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 5.0);
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
-    node->declare_parameter<int>("soft_close_fast_duration_ms", 500);
+    node->declare_parameter<int>("soft_close_fast_duration_ms", 200);
     node->declare_parameter<bool>("init_devices_zero", false);
 
     candleParams_S params;

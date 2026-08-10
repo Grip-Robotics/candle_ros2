@@ -58,7 +58,7 @@ class MdNode : public rclcpp::Node
     static constexpr const char* NODE_PREFIX  = "md/";
     static constexpr int         PUB_TIMER_MS = 5;  // 200 Hz
 
-    static constexpr int    SLOW_STAGE_TIMEOUT_MS = 5000;
+    static constexpr int SLOW_STAGE_TIMEOUT_MS = 500;
 
     std::unordered_map<u16, SoftCloseJob> m_softCloseJobs;
 

@@ -40,6 +40,7 @@ ros2 launch candle_ros2 md_node_launch.py \
   soft_close_slow_torque_limit_nm:=4.0 \
   soft_close_profile_acceleration_rad_s2:=20.0 \
   soft_close_profile_deceleration_rad_s2:=30.0 \
+  soft_close_fast_duration_ms:=200 \
   init_devices_zero:=false
 ```
 
@@ -50,21 +51,21 @@ source install/setup.bash
 ```
 
 1. Add, configure, and enable all drives in impedance mode without changing
-   their encoder zeros:
+  their encoder zeros:
 
 ```bash
 ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
   "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
 ```
 
-2. With every gripper at its known mechanical open reference, zero all drives:
+1. With every gripper at its known mechanical open reference, zero all drives:
 
 ```bash
 ros2 service call /md/zero candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-3. Apply the calibrated runtime position and velocity PID gains:
+1. Apply the calibrated runtime position and velocity PID gains:
 
 ```bash
 ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
@@ -81,22 +82,22 @@ ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
     ]}"
 ```
 
-4. Open all grippers:
+1. Open all grippers:
 
 ```bash
 ros2 service call /md/open_gripper candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-5. Run the calibrated two-stage close for one drive at a time. Adjust
-   `pre_close_gap_mm` when a different transition gap is required:
+1. Run the calibrated two-stage close for one drive at a time. Adjust
+  `pre_close_gap_mm` when a different transition gap is required:
 
 ```bash
 ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
   "{device_ids: [342], pre_close_gap_mm: 3.0}"
 ```
 
-6. Or close one drive all the way using impedance mode:
+1. Or close one drive all the way using impedance mode:
 
 ```bash
 ros2 service call /md/close_gripper candle_ros2/srv/Generic \
@@ -125,7 +126,7 @@ By default, the script preserves existing encoder zeros and requires typing
 1. Applies the calibrated position and velocity PID gains.
 2. Closes and opens each gripper individually.
 3. Soft-closes each gripper individually with `40`, `30`, and `20` mm
-   transition gaps, reopening after every test.
+  transition gaps, reopening after every test.
 
 The soft-close values are the gaps where motion changes from fast to slow; they
 are not final commanded widths. The script intentionally avoids simultaneous
@@ -194,10 +195,11 @@ Relevant MD-node parameters are:
 - `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`3.0` / `3.0`)
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`5.0` / `5.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
-- `soft_close_fast_duration_ms` (`500`) — slow stage starts this long after the request
+- `soft_close_fast_duration_ms` (`200`) — slow stage starts this long after the request
 - `init_devices_zero` (`false`)
 
-```
+The slow-stage monitoring timeout is `500 ms`. Reaching the timeout ends the
+software job, but leaves the position profile active and holding its target.
 
 Soft close uses the position and velocity PID gains stored in the drive. The
 service rejects the request when either position Kp or velocity Kp is not
@@ -211,5 +213,4 @@ Full CANdle ROS2 documentation:
 
 MAB controllers manuals:
 ➡️ [MAB documentation](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/intro.html)
-```
 

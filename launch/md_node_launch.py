@@ -42,7 +42,7 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_profile_acceleration_rad_s2", default_value="5.0"),
         DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="5.0"),
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
-        DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="500"),
+        DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="200"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
     ]
 
