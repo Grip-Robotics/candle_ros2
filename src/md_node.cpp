@@ -675,29 +675,26 @@ bool MdNode::profilePidReady(mab::MD& md)
 
 bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit)
 {
+    // The drive's global limit registers (positionLimitMin/Max, maxVelocity) are
+    // intentionally never written: they persist after soft-close and previously
+    // latched "Error Velocity Limit"/"Warning Position" flags during later
+    // impedance moves. Motion bounds come from the profile registers below.
     mab::MDRegisters_S regs;
-    regs.positionLimitMin = static_cast<float>(
-        std::min(gripperOpenPositionRad, gripperClosedPositionRad));
-    regs.positionLimitMax = static_cast<float>(
-        std::max(gripperOpenPositionRad, gripperClosedPositionRad));
     regs.maxTorque = static_cast<float>(torqueLimit);
-    if (md.writeRegisters(regs.positionLimitMin, regs.positionLimitMax, regs.maxTorque) !=
-        mab::MD::Error_t::OK)
+    if (md.writeRegisters(regs.maxTorque) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to set position/torque limits for drive %d",
+                    "Soft-close: failed to set torque limit for drive %d",
                     md.m_canId);
         return false;
     }
 
-    regs.maxVelocity     = static_cast<float>(velocityLimit);
     regs.maxAcceleration = softCloseProfileAccelerationRadS2;
     regs.maxDeceleration = softCloseProfileDecelerationRadS2;
-    if (md.writeRegisters(regs.maxVelocity, regs.maxAcceleration, regs.maxDeceleration) !=
-        mab::MD::Error_t::OK)
+    if (md.writeRegisters(regs.maxAcceleration, regs.maxDeceleration) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to set global profile limits for drive %d",
+                    "Soft-close: failed to set acceleration limits for drive %d",
                     md.m_canId);
         return false;
     }

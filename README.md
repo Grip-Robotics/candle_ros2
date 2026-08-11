@@ -243,9 +243,10 @@ The fast soft-close stage uses the position and velocity PID gains stored in
 the drive. The service rejects the request when either position Kp or velocity
 Kp is not configured. The slow stage uses impedance control with
 `gripper_impedance_kp`, `gripper_impedance_kd`, the requested slow speed as its
-velocity limit, and `soft_close_slow_torque_limit_nm`. Soft close applies hard
-position limits between the configured open and closed positions and does not
-use target overtravel.
+velocity limit, and `soft_close_slow_torque_limit_nm`. Soft close does not
+write the drive's global position or velocity limit registers
+(`positionLimitMin/Max`, `maxVelocity`); motion bounds come from the commanded
+target and the profile registers, and no target overtravel is used.
 
 ## Documentation
 
