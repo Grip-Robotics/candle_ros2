@@ -29,6 +29,25 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("position_recovery_max_delta_rad", 0.25);
     node->declare_parameter<int>("position_recovery_samples", 3);
     node->declare_parameter<int>("position_recovery_retry_ms", 25);
+    node->declare_parameter<std::string>("startup_position_policy", "restore_or_home");
+    node->declare_parameter<std::string>(
+        "position_state_file", "~/.ros/candle_ros2_position_state.json");
+    node->declare_parameter<int>("position_state_write_period_ms", 1000);
+    node->declare_parameter<double>("position_state_min_change_rad", 0.005);
+    node->declare_parameter<std::string>(
+        "homing_direction_by_id", "342:-1,343:-1,345:-1");
+    node->declare_parameter<double>("homing_torque_nm", 0.3);
+    node->declare_parameter<double>("homing_second_pass_torque_nm", 0.2);
+    node->declare_parameter<int>("homing_torque_ramp_ms", 500);
+    node->declare_parameter<double>("homing_velocity_trip_rad_s", 1.0);
+    node->declare_parameter<double>("homing_min_bus_voltage_v", 10.0);
+    node->declare_parameter<double>("homing_stall_velocity_rad_s", 0.02);
+    node->declare_parameter<int>("homing_stall_dwell_ms", 250);
+    node->declare_parameter<double>("homing_max_travel_rad", 0.75);
+    node->declare_parameter<int>("homing_timeout_ms", 5000);
+    node->declare_parameter<double>("homing_backoff_rad", 0.03);
+    node->declare_parameter<double>("homing_repeatability_rad", 0.015);
+    node->declare_parameter<double>("homing_min_motion_rad", 0.01);
     node->declare_parameter<bool>("init_devices_zero", false);
 
     candleParams_S params;
@@ -66,6 +85,35 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("position_recovery_samples").as_int();
     params.position_recovery_retry_ms =
         node->get_parameter("position_recovery_retry_ms").as_int();
+    params.startup_position_policy =
+        node->get_parameter("startup_position_policy").as_string();
+    params.position_state_file = node->get_parameter("position_state_file").as_string();
+    params.position_state_write_period_ms =
+        node->get_parameter("position_state_write_period_ms").as_int();
+    params.position_state_min_change_rad =
+        node->get_parameter("position_state_min_change_rad").as_double();
+    params.homing_direction_by_id =
+        node->get_parameter("homing_direction_by_id").as_string();
+    params.homing_torque_nm = node->get_parameter("homing_torque_nm").as_double();
+    params.homing_second_pass_torque_nm =
+        node->get_parameter("homing_second_pass_torque_nm").as_double();
+    params.homing_torque_ramp_ms = node->get_parameter("homing_torque_ramp_ms").as_int();
+    params.homing_velocity_trip_rad_s =
+        node->get_parameter("homing_velocity_trip_rad_s").as_double();
+    params.homing_min_bus_voltage_v =
+        node->get_parameter("homing_min_bus_voltage_v").as_double();
+    params.homing_stall_velocity_rad_s =
+        node->get_parameter("homing_stall_velocity_rad_s").as_double();
+    params.homing_stall_dwell_ms =
+        node->get_parameter("homing_stall_dwell_ms").as_int();
+    params.homing_max_travel_rad =
+        node->get_parameter("homing_max_travel_rad").as_double();
+    params.homing_timeout_ms = node->get_parameter("homing_timeout_ms").as_int();
+    params.homing_backoff_rad = node->get_parameter("homing_backoff_rad").as_double();
+    params.homing_repeatability_rad =
+        node->get_parameter("homing_repeatability_rad").as_double();
+    params.homing_min_motion_rad =
+        node->get_parameter("homing_min_motion_rad").as_double();
     params.init_devices_zero = node->get_parameter("init_devices_zero").as_bool();
     return params;
 }

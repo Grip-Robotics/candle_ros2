@@ -1,7 +1,9 @@
 #pragma once
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <optional>
+#include <string>
 #include <unordered_map>
 
 #include "rclcpp/rclcpp.hpp"
@@ -25,7 +27,9 @@
 
 /* Utils */
 #include "candle_ros2/utils/candle_params.hpp"
+#include "candle_ros2/homing_monitor.hpp"
 #include "candle_ros2/position_tracker.hpp"
+#include "candle_ros2/position_state_store.hpp"
 
 /* CANdle-SDK */
 #include "candle.hpp"
@@ -69,6 +73,38 @@ class MdNode : public rclcpp::Node
         bool                                  errorsCleared = false;
     };
 
+    enum class DriveStartupState
+    {
+        Uninitialized,
+        Restoring,
+        Homing,
+        Tracking,
+        Recovering,
+        Faulted
+    };
+
+    enum class HomingStage
+    {
+        InitialBackoff,
+        FirstSeek,
+        Backoff,
+        SecondSeek
+    };
+
+    struct HomingContext
+    {
+        HomingStage stage = HomingStage::FirstSeek;
+        std::chrono::steady_clock::time_point stageStart;
+        std::chrono::steady_clock::time_point nextSample;
+        HomingSeekState seekState;
+        double startRawPosition = 0.0;
+        double firstStopRawPosition = 0.0;
+        double backoffTargetRawPosition = 0.0;
+        double lastTorqueCommand = 0.0;
+        double lastBackoffKp = 0.0;
+        std::optional<std::chrono::steady_clock::time_point> backoffSettleStart;
+    };
+
     std::shared_ptr<mab::Candle> m_candle;
     std::vector<mab::MD>         m_mds;
 
@@ -83,6 +119,14 @@ class MdNode : public rclcpp::Node
     std::unordered_map<u16, PositionTracker> m_positionTrackers;
     std::unordered_map<u16, ResumeCommand> m_resumeCommands;
     std::unordered_map<u16, RecoveryContext> m_recoveryContexts;
+    std::unordered_map<u16, DriveStartupState> m_startupStates;
+    std::unordered_map<u16, int> m_homingDirections;
+    std::unordered_map<u16, double> m_lastPersistedLogicalPositions;
+    std::unordered_map<u16, std::uint64_t> m_calibrationGenerations;
+    std::optional<std::pair<u16, HomingContext>> m_activeHoming;
+    std::deque<u16> m_homingQueue;
+    PositionStateStore m_positionStateStore;
+    std::chrono::steady_clock::time_point m_lastStateWrite;
 
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
@@ -101,6 +145,21 @@ class MdNode : public rclcpp::Node
     double      positionRecoveryMaxDeltaRad;
     int         positionRecoverySamples;
     int         positionRecoveryRetryMs;
+    std::string startupPositionPolicy;
+    int         positionStateWritePeriodMs;
+    double      positionStateMinChangeRad;
+    double      homingTorqueNm;
+    double      homingSecondPassTorqueNm;
+    int         homingTorqueRampMs;
+    double      homingVelocityTripRadS;
+    double      homingMinBusVoltageV;
+    double      homingStallVelocityRadS;
+    int         homingStallDwellMs;
+    double      homingMaxTravelRad;
+    int         homingTimeoutMs;
+    double      homingBackoffRad;
+    double      homingRepeatabilityRad;
+    double      homingMinMotionRad;
     bool        initDevicesZero;
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pubJointState;
@@ -122,12 +181,15 @@ class MdNode : public rclcpp::Node
     rclcpp::Service<candle_ros2::srv::ConfigureGripper>::SharedPtr  srvConfigureGripper;
     rclcpp::Service<candle_ros2::srv::SetGripperTargets>::SharedPtr srvSetGripperTargets;
     rclcpp::Service<candle_ros2::srv::SoftCloseGripper>::SharedPtr srvSoftClose;
+    rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvHome;
 
     rclcpp::TimerBase::SharedPtr tmrPub;
 
     void publishJointStates();
     void tickSoftCloseJobs();
     void tickRecoveryJobs();
+    void tickHoming();
+    void maybePersistPositionState(bool force = false);
 
     void cbMotionCmd(const candle_ros2::msg::MotionCmd& msg);
     void cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg);
@@ -139,6 +201,8 @@ class MdNode : public rclcpp::Node
     void cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::Request> req,
                        std::shared_ptr<candle_ros2::srv::InitDevices::Response>      rsp);
     void cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
+                std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp);
+    void cbHome(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
                 std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp);
     void cbSetMode(const std::shared_ptr<candle_ros2::srv::SetMode::Request> req,
                    std::shared_ptr<candle_ros2::srv::SetMode::Response>      rsp);
@@ -162,7 +226,11 @@ class MdNode : public rclcpp::Node
         std::shared_ptr<candle_ros2::srv::SoftCloseGripper::Response>      rsp);
 
     bool configureGripper(
-        mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit);
+        mab::MD& md,
+        double   kp,
+        double   kd,
+        double   velocityLimit,
+        double   torqueLimit);
     bool profilePidReady(mab::MD& md);
     bool configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
@@ -175,6 +243,15 @@ class MdNode : public rclcpp::Node
     bool resumeAfterRecovery(mab::MD& md);
     bool canAcceptPositionCommand(u16 id) const;
     void rememberResumeCommand(u16 id, double target, bool softClose, double slowVelocity);
+    bool tryRestorePosition(mab::MD& md);
+    bool queueHoming(u16 id);
+    bool startNextHoming();
+    bool startTorqueSeek(mab::MD& md, HomingContext& context, HomingStage stage);
+    bool writeTargetTorque(mab::MD& md, double torqueNm);
+    void completeHoming(mab::MD& md, HomingContext& context, double stopRawPosition);
+    void abortHoming(mab::MD& md, const std::string& reason);
+    void parseHomingDirections(const std::string& setting);
+    const char* startupStateName(DriveStartupState state) const;
     void cancelSoftClose(u16 id);
 
     /** Piecewise-linear calibration: finger gap [mm] → motor position [rad]. */

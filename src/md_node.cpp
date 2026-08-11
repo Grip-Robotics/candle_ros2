@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -14,6 +15,8 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
                const candleParams_S&        params)
     : Node("candle_md_node", options),
       m_candle(std::move(candle)),
+      m_positionStateStore(params.position_state_file),
+      m_lastStateWrite(std::chrono::steady_clock::now()),
       jointNamePrefix(params.joint_name_prefix),
       gripperOpenPositionRad(params.gripper_open_position_rad),
       gripperClosedPositionRad(params.gripper_closed_position_rad),
@@ -33,6 +36,21 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       positionRecoveryMaxDeltaRad(params.position_recovery_max_delta_rad),
       positionRecoverySamples(params.position_recovery_samples),
       positionRecoveryRetryMs(params.position_recovery_retry_ms),
+      startupPositionPolicy(params.startup_position_policy),
+      positionStateWritePeriodMs(params.position_state_write_period_ms),
+      positionStateMinChangeRad(params.position_state_min_change_rad),
+      homingTorqueNm(params.homing_torque_nm),
+      homingSecondPassTorqueNm(params.homing_second_pass_torque_nm),
+      homingTorqueRampMs(params.homing_torque_ramp_ms),
+      homingVelocityTripRadS(params.homing_velocity_trip_rad_s),
+      homingMinBusVoltageV(params.homing_min_bus_voltage_v),
+      homingStallVelocityRadS(params.homing_stall_velocity_rad_s),
+      homingStallDwellMs(params.homing_stall_dwell_ms),
+      homingMaxTravelRad(params.homing_max_travel_rad),
+      homingTimeoutMs(params.homing_timeout_ms),
+      homingBackoffRad(params.homing_backoff_rad),
+      homingRepeatabilityRad(params.homing_repeatability_rad),
+      homingMinMotionRad(params.homing_min_motion_rad),
       initDevicesZero(params.init_devices_zero)
 {
     if (jointNamePrefix.empty())
@@ -53,9 +71,39 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         encoderWrapPeriodRad <= 0.0 || !std::isfinite(positionRecoveryMaxDeltaRad) ||
         positionRecoveryMaxDeltaRad <= 0.0 ||
         positionRecoveryMaxDeltaRad >= encoderWrapPeriodRad / 2.0 ||
-        positionRecoverySamples <= 0 || positionRecoveryRetryMs <= 0)
+        positionRecoverySamples <= 0 || positionRecoveryRetryMs <= 0 ||
+        (startupPositionPolicy != "restore_or_home" &&
+         startupPositionPolicy != "restore_only" && startupPositionPolicy != "always_home") ||
+        positionStateWritePeriodMs <= 0 || !std::isfinite(positionStateMinChangeRad) ||
+        positionStateMinChangeRad < 0.0 || !std::isfinite(homingTorqueNm) ||
+        homingTorqueNm <= 0.0 || !std::isfinite(homingSecondPassTorqueNm) ||
+        homingSecondPassTorqueNm <= 0.0 ||
+        homingSecondPassTorqueNm > homingTorqueNm || homingTorqueRampMs <= 0 ||
+        !std::isfinite(homingVelocityTripRadS) || homingVelocityTripRadS <= 0.0 ||
+        !std::isfinite(homingMinBusVoltageV) || homingMinBusVoltageV <= 0.0 ||
+        !std::isfinite(homingStallVelocityRadS) || homingStallVelocityRadS < 0.0 ||
+        homingStallVelocityRadS >= homingVelocityTripRadS ||
+        homingStallDwellMs <= 0 || !std::isfinite(homingMaxTravelRad) ||
+        homingMaxTravelRad <= 0.0 || homingTimeoutMs <= 0 ||
+        !std::isfinite(homingBackoffRad) || homingBackoffRad <= 0.0 ||
+        homingBackoffRad >= homingMaxTravelRad ||
+        !std::isfinite(homingRepeatabilityRad) || homingRepeatabilityRad <= 0.0 ||
+        homingRepeatabilityRad >= homingBackoffRad ||
+        !std::isfinite(homingMinMotionRad) || homingMinMotionRad <= 0.0 ||
+        homingMinMotionRad >= homingMaxTravelRad)
         throw std::invalid_argument(
             "invalid gripper position, gain, velocity, torque, or soft-close parameter");
+
+    parseHomingDirections(params.homing_direction_by_id);
+    std::string stateLoadError;
+    if (!m_positionStateStore.load(&stateLoadError))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Position state file %s is invalid: %s; startup restore disabled until "
+                    "homing succeeds",
+                    m_positionStateStore.path().c_str(),
+                    stateLoadError.c_str());
+    }
 
     rclcpp::QoS defaultQoS(10);
     defaultQoS.reliable();
@@ -92,6 +140,9 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     srvZero = this->create_service<candle_ros2::srv::Generic>(
         std::string(NODE_PREFIX) + "zero",
         std::bind(&MdNode::cbZero, this, std::placeholders::_1, std::placeholders::_2));
+    srvHome = this->create_service<candle_ros2::srv::Generic>(
+        std::string(NODE_PREFIX) + "home",
+        std::bind(&MdNode::cbHome, this, std::placeholders::_1, std::placeholders::_2));
     srvSetMode = this->create_service<candle_ros2::srv::SetMode>(
         std::string(NODE_PREFIX) + "set_mode",
         std::bind(&MdNode::cbSetMode, this, std::placeholders::_1, std::placeholders::_2));
@@ -129,11 +180,22 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
 
 MdNode::~MdNode()
 {
+    if (m_activeHoming.has_value())
+    {
+        auto md = findMd(m_mds, m_activeHoming->first);
+        if (md != m_mds.end())
+        {
+            writeTargetTorque(*md, 0.0);
+            md->disable();
+        }
+    }
+    maybePersistPositionState(true);
     RCLCPP_INFO(this->get_logger(), "Candle ROS2 MD node finished.");
 }
 
 void MdNode::publishJointStates()
 {
+    tickHoming();
     tickRecoveryJobs();
     tickSoftCloseJobs();
 
@@ -175,6 +237,7 @@ void MdNode::publishJointStates()
         msgJointStates.effort.push_back(torque);
     }
     this->pubJointState->publish(msgJointStates);
+    maybePersistPositionState();
     return;
 }
 
@@ -397,6 +460,9 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
             PositionTracker(encoderWrapPeriodRad,
                             positionRecoveryMaxDeltaRad,
                             static_cast<std::size_t>(positionRecoverySamples)));
+        m_startupStates[id] = DriveStartupState::Uninitialized;
+        if (const auto persisted = m_positionStateStore.get(id); persisted.has_value())
+            m_calibrationGenerations[id] = persisted->calibrationGeneration;
         m_mds.push_back(std::move(md));
         rsp->success.push_back(true);
     }
@@ -440,14 +506,42 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
             continue;
         }
 
-        if (initDevicesZero && md->zero() != mab::MD::Error_t::OK)
+        bool restoredPosition = false;
+        if (initDevicesZero &&
+            (md->zero() != mab::MD::Error_t::OK || md->save() != mab::MD::Error_t::OK))
         {
             RCLCPP_WARN(
                 this->get_logger(), "Init devices: failed to zero drive %d", req->device_ids[i]);
             continue;
         }
         if (initDevicesZero)
+        {
             m_positionTrackers.at(req->device_ids[i]).resetAtZero();
+            m_startupStates[req->device_ids[i]] = DriveStartupState::Tracking;
+            ++m_calibrationGenerations[req->device_ids[i]];
+        }
+        else if (m_startupStates[req->device_ids[i]] != DriveStartupState::Tracking)
+        {
+            m_startupStates[req->device_ids[i]] = DriveStartupState::Restoring;
+            restoredPosition =
+                startupPositionPolicy != "always_home" && tryRestorePosition(*md);
+            if (!restoredPosition)
+            {
+                if (startupPositionPolicy == "restore_only")
+                {
+                    m_startupStates[req->device_ids[i]] = DriveStartupState::Faulted;
+                    RCLCPP_ERROR(this->get_logger(),
+                                 "Init devices: drive %d has no valid persisted position; "
+                                 "manual /md/home is required",
+                                 req->device_ids[i]);
+                }
+                else
+                {
+                    queueHoming(req->device_ids[i]);
+                }
+                continue;
+            }
+        }
 
         const bool configured =
             req->mode != "IMPEDANCE" ||
@@ -470,8 +564,11 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         if (modeRsp->success.empty() || !modeRsp->success.front())
             continue;
 
-        const auto holdPos = readLogicalPosition(*md, false);
-        if (!holdPos.has_value() || !setGripperTarget(*md, *holdPos))
+        const auto currentPos = readLogicalPosition(*md, false);
+        const double holdPos =
+            currentPos.has_value() ? *currentPos
+                                   : std::numeric_limits<double>::quiet_NaN();
+        if (!std::isfinite(holdPos) || !setGripperTarget(*md, holdPos))
         {
             RCLCPP_WARN(this->get_logger(),
                         "Init devices: failed to latch hold target for drive %d",
@@ -486,7 +583,7 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         // start a close motion.
         const auto holdPosAfterEnable = readLogicalPosition(*md, false);
         if (!holdPosAfterEnable.has_value() ||
-            !setGripperTarget(*md, *holdPosAfterEnable))
+            !setGripperTarget(*md, holdPos))
         {
             RCLCPP_WARN(this->get_logger(),
                         "Init devices: failed to reassert hold target for drive %d after enable",
@@ -499,8 +596,7 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
                     "Init devices: drive %d holding at %.4f rad",
                     req->device_ids[i],
                     *holdPosAfterEnable);
-        rememberResumeCommand(
-            req->device_ids[i], *holdPosAfterEnable, false, gripperVelocityLimitRadS);
+        rememberResumeCommand(req->device_ids[i], holdPos, false, gripperVelocityLimitRadS);
         rsp->success[i] = true;
     }
 }
@@ -519,6 +615,11 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
             continue;
         }
 
+        if (m_activeHoming.has_value() && m_activeHoming->first == id)
+            abortHoming(*md, "manual zero requested");
+        m_homingQueue.erase(
+            std::remove(m_homingQueue.begin(), m_homingQueue.end(), id),
+            m_homingQueue.end());
         cancelSoftClose(id);
 
         if (md->zero() != mab::MD::Error_t::OK)
@@ -530,6 +631,8 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
 
         m_recoveryContexts.erase(id);
         m_positionTrackers.at(id).resetAtZero();
+        m_startupStates[id] = DriveStartupState::Tracking;
+        ++m_calibrationGenerations[id];
 
         // Zero changes the position frame but does not update the active
         // target. Replace the pre-zero target immediately so the drive holds
@@ -545,10 +648,19 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
         }
 
         rememberResumeCommand(id, 0.0, false, gripperVelocityLimitRadS);
+        maybePersistPositionState(true);
         RCLCPP_INFO(this->get_logger(), "Drive %d zeroed and holding at logical 0 rad", id);
         rsp->success.push_back(true);
     }
     return;
+}
+
+void MdNode::cbHome(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
+                    std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp)
+{
+    rsp->success.reserve(req->device_ids.size());
+    for (const auto id : req->device_ids)
+        rsp->success.push_back(queueHoming(id));
 }
 
 void MdNode::cbSetLimits(const std::shared_ptr<candle_ros2::srv::SetLimits::Request> req,
@@ -590,7 +702,11 @@ void MdNode::cbSetLimits(const std::shared_ptr<candle_ros2::srv::SetLimits::Requ
 }
 
 bool MdNode::configureGripper(
-    mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit)
+    mab::MD& md,
+    double   kp,
+    double   kd,
+    double   velocityLimit,
+    double   torqueLimit)
 {
     mab::MDRegisters_S impedanceRegs;
     impedanceRegs.motorImpPidKp = static_cast<float>(kp);
@@ -605,12 +721,13 @@ bool MdNode::configureGripper(
         return false;
     }
 
-    mab::MDRegisters_S limitRegs;
-    limitRegs.profileVelocity = static_cast<float>(velocityLimit);
-    limitRegs.maxTorque       = static_cast<float>(torqueLimit);
-    if (md.writeRegisters(limitRegs.profileVelocity, limitRegs.maxTorque) != mab::MD::Error_t::OK)
+    mab::MDRegisters_S profileRegs;
+    profileRegs.profileVelocity = static_cast<float>(velocityLimit);
+    if (md.writeRegisters(profileRegs.profileVelocity) != mab::MD::Error_t::OK)
     {
-        RCLCPP_WARN(this->get_logger(), "Failed to set limits for drive with ID: %d", md.m_canId);
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to set profile velocity for drive with ID: %d",
+                    md.m_canId);
         return false;
     }
 
@@ -674,24 +791,18 @@ bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double 
         return false;
 
     mab::MDRegisters_S regs;
-    const double rawOpen   = tracker->second.logicalToRaw(gripperOpenPositionRad);
-    const double rawClosed = tracker->second.logicalToRaw(gripperClosedPositionRad);
-    regs.positionLimitMin  = static_cast<float>(std::min(rawOpen, rawClosed));
-    regs.positionLimitMax  = static_cast<float>(std::max(rawOpen, rawClosed));
     regs.maxTorque = static_cast<float>(torqueLimit);
-    if (md.writeRegisters(regs.positionLimitMin, regs.positionLimitMax, regs.maxTorque) !=
-        mab::MD::Error_t::OK)
+    if (md.writeRegisters(regs.maxTorque) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to set position/torque limits for drive %d",
+                    "Soft-close: failed to set torque limit for drive %d",
                     md.m_canId);
         return false;
     }
 
-    regs.maxVelocity     = static_cast<float>(velocityLimit);
     regs.maxAcceleration = softCloseProfileAccelerationRadS2;
     regs.maxDeceleration = softCloseProfileDecelerationRadS2;
-    if (md.writeRegisters(regs.maxVelocity, regs.maxAcceleration, regs.maxDeceleration) !=
+    if (md.writeRegisters(regs.maxAcceleration, regs.maxDeceleration) !=
         mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
@@ -797,6 +908,20 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
     const auto [quickStatus, statusErr] = md.getQuickStatus();
     using Bits = mab::MDStatus::QuickStatusBits;
     const bool statusUnavailable = statusErr != mab::MD::Error_t::OK;
+    using MotionBits = mab::MDStatus::MotionStatusBits;
+    bool motionError = false;
+    if (!statusUnavailable && quickStatus.at(Bits::MotionStatus).isSet())
+    {
+        const auto [motionStatus, motionErr] = md.getMotionStatus();
+        if (motionErr != mab::MD::Error_t::OK)
+        {
+            beginRecovery(md.m_canId);
+            return false;
+        }
+        motionError =
+            motionStatus.at(MotionBits::ErrorPositionLimit).isSet() ||
+            motionStatus.at(MotionBits::ErrorVelocityLimit).isSet();
+    }
     const bool inError =
         !statusUnavailable &&
         (quickStatus.at(Bits::MainEncoderStatus).isSet() ||
@@ -804,7 +929,7 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
          quickStatus.at(Bits::CalibrationEncoderStatus).isSet() ||
          quickStatus.at(Bits::MosfetBridgeStatus).isSet() ||
          quickStatus.at(Bits::HardwareStatus).isSet() ||
-         quickStatus.at(Bits::MotionStatus).isSet());
+         motionError);
     if (!inError)
     {
         if (!statusUnavailable)
@@ -821,6 +946,23 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
         RCLCPP_WARN(this->get_logger(),
                     "Drive %d is in error state; clearing errors before motion command",
                     md.m_canId);
+        const auto [hardwareStatus, hardwareErr] = md.getHardwareStatus();
+        const auto [motionStatus, motionErr]     = md.getMotionStatus();
+        if (hardwareErr == mab::MD::Error_t::OK &&
+            motionErr == mab::MD::Error_t::OK)
+        {
+            using HardwareBits = mab::MDStatus::HardwareStatusBits;
+            using MotionBits   = mab::MDStatus::MotionStatusBits;
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Drive %d fault details: undervoltage=%d overcurrent=%d "
+                "position_limit=%d velocity_limit=%d",
+                md.m_canId,
+                hardwareStatus.at(HardwareBits::ErrorUnderVoltage).isSet(),
+                hardwareStatus.at(HardwareBits::ErrorOverCurrent).isSet(),
+                motionStatus.at(MotionBits::ErrorPositionLimit).isSet(),
+                motionStatus.at(MotionBits::ErrorVelocityLimit).isSet());
+        }
     }
 
     if (md.clearErrors() != mab::MD::Error_t::OK)
@@ -831,13 +973,27 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
     }
 
     const auto [statusAfterClear, statusAfterClearErr] = md.getQuickStatus();
+    bool motionErrorAfterClear = false;
+    if (statusAfterClearErr == mab::MD::Error_t::OK &&
+        statusAfterClear.at(Bits::MotionStatus).isSet())
+    {
+        const auto [motionStatus, motionErr] = md.getMotionStatus();
+        if (motionErr != mab::MD::Error_t::OK)
+        {
+            beginRecovery(md.m_canId);
+            return false;
+        }
+        motionErrorAfterClear =
+            motionStatus.at(MotionBits::ErrorPositionLimit).isSet() ||
+            motionStatus.at(MotionBits::ErrorVelocityLimit).isSet();
+    }
     if (statusAfterClearErr != mab::MD::Error_t::OK ||
         statusAfterClear.at(Bits::MainEncoderStatus).isSet() ||
         statusAfterClear.at(Bits::OutputEncoderStatus).isSet() ||
         statusAfterClear.at(Bits::CalibrationEncoderStatus).isSet() ||
         statusAfterClear.at(Bits::MosfetBridgeStatus).isSet() ||
         statusAfterClear.at(Bits::HardwareStatus).isSet() ||
-        statusAfterClear.at(Bits::MotionStatus).isSet())
+        motionErrorAfterClear)
     {
         RCLCPP_WARN(this->get_logger(),
                     "Drive %d is not healthy after clearing errors; motion rejected",
@@ -852,7 +1008,9 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
 std::optional<double> MdNode::readLogicalPosition(mab::MD& md, bool triggerRecovery)
 {
     auto tracker = m_positionTrackers.find(md.m_canId);
-    if (tracker == m_positionTrackers.end())
+    const auto startupState = m_startupStates.find(md.m_canId);
+    if (tracker == m_positionTrackers.end() || startupState == m_startupStates.end() ||
+        startupState->second != DriveStartupState::Tracking)
         return std::nullopt;
 
     if (tracker->second.state() == PositionTracker::State::Recovering ||
@@ -873,7 +1031,9 @@ std::optional<double> MdNode::readLogicalPosition(mab::MD& md, bool triggerRecov
 void MdNode::beginRecovery(u16 id)
 {
     auto tracker = m_positionTrackers.find(id);
-    if (tracker == m_positionTrackers.end() ||
+    auto startupState = m_startupStates.find(id);
+    if (tracker == m_positionTrackers.end() || startupState == m_startupStates.end() ||
+        startupState->second != DriveStartupState::Tracking ||
         tracker->second.state() == PositionTracker::State::Faulted)
         return;
 
@@ -886,6 +1046,7 @@ void MdNode::beginRecovery(u16 id)
                 id, gripperClosedPositionRad, true, softClose->second.slowVelocityRadS);
         }
         tracker->second.markCommunicationLost();
+        startupState->second = DriveStartupState::Recovering;
         RCLCPP_WARN(this->get_logger(),
                     "Drive %d lost communication; position invalid until automatic recovery",
                     id);
@@ -911,8 +1072,7 @@ bool MdNode::resumeAfterRecovery(mab::MD& md)
     const double torque = softClose ? softCloseSlowTorqueLimitNm : gripperTorqueLimitNm;
 
     if (md.disable() != mab::MD::Error_t::OK ||
-        !configureGripper(
-            md, gripperImpedanceKp, gripperImpedanceKd, velocity, torque) ||
+        !configureGripper(md, gripperImpedanceKp, gripperImpedanceKd, velocity, torque) ||
         md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
         !setGripperTarget(md, target) ||
         md.enable() != mab::MD::Error_t::OK ||
@@ -935,7 +1095,10 @@ bool MdNode::resumeAfterRecovery(mab::MD& md)
 bool MdNode::canAcceptPositionCommand(u16 id) const
 {
     const auto tracker = m_positionTrackers.find(id);
+    const auto startupState = m_startupStates.find(id);
     return tracker != m_positionTrackers.end() && tracker->second.isTracking() &&
+           startupState != m_startupStates.end() &&
+           startupState->second == DriveStartupState::Tracking &&
            m_recoveryContexts.find(id) == m_recoveryContexts.end();
 }
 
@@ -945,6 +1108,638 @@ void MdNode::rememberResumeCommand(u16 id, double target, bool softClose, double
     auto tracker = m_positionTrackers.find(id);
     if (tracker != m_positionTrackers.end())
         tracker->second.setLastTarget(target);
+}
+
+bool MdNode::tryRestorePosition(mab::MD& md)
+{
+    const auto persisted = m_positionStateStore.get(md.m_canId);
+    if (!persisted.has_value() ||
+        !isPersistedPositionStateCompatible(
+            *persisted,
+            encoderWrapPeriodRad,
+            std::abs(gripperClosedPositionRad - gripperOpenPositionRad)))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d has no compatible persisted position state",
+                    md.m_canId);
+        return false;
+    }
+
+    std::optional<double> previousCandidate;
+    double                lastRaw       = 0.0;
+    double                lastCandidate = 0.0;
+    using Bits = mab::MDStatus::QuickStatusBits;
+    for (int sample = 0; sample < positionRecoverySamples; ++sample)
+    {
+        const auto [status, statusErr] = md.getQuickStatus();
+        const bool encoderHealthy =
+            statusErr == mab::MD::Error_t::OK &&
+            !status.at(Bits::MainEncoderStatus).isSet() &&
+            !status.at(Bits::OutputEncoderStatus).isSet() &&
+            !status.at(Bits::CalibrationEncoderStatus).isSet();
+        const auto [rawPosition, rawErr] = md.getPosition();
+        if (!encoderHealthy || rawErr != mab::MD::Error_t::OK)
+            return false;
+
+        lastRaw = static_cast<double>(rawPosition);
+        lastCandidate = PositionTracker::nearestEquivalent(
+            lastRaw, persisted->logicalPosition, encoderWrapPeriodRad);
+        if (std::abs(lastCandidate - persisted->logicalPosition) >
+                positionRecoveryMaxDeltaRad ||
+            (previousCandidate.has_value() &&
+             std::abs(lastCandidate - *previousCandidate) > 0.02))
+            return false;
+        previousCandidate = lastCandidate;
+    }
+
+    const double rangeMin =
+        std::min(gripperOpenPositionRad, gripperClosedPositionRad) - 0.02;
+    const double rangeMax =
+        std::max(gripperOpenPositionRad, gripperClosedPositionRad) + 0.02;
+    if (lastCandidate < rangeMin || lastCandidate > rangeMax)
+        return false;
+
+    auto& tracker = m_positionTrackers.at(md.m_canId);
+    if (!tracker.restore(lastRaw, lastCandidate, persisted->logicalTarget))
+        return false;
+
+    m_startupStates[md.m_canId] = DriveStartupState::Tracking;
+    m_calibrationGenerations[md.m_canId] = persisted->calibrationGeneration;
+    rememberResumeCommand(
+        md.m_canId, persisted->logicalTarget, false, gripperVelocityLimitRadS);
+    RCLCPP_INFO(this->get_logger(),
+                "Drive %d restored from %s at logical %.4f rad (target %.4f rad)",
+                md.m_canId,
+                m_positionStateStore.path().c_str(),
+                lastCandidate,
+                persisted->logicalTarget);
+    return true;
+}
+
+void MdNode::maybePersistPositionState(bool force)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (!force &&
+        now - m_lastStateWrite <
+            std::chrono::milliseconds(positionStateWritePeriodMs))
+        return;
+
+    bool changed = false;
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    for (const auto& [id, tracker] : m_positionTrackers)
+    {
+        const auto startupState = m_startupStates.find(id);
+        if (startupState == m_startupStates.end() ||
+            startupState->second != DriveStartupState::Tracking ||
+            !tracker.isTracking() || !std::isfinite(tracker.continuousPosition()) ||
+            !std::isfinite(tracker.rawPosition()))
+            continue;
+
+        const auto lastPersisted = m_lastPersistedLogicalPositions.find(id);
+        if (!force && lastPersisted != m_lastPersistedLogicalPositions.end() &&
+            std::abs(lastPersisted->second - tracker.continuousPosition()) <
+                positionStateMinChangeRad)
+            continue;
+
+        const auto target = tracker.lastTarget().value_or(tracker.continuousPosition());
+        m_positionStateStore.set(
+            id,
+            PersistedPositionState{
+                tracker.continuousPosition(),
+                tracker.rawPosition(),
+                target,
+                encoderWrapPeriodRad,
+                std::abs(gripperClosedPositionRad - gripperOpenPositionRad),
+                m_calibrationGenerations[id],
+                timestamp,
+                m_calibrationGenerations[id] > 0,
+            });
+        m_lastPersistedLogicalPositions[id] = tracker.continuousPosition();
+        changed = true;
+    }
+
+    if (changed || force)
+    {
+        std::string error;
+        if (!m_positionStateStore.saveAtomic(&error))
+        {
+            RCLCPP_ERROR(this->get_logger(),
+                         "Failed to persist position state to %s: %s",
+                         m_positionStateStore.path().c_str(),
+                         error.c_str());
+        }
+        else
+        {
+            m_lastStateWrite = now;
+        }
+    }
+}
+
+void MdNode::parseHomingDirections(const std::string& setting)
+{
+    std::stringstream entries(setting);
+    std::string       entry;
+    while (std::getline(entries, entry, ','))
+    {
+        const auto separator = entry.find(':');
+        if (separator == std::string::npos)
+            throw std::invalid_argument("homing_direction_by_id entries must be ID:+1 or ID:-1");
+
+        const auto id        = std::stoul(entry.substr(0, separator));
+        const int  direction = std::stoi(entry.substr(separator + 1));
+        if (id > std::numeric_limits<u16>::max() ||
+            (direction != -1 && direction != 1))
+            throw std::invalid_argument("invalid homing_direction_by_id entry");
+        m_homingDirections[static_cast<u16>(id)] = direction;
+    }
+}
+
+const char* MdNode::startupStateName(DriveStartupState state) const
+{
+    switch (state)
+    {
+        case DriveStartupState::Uninitialized:
+            return "UNINITIALIZED";
+        case DriveStartupState::Restoring:
+            return "RESTORING";
+        case DriveStartupState::Homing:
+            return "HOMING";
+        case DriveStartupState::Tracking:
+            return "TRACKING";
+        case DriveStartupState::Recovering:
+            return "RECOVERING";
+        case DriveStartupState::Faulted:
+            return "FAULTED";
+    }
+    return "UNKNOWN";
+}
+
+bool MdNode::queueHoming(u16 id)
+{
+    auto md = findMd(m_mds, id);
+    if (md == m_mds.end())
+        return false;
+    if (m_homingDirections.find(id) == m_homingDirections.end())
+    {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Drive %d cannot home: no direction in homing_direction_by_id",
+                     id);
+        m_startupStates[id] = DriveStartupState::Faulted;
+        return false;
+    }
+    if ((m_activeHoming.has_value() && m_activeHoming->first == id) ||
+        std::find(m_homingQueue.begin(), m_homingQueue.end(), id) != m_homingQueue.end())
+        return true;
+
+    m_softCloseJobs.erase(id);
+    m_recoveryContexts.erase(id);
+    if (md->disable() != mab::MD::Error_t::OK)
+    {
+        m_startupStates[id] = DriveStartupState::Faulted;
+        return false;
+    }
+    m_startupStates[id] = DriveStartupState::Homing;
+    m_homingQueue.push_back(id);
+    RCLCPP_INFO(this->get_logger(), "Drive %d queued for open-stop homing", id);
+    return startNextHoming();
+}
+
+bool MdNode::startNextHoming()
+{
+    if (m_activeHoming.has_value() || m_homingQueue.empty())
+        return true;
+
+    const u16 id = m_homingQueue.front();
+    m_homingQueue.pop_front();
+    auto md = findMd(m_mds, id);
+    if (md == m_mds.end())
+        return false;
+
+    const auto [rawPosition, rawErr] = md->getPosition();
+    if (rawErr != mab::MD::Error_t::OK)
+    {
+        m_startupStates[id] = DriveStartupState::Faulted;
+        RCLCPP_ERROR(this->get_logger(),
+                     "Drive %d homing could not read its startup position",
+                     id);
+        return false;
+    }
+
+    HomingContext context;
+    context.startRawPosition = static_cast<double>(rawPosition);
+    context.backoffTargetRawPosition =
+        context.startRawPosition -
+        static_cast<double>(m_homingDirections.at(id)) * homingBackoffRad;
+    m_activeHoming.emplace(id, context);
+    auto& activeContext = m_activeHoming->second;
+    const double backoffKp = gripperImpedanceKp;
+    if (md->disable() != mab::MD::Error_t::OK ||
+        !configureGripper(*md,
+                          backoffKp,
+                          gripperImpedanceKd,
+                          homingVelocityTripRadS,
+                          gripperTorqueLimitNm) ||
+        md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+        !writeRawTarget(*md, activeContext.backoffTargetRawPosition) ||
+        md->enable() != mab::MD::Error_t::OK ||
+        !writeRawTarget(*md, activeContext.backoffTargetRawPosition))
+    {
+        abortHoming(*md, "failed to perform initial open-stop backoff");
+        return false;
+    }
+    activeContext.stage      = HomingStage::InitialBackoff;
+    activeContext.stageStart = std::chrono::steady_clock::now();
+    activeContext.lastBackoffKp = backoffKp;
+
+    RCLCPP_INFO(this->get_logger(),
+                "Drive %d homing started toward open with direction %d; "
+                "dynamic backoff=%.3f rad effort ramp %.2f->%.2f Nm",
+                id,
+                m_homingDirections.at(id),
+                homingBackoffRad,
+                std::min<double>(backoffKp * homingBackoffRad, gripperTorqueLimitNm),
+                std::min<double>(2.0, gripperTorqueLimitNm));
+    return true;
+}
+
+bool MdNode::startTorqueSeek(mab::MD& md, HomingContext& context, HomingStage stage)
+{
+    const auto [rawPosition, rawErr] = md.getPosition();
+    if (rawErr != mab::MD::Error_t::OK ||
+        md.disable() != mab::MD::Error_t::OK ||
+        !writeTargetTorque(md, 0.0) ||
+        md.setMotionMode(mab::MdMode_E::RAW_TORQUE) != mab::MD::Error_t::OK ||
+        md.enable() != mab::MD::Error_t::OK ||
+        !writeTargetTorque(md, 0.0))
+        return false;
+
+    context.stage            = stage;
+    context.stageStart       = std::chrono::steady_clock::now();
+    context.nextSample       = context.stageStart;
+    context.seekState        = HomingSeekState{};
+    context.startRawPosition = static_cast<double>(rawPosition);
+    context.lastTorqueCommand = 0.0;
+    return true;
+}
+
+bool MdNode::writeTargetTorque(mab::MD& md, double torqueNm)
+{
+    mab::MDRegisters_S registers;
+    registers.targetTorque = static_cast<float>(torqueNm);
+    return md.writeRegisters(registers.targetTorque) == mab::MD::Error_t::OK;
+}
+
+void MdNode::tickHoming()
+{
+    if (!m_activeHoming.has_value())
+    {
+        startNextHoming();
+        return;
+    }
+
+    const u16 id = m_activeHoming->first;
+    auto md      = findMd(m_mds, id);
+    if (md == m_mds.end())
+    {
+        m_activeHoming.reset();
+        m_startupStates[id] = DriveStartupState::Faulted;
+        return;
+    }
+    auto& context = m_activeHoming->second;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < context.nextSample)
+        return;
+    context.nextSample = now + std::chrono::milliseconds(20);
+
+    const auto [status, statusErr] = md->getQuickStatus();
+    const auto [rawPositionValue, positionErr] = md->getPosition();
+    const auto [velocityValue, velocityErr] = md->getVelocity();
+    mab::MDRegisters_S powerRegisters;
+    const auto voltageErr = md->readRegisters(powerRegisters.dcBusVoltage);
+    using Bits = mab::MDStatus::QuickStatusBits;
+    bool motionError = false;
+    bool motionStatusUnavailable = false;
+    if (statusErr == mab::MD::Error_t::OK &&
+        status.at(Bits::MotionStatus).isSet())
+    {
+        const auto [motionStatus, motionErr] = md->getMotionStatus();
+        motionStatusUnavailable = motionErr != mab::MD::Error_t::OK;
+        if (!motionStatusUnavailable)
+        {
+            using MotionBits = mab::MDStatus::MotionStatusBits;
+            motionError =
+                motionStatus.at(MotionBits::ErrorPositionLimit).isSet() ||
+                motionStatus.at(MotionBits::ErrorVelocityLimit).isSet();
+        }
+    }
+    const bool statusAvailable = statusErr == mab::MD::Error_t::OK;
+    const bool encoderError =
+        statusAvailable &&
+        (status.at(Bits::MainEncoderStatus).isSet() ||
+         status.at(Bits::OutputEncoderStatus).isSet() ||
+         status.at(Bits::CalibrationEncoderStatus).isSet());
+    const bool bridgeError =
+        statusAvailable && status.at(Bits::MosfetBridgeStatus).isSet();
+    const bool hardwareError =
+        statusAvailable && status.at(Bits::HardwareStatus).isSet();
+    const bool criticalError = !statusAvailable || motionStatusUnavailable ||
+                               encoderError || bridgeError || hardwareError || motionError;
+    if (criticalError || positionErr != mab::MD::Error_t::OK ||
+        velocityErr != mab::MD::Error_t::OK ||
+        voltageErr != mab::MD::Error_t::OK ||
+        !std::isfinite(powerRegisters.dcBusVoltage.value) ||
+        powerRegisters.dcBusVoltage.value < homingMinBusVoltageV)
+    {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Drive %d homing health: status_comm=%d encoder=%d bridge=%d hardware=%d "
+                     "motion_error=%d position_comm=%d velocity_comm=%d voltage_comm=%d "
+                     "bus_voltage=%.2f V",
+                     id,
+                     !statusAvailable,
+                     encoderError,
+                     bridgeError,
+                     hardwareError,
+                     motionError,
+                     positionErr != mab::MD::Error_t::OK,
+                     velocityErr != mab::MD::Error_t::OK,
+                     voltageErr != mab::MD::Error_t::OK,
+                     static_cast<double>(powerRegisters.dcBusVoltage.value));
+        abortHoming(*md, "communication or drive status failure");
+        return;
+    }
+
+    const double rawPosition = static_cast<double>(rawPositionValue);
+    const double velocity    = static_cast<double>(velocityValue);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - context.stageStart);
+    const auto updateBackoffStiffness = [&]()
+    {
+        constexpr double BACKOFF_MAX_EFFORT_NM = 2.0;
+        constexpr double BACKOFF_KP_WRITE_STEP = 1.0;
+        constexpr double BACKOFF_RAMP_MS = 1000.0;
+        const double initialEffort =
+            static_cast<double>(gripperImpedanceKp) * homingBackoffRad;
+        const double maximumEffort =
+            std::min<double>(BACKOFF_MAX_EFFORT_NM, gripperTorqueLimitNm);
+        const double rampFraction =
+            std::clamp(static_cast<double>(elapsed.count()) / BACKOFF_RAMP_MS, 0.0, 1.0);
+        const double effort =
+            initialEffort + (maximumEffort - initialEffort) * rampFraction;
+        const double kp = std::max<double>(gripperImpedanceKp, effort / homingBackoffRad);
+        if (std::abs(kp - context.lastBackoffKp) >= BACKOFF_KP_WRITE_STEP)
+        {
+            mab::MDRegisters_S registers;
+            registers.motorImpPidKp = static_cast<float>(kp);
+            if (md->writeRegisters(registers.motorImpPidKp) != mab::MD::Error_t::OK)
+                return false;
+            context.lastBackoffKp = kp;
+        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(),
+                             *this->get_clock(),
+                             250,
+                             "Drive %d homing backoff: error=%.4f rad velocity=%.4f rad/s "
+                             "effort_limit=%.2f Nm kp=%.2f",
+                             id,
+                             context.backoffTargetRawPosition - rawPosition,
+                             velocity,
+                             effort,
+                             kp);
+        return true;
+    };
+    const auto backoffSettled = [&]()
+    {
+        constexpr double BACKOFF_SETTLE_VELOCITY_RAD_S  = 0.10;
+        constexpr auto   BACKOFF_SETTLE_TIME = std::chrono::milliseconds(100);
+        const double requiredClearance =
+            std::max(homingMinMotionRad, homingBackoffRad * 0.5);
+        const bool settled =
+            std::abs(rawPosition - context.startRawPosition) >= requiredClearance &&
+            std::abs(velocity) <= BACKOFF_SETTLE_VELOCITY_RAD_S;
+        if (!settled)
+        {
+            context.backoffSettleStart.reset();
+            return false;
+        }
+        if (!context.backoffSettleStart.has_value())
+        {
+            context.backoffSettleStart = now;
+            return false;
+        }
+        return now - *context.backoffSettleStart >= BACKOFF_SETTLE_TIME;
+    };
+
+    if (context.stage == HomingStage::InitialBackoff)
+    {
+        if (std::abs(velocity) > homingVelocityTripRadS)
+        {
+            abortHoming(*md, "initial backoff velocity safety limit exceeded");
+            return;
+        }
+        if (elapsed > std::chrono::milliseconds(3000))
+        {
+            abortHoming(*md, "initial backoff timed out");
+            return;
+        }
+        if (!updateBackoffStiffness())
+        {
+            abortHoming(*md, "failed to ramp initial backoff effort");
+            return;
+        }
+        if (backoffSettled())
+        {
+            if (!startTorqueSeek(*md, context, HomingStage::FirstSeek))
+                abortHoming(*md, "failed to enter first torque-seek stage");
+        }
+        return;
+    }
+
+    if (context.stage == HomingStage::Backoff)
+    {
+        if (std::abs(velocity) > homingVelocityTripRadS)
+        {
+            abortHoming(*md, "second backoff velocity safety limit exceeded");
+            return;
+        }
+        if (elapsed > std::chrono::milliseconds(3000))
+        {
+            abortHoming(*md, "backoff timed out");
+            return;
+        }
+        if (!updateBackoffStiffness())
+        {
+            abortHoming(*md, "failed to ramp second backoff effort");
+            return;
+        }
+        if (backoffSettled())
+        {
+            if (!startTorqueSeek(*md, context, HomingStage::SecondSeek))
+                abortHoming(*md, "failed to enter second torque-seek stage");
+        }
+        return;
+    }
+
+    const double passTorque = context.stage == HomingStage::FirstSeek
+                                  ? homingTorqueNm
+                                  : homingSecondPassTorqueNm;
+    const double rampFraction =
+        std::clamp(static_cast<double>(elapsed.count()) /
+                       static_cast<double>(homingTorqueRampMs),
+                   0.0,
+                   1.0);
+    const double torqueCommand =
+        static_cast<double>(m_homingDirections.at(id)) * passTorque * rampFraction;
+    if (std::abs(torqueCommand - context.lastTorqueCommand) >= 0.005)
+    {
+        if (!writeTargetTorque(*md, torqueCommand))
+        {
+            abortHoming(*md, "failed to update homing torque");
+            return;
+        }
+        context.lastTorqueCommand = torqueCommand;
+    }
+
+    constexpr auto SEEK_VELOCITY_GRACE = std::chrono::milliseconds(100);
+    const double monitoredVelocity =
+        elapsed < SEEK_VELOCITY_GRACE ? 0.0 : velocity;
+    const auto seekResult =
+        updateHomingSeek(context.seekState,
+                         rawPosition - context.startRawPosition,
+                         monitoredVelocity,
+                         rampFraction,
+                         elapsed.count(),
+                         homingMinMotionRad,
+                         homingMaxTravelRad,
+                         homingVelocityTripRadS,
+                         homingStallVelocityRadS,
+                         homingStallDwellMs,
+                         homingTimeoutMs);
+    RCLCPP_INFO_THROTTLE(this->get_logger(),
+                         *this->get_clock(),
+                         500,
+                         "Drive %d homing seek: pass=%d delta=%.4f rad velocity=%.4f rad/s "
+                         "torque=%.3f Nm moved=%d",
+                         id,
+                         context.stage == HomingStage::FirstSeek ? 1 : 2,
+                         rawPosition - context.startRawPosition,
+                         velocity,
+                         torqueCommand,
+                         context.seekState.moved);
+    if (seekResult != HomingSeekResult::StopDetected)
+    {
+        if (seekResult == HomingSeekResult::OverVelocity)
+            abortHoming(*md, "homing velocity safety limit exceeded");
+        else if (seekResult == HomingSeekResult::MaxTravel)
+            abortHoming(*md, "maximum homing travel exceeded");
+        else if (seekResult == HomingSeekResult::Timeout)
+            abortHoming(*md, "seek timed out");
+        return;
+    }
+
+    if (!writeTargetTorque(*md, 0.0) || md->disable() != mab::MD::Error_t::OK)
+    {
+        abortHoming(*md, "could not remove torque at detected stop");
+        return;
+    }
+
+    if (context.stage == HomingStage::FirstSeek)
+    {
+        context.firstStopRawPosition = rawPosition;
+        context.startRawPosition = rawPosition;
+        context.backoffTargetRawPosition =
+            rawPosition -
+            static_cast<double>(m_homingDirections.at(id)) * homingBackoffRad;
+        const double backoffKp = gripperImpedanceKp;
+        if (!configureGripper(*md,
+                              backoffKp,
+                              gripperImpedanceKd,
+                              homingVelocityTripRadS,
+                              gripperTorqueLimitNm) ||
+            md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+            !writeRawTarget(*md, context.backoffTargetRawPosition) ||
+            md->enable() != mab::MD::Error_t::OK ||
+            !writeRawTarget(*md, context.backoffTargetRawPosition))
+        {
+            abortHoming(*md, "failed to back off from first stop");
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d homing second dynamic backoff: distance=%.3f rad "
+                    "effort ramp %.2f->%.2f Nm",
+                    id,
+                    homingBackoffRad,
+                    std::min<double>(backoffKp * homingBackoffRad, gripperTorqueLimitNm),
+                    std::min<double>(2.0, gripperTorqueLimitNm));
+        context.stage      = HomingStage::Backoff;
+        context.stageStart = now;
+        context.seekState  = HomingSeekState{};
+        context.lastBackoffKp = backoffKp;
+        context.backoffSettleStart.reset();
+        return;
+    }
+
+    completeHoming(*md, context, rawPosition);
+}
+
+void MdNode::completeHoming(mab::MD& md, HomingContext& context, double stopRawPosition)
+{
+    if (!homingStopsRepeatable(
+            context.firstStopRawPosition, stopRawPosition, homingRepeatabilityRad))
+    {
+        abortHoming(md, "two homing passes did not agree");
+        return;
+    }
+
+    if (md.zero() != mab::MD::Error_t::OK)
+    {
+        abortHoming(md, "could not zero the open reference");
+        return;
+    }
+
+    auto& tracker = m_positionTrackers.at(md.m_canId);
+    tracker.resetAtZero();
+    m_startupStates[md.m_canId] = DriveStartupState::Tracking;
+    ++m_calibrationGenerations[md.m_canId];
+    rememberResumeCommand(md.m_canId, 0.0, false, gripperVelocityLimitRadS);
+
+    if (!configureGripper(md,
+                          gripperImpedanceKp,
+                          gripperImpedanceKd,
+                          gripperVelocityLimitRadS,
+                          gripperTorqueLimitNm) ||
+        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+        !setGripperTarget(md, 0.0) ||
+        md.enable() != mab::MD::Error_t::OK ||
+        !setGripperTarget(md, 0.0))
+    {
+        abortHoming(md, "zero succeeded but normal hold configuration failed");
+        return;
+    }
+
+    const u16 id = md.m_canId;
+    m_activeHoming.reset();
+    maybePersistPositionState(true);
+    RCLCPP_INFO(this->get_logger(),
+                "Drive %d homing completed; state=%s",
+                id,
+                startupStateName(m_startupStates[id]));
+}
+
+void MdNode::abortHoming(mab::MD& md, const std::string& reason)
+{
+    writeTargetTorque(md, 0.0);
+    md.disable();
+    const u16 id = md.m_canId;
+    if (auto tracker = m_positionTrackers.find(id); tracker != m_positionTrackers.end())
+        tracker->second.markFaulted();
+    m_startupStates[id] = DriveStartupState::Faulted;
+    m_activeHoming.reset();
+    RCLCPP_ERROR(this->get_logger(),
+                 "Drive %d homing aborted: %s; state=%s",
+                 id,
+                 reason.c_str(),
+                 startupStateName(m_startupStates[id]));
 }
 
 void MdNode::tickRecoveryJobs()
@@ -1002,6 +1797,7 @@ void MdNode::tickRecoveryJobs()
         if (tracker->second.state() == PositionTracker::State::Uninitialized)
         {
             tracker->second.initialize(static_cast<double>(rawPosition));
+            m_startupStates[id] = DriveStartupState::Tracking;
             recovered.push_back(id);
             continue;
         }
@@ -1013,6 +1809,7 @@ void MdNode::tickRecoveryJobs()
             RCLCPP_ERROR(this->get_logger(),
                          "Drive %d recovery is ambiguous; manual open calibration is required",
                          id);
+            m_startupStates[id] = DriveStartupState::Faulted;
             faulted.push_back(id);
             continue;
         }
@@ -1024,11 +1821,13 @@ void MdNode::tickRecoveryJobs()
 
         if (resumeAfterRecovery(*md))
         {
+            m_startupStates[id] = DriveStartupState::Tracking;
             recovered.push_back(id);
         }
         else
         {
             tracker->second.markCommunicationLost();
+            m_startupStates[id] = DriveStartupState::Recovering;
             context.errorsCleared = false;
         }
     }
@@ -1546,6 +2345,15 @@ void MdNode::cbSetMode(const std::shared_ptr<candle_ros2::srv::SetMode::Request>
             rsp->success.push_back(false);
             continue;
         }
+        if (!canAcceptPositionCommand(req->device_ids[i]))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d state=%s; mode change rejected",
+                        req->device_ids[i],
+                        startupStateName(m_startupStates[req->device_ids[i]]));
+            rsp->success.push_back(false);
+            continue;
+        }
 
         if (md->setMotionMode(mode) == mab::MD::Error_t::OK)
             rsp->success.push_back(true);
@@ -1565,6 +2373,15 @@ void MdNode::cbEnable(const std::shared_ptr<candle_ros2::srv::Generic::Request> 
         auto md = findMd(m_mds, id);
         if (md == m_mds.end())
         {
+            rsp->success.push_back(false);
+            continue;
+        }
+        if (!canAcceptPositionCommand(id))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d state=%s; enable rejected",
+                        id,
+                        startupStateName(m_startupStates[id]));
             rsp->success.push_back(false);
             continue;
         }
@@ -1588,6 +2405,13 @@ void MdNode::cbDisable(const std::shared_ptr<candle_ros2::srv::Generic::Request>
         if (md == m_mds.end())
         {
             rsp->success.push_back(false);
+            continue;
+        }
+
+        if (m_activeHoming.has_value() && m_activeHoming->first == id)
+        {
+            abortHoming(*md, "disabled by service request");
+            rsp->success.push_back(true);
             continue;
         }
 

@@ -66,7 +66,7 @@ rosidl_get_typesupport_target(cpp_typesupport_target
 
 file(GLOB_RECURSE pds_sources "src/pds_modules/*.cpp")
 
-add_library(${md_node_name} STATIC src/md_node.cpp)
+add_library(${md_node_name} STATIC src/md_node.cpp src/position_state_store.cpp)
 target_include_directories(${md_node_name} PUBLIC include)
 ament_target_dependencies(${md_node_name} rclcpp rclcpp_components sensor_msgs)
 target_link_libraries(${md_node_name} ${cpp_typesupport_target} candle)
@@ -99,6 +99,16 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(position_tracker_test test/position_tracker_test.cpp)
   target_include_directories(position_tracker_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(homing_monitor_test test/homing_monitor_test.cpp)
+  target_include_directories(homing_monitor_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(position_state_store_test
+    test/position_state_store_test.cpp
+    src/position_state_store.cpp)
+  target_include_directories(position_state_store_test BEFORE PRIVATE
     CANdle-SDK/commons/googletest/googletest/include
     include)
 endif()

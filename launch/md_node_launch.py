@@ -31,8 +31,8 @@ def generate_launch_description():
         DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.63"),
         DeclareLaunchArgument("gripper_impedance_kp", default_value="12.5"),
         DeclareLaunchArgument("gripper_impedance_kd", default_value="0.05"),
-        DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="3.5"),
-        DeclareLaunchArgument("gripper_torque_limit_nm", default_value="4.0"),
+        DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="6.0"),
+        DeclareLaunchArgument("gripper_torque_limit_nm", default_value="3.0"),
         DeclareLaunchArgument("soft_close_fast_torque_limit_nm", default_value="4.0"),
         DeclareLaunchArgument("soft_close_slow_torque_limit_nm", default_value="4.0"),
         DeclareLaunchArgument("soft_close_profile_acceleration_rad_s2", default_value="100.0"),
@@ -43,6 +43,28 @@ def generate_launch_description():
         DeclareLaunchArgument("position_recovery_max_delta_rad", default_value="0.25"),
         DeclareLaunchArgument("position_recovery_samples", default_value="3"),
         DeclareLaunchArgument("position_recovery_retry_ms", default_value="25"),
+        DeclareLaunchArgument("startup_position_policy", default_value="restore_or_home"),
+        DeclareLaunchArgument(
+            "position_state_file",
+            default_value="~/.ros/candle_ros2_position_state.json",
+        ),
+        DeclareLaunchArgument("position_state_write_period_ms", default_value="1000"),
+        DeclareLaunchArgument("position_state_min_change_rad", default_value="0.005"),
+        DeclareLaunchArgument(
+            "homing_direction_by_id", default_value="342:-1,343:-1,345:-1"
+        ),
+        DeclareLaunchArgument("homing_torque_nm", default_value="0.3"),
+        DeclareLaunchArgument("homing_second_pass_torque_nm", default_value="0.3"),
+        DeclareLaunchArgument("homing_torque_ramp_ms", default_value="500"),
+        DeclareLaunchArgument("homing_velocity_trip_rad_s", default_value="6.0"),
+        DeclareLaunchArgument("homing_min_bus_voltage_v", default_value="10.0"),
+        DeclareLaunchArgument("homing_stall_velocity_rad_s", default_value="0.06"),
+        DeclareLaunchArgument("homing_stall_dwell_ms", default_value="250"),
+        DeclareLaunchArgument("homing_max_travel_rad", default_value="0.75"),
+        DeclareLaunchArgument("homing_timeout_ms", default_value="5000"),
+        DeclareLaunchArgument("homing_backoff_rad", default_value="0.03"),
+        DeclareLaunchArgument("homing_repeatability_rad", default_value="0.015"),
+        DeclareLaunchArgument("homing_min_motion_rad", default_value="0.01"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
     ]
 
@@ -120,6 +142,62 @@ def generate_launch_description():
                         ),
                         "position_recovery_retry_ms": ParameterValue(
                             LaunchConfiguration("position_recovery_retry_ms"), value_type=int
+                        ),
+                        "startup_position_policy": LaunchConfiguration(
+                            "startup_position_policy"
+                        ),
+                        "position_state_file": LaunchConfiguration("position_state_file"),
+                        "position_state_write_period_ms": ParameterValue(
+                            LaunchConfiguration("position_state_write_period_ms"),
+                            value_type=int,
+                        ),
+                        "position_state_min_change_rad": ParameterValue(
+                            LaunchConfiguration("position_state_min_change_rad"),
+                            value_type=float,
+                        ),
+                        "homing_direction_by_id": LaunchConfiguration(
+                            "homing_direction_by_id"
+                        ),
+                        "homing_torque_nm": ParameterValue(
+                            LaunchConfiguration("homing_torque_nm"), value_type=float
+                        ),
+                        "homing_second_pass_torque_nm": ParameterValue(
+                            LaunchConfiguration("homing_second_pass_torque_nm"),
+                            value_type=float,
+                        ),
+                        "homing_torque_ramp_ms": ParameterValue(
+                            LaunchConfiguration("homing_torque_ramp_ms"), value_type=int
+                        ),
+                        "homing_velocity_trip_rad_s": ParameterValue(
+                            LaunchConfiguration("homing_velocity_trip_rad_s"),
+                            value_type=float,
+                        ),
+                        "homing_min_bus_voltage_v": ParameterValue(
+                            LaunchConfiguration("homing_min_bus_voltage_v"),
+                            value_type=float,
+                        ),
+                        "homing_stall_velocity_rad_s": ParameterValue(
+                            LaunchConfiguration("homing_stall_velocity_rad_s"),
+                            value_type=float,
+                        ),
+                        "homing_stall_dwell_ms": ParameterValue(
+                            LaunchConfiguration("homing_stall_dwell_ms"), value_type=int
+                        ),
+                        "homing_max_travel_rad": ParameterValue(
+                            LaunchConfiguration("homing_max_travel_rad"), value_type=float
+                        ),
+                        "homing_timeout_ms": ParameterValue(
+                            LaunchConfiguration("homing_timeout_ms"), value_type=int
+                        ),
+                        "homing_backoff_rad": ParameterValue(
+                            LaunchConfiguration("homing_backoff_rad"), value_type=float
+                        ),
+                        "homing_repeatability_rad": ParameterValue(
+                            LaunchConfiguration("homing_repeatability_rad"),
+                            value_type=float,
+                        ),
+                        "homing_min_motion_rad": ParameterValue(
+                            LaunchConfiguration("homing_min_motion_rad"), value_type=float
                         ),
                         "init_devices_zero": ParameterValue(
                             LaunchConfiguration("init_devices_zero"), value_type=bool

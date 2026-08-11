@@ -41,6 +41,22 @@ class PositionTracker
         m_state               = State::Tracking;
     }
 
+    bool restore(double rawPosition, double logicalPosition, std::optional<double> logicalTarget)
+    {
+        if (!std::isfinite(rawPosition) || !std::isfinite(logicalPosition) ||
+            (logicalTarget.has_value() && !std::isfinite(*logicalTarget)))
+            return false;
+
+        m_lastRawPosition    = rawPosition;
+        m_continuousPosition = logicalPosition;
+        m_rawOffset          = logicalPosition - rawPosition;
+        m_lastTarget         = logicalTarget;
+        m_recoveryCandidate.reset();
+        m_recoverySampleCount = 0;
+        m_state               = State::Tracking;
+        return true;
+    }
+
     void resetAtZero(double rawPosition = 0.0)
     {
         m_lastRawPosition    = rawPosition;
@@ -89,8 +105,7 @@ class PositionTracker
             return RecoveryResult::Rejected;
 
         const double candidate =
-            rawPosition +
-            std::round((m_continuousPosition - rawPosition) / m_wrapPeriodRad) * m_wrapPeriodRad;
+            nearestEquivalent(rawPosition, m_continuousPosition, m_wrapPeriodRad);
         if (std::abs(candidate - m_continuousPosition) > m_maxRecoveryDeltaRad)
         {
             markFaulted();
@@ -126,6 +141,14 @@ class PositionTracker
         m_recoverySampleCount = 0;
     }
 
+    static double nearestEquivalent(double rawPosition,
+                                    double referencePosition,
+                                    double wrapPeriodRad)
+    {
+        return rawPosition +
+               std::round((referencePosition - rawPosition) / wrapPeriodRad) * wrapPeriodRad;
+    }
+
     double logicalToRaw(double logicalPosition) const
     {
         return logicalPosition - m_rawOffset;
@@ -154,6 +177,11 @@ class PositionTracker
     double rawOffset() const
     {
         return m_rawOffset;
+    }
+
+    double rawPosition() const
+    {
+        return m_lastRawPosition;
     }
 
     std::optional<double> lastTarget() const

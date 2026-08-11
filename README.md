@@ -28,39 +28,62 @@ For configuration, please use:
 The following commands are the calibrated sequence for drives `342`, `343`, and
 `345`. Encoder zeros are preserved during normal initialization. Zero a drive
 only as a deliberate calibration step while it is at its known mechanical open
-reference. Before starting this sequence, place every gripper at that mechanical
-open reference.
+reference.
 
 In terminal 1, launch the node and keep it running:
 
 ```bash
-ros2 launch candle_ros2 md_node_launch.py
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 launch candle_ros2 md_node_launch.py \
+  init_devices_zero:=false \
+  gripper_closed_position_rad:=0.63 \
+  gripper_velocity_limit_rad_s:=6.0 \
+  gripper_torque_limit_nm:=3.0 \
+  soft_close_fast_torque_limit_nm:=3.0 \
+  soft_close_slow_torque_limit_nm:=3.0 \
+  position_recovery_retry_ms:=25 \
+  position_recovery_samples:=3
 ```
 
 In terminal 2, source the workspace and run the remaining commands in order:
 
 ```bash
+source /opt/ros/humble/setup.bash
 source install/setup.bash
 ```
 
-1. Add, configure, and enable all drives in impedance mode without changing
-  their encoder zeros:
+1. Add and initialize all drives in impedance mode:
 
 ```bash
 ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
   "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
 ```
 
-1. With every gripper still at its known mechanical open reference, zero all
-  drives. This command also replaces the old motion target with logical `0`.
-  Runtime zero is not retained by the MD across a drive power reset:
+With `startup_position_policy:=restore_or_home`, each drive either restores its
+trusted host-side state or is queued for open-stop homing. Homing is
+asynchronous, so the initialization response can be `false` while homing is
+running. Wait for the `homing complete` log before commanding that drive.
+
+2. For a deliberate manual calibration instead of automatic homing, place the
+requested drives at the mechanical open reference and call zero. This aborts
+active homing, defines logical `0`, and atomically updates the host-side state
+file without writing the drive's flash:
 
 ```bash
 ros2 service call /md/zero candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-1. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
+To retry automatic homing explicitly:
+
+```bash
+ros2 service call /md/home candle_ros2/srv/Generic \
+  "{device_ids: [342, 343, 345]}"
+```
+
+3. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
 
 ```bash
 ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
@@ -77,14 +100,14 @@ ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
     ]}"
 ```
 
-1. Open all grippers:
+4. Open all grippers:
 
 ```bash
 ros2 service call /md/open_gripper candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-1. Run the calibrated two-stage close for one drive at a time. Adjust
+5. Run the calibrated two-stage close for one drive at a time. Adjust
   `pre_close_gap_mm` when a different transition gap is required:
 
 ```bash
@@ -105,7 +128,7 @@ ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
     fast_speed: 1.0, slow_speed: 0.0}"
 ```
 
-1. Or close one drive all the way using impedance mode:
+6. Or close one drive all the way using impedance mode:
 
 ```bash
 ros2 service call /md/close_gripper candle_ros2/srv/Generic \
@@ -121,8 +144,8 @@ reference.
 
 ### Brownout position continuity
 
-The MD main encoder retains one motor revolution after a drive reset, while its
-turn count and runtime zero are lost. For the 10:1 gripper drive this produces
+The MD main encoder retains its single-turn reference after a drive reset, while
+its accumulated gearbox turn section is lost. For the 10:1 gripper drive this produces
 position jumps of approximately `2π / 10 = 0.62831853 rad`. While this ROS node
 remains running, it keeps a continuous logical position per drive and unwraps
 such jumps against the last trusted position.
@@ -135,9 +158,36 @@ an interrupted soft-close resumes its final closed target with the slow
 impedance configuration.
 
 If recovery is ambiguous, the drive remains disabled. Place it manually at the
-mechanical open reference and call `/md/zero`. Continuity state is intentionally
-not stored on disk, so a simultaneous MD and ROS-node restart also requires this
-manual calibration.
+mechanical open reference and call `/md/zero`.
+
+### Persistent startup restore and homing
+
+The node stores the last trusted logical position atomically in
+`~/.ros/candle_ros2_position_state.json`. On `/md/init_devices`, it keeps each
+drive disabled, validates three stable encoder/status samples, and restores the
+nearest wrap branch when it is within `0.25 rad` of the saved state.
+
+With the default `startup_position_policy:=restore_or_home`, a missing, corrupt,
+or incompatible state queues automatic open-stop homing. Homing is performed
+one drive at a time: a small initial backoff is followed by a ramped low-torque
+seek, another backoff, and a slower second seek. Both stop positions must agree.
+The drive is then zeroed, persisted to the host-side state file, returned to
+impedance mode, and held at logical zero. Manual retry is available with:
+
+```bash
+ros2 service call /md/home candle_ros2/srv/Generic \
+  "{device_ids: [342]}"
+```
+
+Homing intentionally contacts the mechanical open stop. Verify
+`homing_direction_by_id` and begin with low torque. Any CAN loss, low bus
+voltage, encoder/status fault, excessive velocity/travel, timeout, or
+non-repeatable stop leaves the drive disabled.
+
+The JSON restore is still assumption-based. Movement close to one complete
+`0.628 rad` encoder wrap while the drive and node are both off cannot be
+distinguished without an output-side absolute encoder or independent home
+sensor.
 
 ### Automated service test
 
@@ -219,8 +269,8 @@ Relevant MD-node parameters are:
 - `gripper_open_position_rad` (`0.0`)
 - `gripper_closed_position_rad` (`0.63` from the launch file)
 - `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
-- `gripper_velocity_limit_rad_s` (`3.5`)
-- `gripper_torque_limit_nm` (`4.0`)
+- `gripper_velocity_limit_rad_s` (`6.0`)
+- `gripper_torque_limit_nm` (`3.0`)
 - `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`4.0` / `4.0`)
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
@@ -229,6 +279,19 @@ Relevant MD-node parameters are:
 - `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
 - `position_recovery_samples` (`3`)
 - `position_recovery_retry_ms` (`25`)
+- `startup_position_policy` (`restore_or_home`; alternatives: `restore_only`, `always_home`)
+- `position_state_file` (`~/.ros/candle_ros2_position_state.json`)
+- `position_state_write_period_ms` (`1000`)
+- `position_state_min_change_rad` (`0.005`)
+- `homing_direction_by_id` (`342:-1,343:-1,345:-1`)
+- `homing_torque_nm` / `homing_second_pass_torque_nm` (`0.3` / `0.3`)
+- `homing_torque_ramp_ms` (`500`)
+- `homing_velocity_trip_rad_s` (`6.0`)
+- `homing_min_bus_voltage_v` (`10.0`)
+- `homing_stall_velocity_rad_s` / `homing_stall_dwell_ms` (`0.06` / `250`)
+- `homing_max_travel_rad` / `homing_timeout_ms` (`0.75` / `5000`)
+- `homing_backoff_rad` / `homing_repeatability_rad` (`0.03` / `0.015`)
+- `homing_min_motion_rad` (`0.01`)
 - `init_devices_zero` (`false`)
 
 Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then
@@ -250,9 +313,8 @@ The fast soft-close stage uses the position and velocity PID gains stored in
 the drive. The service rejects the request when either position Kp or velocity
 Kp is not configured. The slow stage uses impedance control with
 `gripper_impedance_kp`, `gripper_impedance_kd`, the requested slow speed as its
-velocity limit, and `soft_close_slow_torque_limit_nm`. Soft close applies hard
-position limits between the configured open and closed positions and does not
-use target overtravel.
+profile velocity, and `soft_close_slow_torque_limit_nm`. The node does not
+modify the drive's firmware maximum-position or maximum-velocity registers.
 
 ## Documentation
 

@@ -69,3 +69,17 @@ TEST(PositionTrackerTest, RejectsAmbiguousRecoveryMotion)
     EXPECT_EQ(tracker.observeRecovery(0.30), PositionTracker::RecoveryResult::Rejected);
     EXPECT_EQ(tracker.state(), PositionTracker::State::Faulted);
 }
+
+TEST(PositionTrackerTest, RestoresExplicitLogicalBranchAndTarget)
+{
+    PositionTracker tracker(PERIOD, 0.25, 3);
+    const double rawAfterRestart = 0.452 - PERIOD;
+    const double candidate =
+        PositionTracker::nearestEquivalent(rawAfterRestart, 0.452, PERIOD);
+    ASSERT_TRUE(tracker.restore(rawAfterRestart, candidate, 0.63));
+
+    EXPECT_NEAR(tracker.continuousPosition(), 0.452, 1e-9);
+    EXPECT_NEAR(tracker.logicalToRaw(0.63), 0.63 - PERIOD, 1e-9);
+    ASSERT_TRUE(tracker.lastTarget().has_value());
+    EXPECT_DOUBLE_EQ(*tracker.lastTarget(), 0.63);
+}
