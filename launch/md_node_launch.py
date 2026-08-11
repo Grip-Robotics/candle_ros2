@@ -39,6 +39,10 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="100.0"),
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
+        DeclareLaunchArgument("encoder_wrap_period_rad", default_value="0.62831853"),
+        DeclareLaunchArgument("position_recovery_max_delta_rad", default_value="0.25"),
+        DeclareLaunchArgument("position_recovery_samples", default_value="3"),
+        DeclareLaunchArgument("position_recovery_retry_ms", default_value="25"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
     ]
 
@@ -103,6 +107,19 @@ def generate_launch_description():
                         ),
                         "soft_close_fast_duration_ms": ParameterValue(
                             LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int
+                        ),
+                        "encoder_wrap_period_rad": ParameterValue(
+                            LaunchConfiguration("encoder_wrap_period_rad"), value_type=float
+                        ),
+                        "position_recovery_max_delta_rad": ParameterValue(
+                            LaunchConfiguration("position_recovery_max_delta_rad"),
+                            value_type=float,
+                        ),
+                        "position_recovery_samples": ParameterValue(
+                            LaunchConfiguration("position_recovery_samples"), value_type=int
+                        ),
+                        "position_recovery_retry_ms": ParameterValue(
+                            LaunchConfiguration("position_recovery_retry_ms"), value_type=int
                         ),
                         "init_devices_zero": ParameterValue(
                             LaunchConfiguration("init_devices_zero"), value_type=bool

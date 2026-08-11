@@ -52,8 +52,8 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
 ```
 
 1. With every gripper still at its known mechanical open reference, zero all
-  drives. This command also replaces the old motion target with `0` and saves
-  the new zero calibration to drive flash:
+  drives. This command also replaces the old motion target with logical `0`.
+  Runtime zero is not retained by the MD across a drive power reset:
 
 ```bash
 ros2 service call /md/zero candle_ros2/srv/Generic \
@@ -118,6 +118,26 @@ normal startup and fault recovery so re-initialization cannot redefine zero at
 an arbitrary mechanism position. Use `/md/zero` only as a deliberate calibration
 command while all requested mechanisms are physically at their intended open
 reference.
+
+### Brownout position continuity
+
+The MD main encoder retains one motor revolution after a drive reset, while its
+turn count and runtime zero are lost. For the 10:1 gripper drive this produces
+position jumps of approximately `2π / 10 = 0.62831853 rad`. While this ROS node
+remains running, it keeps a continuous logical position per drive and unwraps
+such jumps against the last trusted position.
+
+On a CAN outage the node publishes `NaN` joint-state values, rejects new motion
+commands, retries communication every `25 ms`, and requires three healthy
+position/status samples. Recovery succeeds only when inferred unpowered motion
+is at most `0.25 rad`. The interrupted target is then resumed automatically;
+an interrupted soft-close resumes its final closed target with the slow
+impedance configuration.
+
+If recovery is ambiguous, the drive remains disabled. Place it manually at the
+mechanical open reference and call `/md/zero`. Continuity state is intentionally
+not stored on disk, so a simultaneous MD and ROS-node restart also requires this
+manual calibration.
 
 ### Automated service test
 
@@ -197,7 +217,7 @@ Relevant MD-node parameters are:
 
 - `joint_name_prefix` (`md_`)
 - `gripper_open_position_rad` (`0.0`)
-- `gripper_closed_position_rad` (`0.65`)
+- `gripper_closed_position_rad` (`0.63` from the launch file)
 - `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
 - `gripper_velocity_limit_rad_s` (`3.5`)
 - `gripper_torque_limit_nm` (`4.0`)
@@ -205,6 +225,10 @@ Relevant MD-node parameters are:
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
+- `encoder_wrap_period_rad` (`0.62831853`)
+- `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
+- `position_recovery_samples` (`3`)
+- `position_recovery_retry_ms` (`25`)
 - `init_devices_zero` (`false`)
 
 Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then
