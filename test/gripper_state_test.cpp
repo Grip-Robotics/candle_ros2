@@ -8,7 +8,7 @@ namespace
 {
 constexpr double OPEN_POSITION = 0.0;
 constexpr double CLOSED_POSITION = 0.63;
-constexpr double POSITION_TOLERANCE = 0.01;
+constexpr double POSITION_TOLERANCE = 0.025;
 constexpr double MOVING_VELOCITY = 0.12;
 
 GripperOperationalState classify(bool homing, bool available, double position, double velocity)

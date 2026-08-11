@@ -26,7 +26,7 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
     node->declare_parameter<int>("health_publish_period_ms", 200);
-    node->declare_parameter<double>("gripper_state_position_tolerance_rad", 0.01);
+    node->declare_parameter<double>("gripper_state_position_tolerance_rad", 0.025);
     node->declare_parameter<double>("gripper_state_moving_velocity_rad_s", 0.12);
     node->declare_parameter<double>("encoder_wrap_period_rad", 0.62831853);
     node->declare_parameter<double>("position_recovery_max_delta_rad", 0.25);
