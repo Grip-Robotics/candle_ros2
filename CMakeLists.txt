@@ -27,6 +27,7 @@ find_package(std_msgs REQUIRED)
 
 set(msg_files
   "msg/ImpedanceCmd.msg"
+  "msg/MdHealth.msg"
   "msg/MotionCmd.msg"
   "msg/Pid.msg"
   "msg/VelocityPidCmd.msg"
@@ -103,6 +104,10 @@ if(BUILD_TESTING)
     include)
   ament_add_gtest(homing_monitor_test test/homing_monitor_test.cpp)
   target_include_directories(homing_monitor_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(drive_health_test test/drive_health_test.cpp)
+  target_include_directories(drive_health_test BEFORE PRIVATE
     CANdle-SDK/commons/googletest/googletest/include
     include)
   ament_add_gtest(position_state_store_test

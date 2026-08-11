@@ -37,14 +37,7 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 
 ros2 launch candle_ros2 md_node_launch.py \
-  init_devices_zero:=false \
-  gripper_closed_position_rad:=0.63 \
-  gripper_velocity_limit_rad_s:=6.0 \
-  gripper_torque_limit_nm:=3.0 \
-  soft_close_fast_torque_limit_nm:=3.0 \
-  soft_close_slow_torque_limit_nm:=3.0 \
-  position_recovery_retry_ms:=25 \
-  position_recovery_samples:=3
+  init_devices_zero:=false
 ```
 
 In terminal 2, source the workspace and run the remaining commands in order:
@@ -64,9 +57,10 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
 With `startup_position_policy:=restore_or_home`, each drive either restores its
 trusted host-side state or is queued for open-stop homing. Homing is
 asynchronous, so the initialization response can be `false` while homing is
-running. Wait for the `homing complete` log before commanding that drive.
+running. Wait for the `homing complete` log before commanding that drive. If you want to home every time, set `startup_position_policy:=always_home`.
 
-2. For a deliberate manual calibration instead of automatic homing, place the
+1. For a deliberate manual calibration instead of automatic homing, place the
+
 requested drives at the mechanical open reference and call zero. This aborts
 active homing, defines logical `0`, and atomically updates the host-side state
 file without writing the drive's flash:
@@ -83,7 +77,7 @@ ros2 service call /md/home candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-3. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
+1. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
 
 ```bash
 ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
@@ -100,14 +94,14 @@ ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
     ]}"
 ```
 
-4. Open all grippers:
+1. Open all grippers:
 
 ```bash
 ros2 service call /md/open_gripper candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-5. Run the calibrated two-stage close for one drive at a time. Adjust
+1. Run the calibrated two-stage close for one drive at a time. Adjust
   `pre_close_gap_mm` when a different transition gap is required:
 
 ```bash
@@ -128,7 +122,7 @@ ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
     fast_speed: 1.0, slow_speed: 0.0}"
 ```
 
-6. Or close one drive all the way using impedance mode:
+1. Or close one drive all the way using impedance mode:
 
 ```bash
 ros2 service call /md/close_gripper candle_ros2/srv/Generic \
@@ -160,6 +154,26 @@ impedance configuration.
 If recovery is ambiguous, the drive remains disabled. Place it manually at the
 mechanical open reference and call `/md/zero`.
 
+### Drive health
+
+The node publishes stack-compatible per-drive health on `/md/health` every
+`health_publish_period_ms` (default `200 ms`):
+
+```bash
+ros2 topic echo /md/health
+```
+
+All `MdHealth` arrays use the same `device_ids` ordering. `responsive` is false
+only when a drive does not answer its status query. `error` is true for
+unavailable status, a real drive error, or a position state that rejects
+commands. Warning-only firmware flags are listed in `active_errors` without
+setting `error`.
+
+Position states are reported through `active_errors` without changing the
+message contract used by the larger stack. `TRACKING` adds no position error;
+`UNINITIALIZED`, `RESTORING`, `HOMING`, `RECOVERING`, and `FAULTED` set
+`error=true` and describe why commands are rejected.
+
 ### Persistent startup restore and homing
 
 The node stores the last trusted logical position atomically in
@@ -171,14 +185,12 @@ With the default `startup_position_policy:=restore_or_home`, a missing, corrupt,
 or incompatible state queues automatic open-stop homing. Homing is performed
 one drive at a time: a small initial backoff is followed by a ramped low-torque
 seek, another backoff, and a slower second seek. Both stop positions must agree.
-After detecting real motion at the normal `0.3 Nm` travel torque, the node keeps
-RAW_TORQUE active and continuously ramps to
-`homing_stop_verification_torque_nm`. A stop is accepted only when position
-remains stable within the encoder-noise window at the verification torque.
 The drive is then zeroed, persisted to the host-side state file, returned to
 impedance mode, and held at logical zero. Manual retry is available with:
 
 ```bash
+source install/setup.bash
+
 ros2 service call /md/home candle_ros2/srv/Generic \
   "{device_ids: [342]}"
 ```
@@ -279,6 +291,7 @@ Relevant MD-node parameters are:
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
+- `health_publish_period_ms` (`200`)
 - `encoder_wrap_period_rad` (`0.62831853`)
 - `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
 - `position_recovery_samples` (`3`)
@@ -289,15 +302,13 @@ Relevant MD-node parameters are:
 - `position_state_min_change_rad` (`0.005`)
 - `homing_direction_by_id` (`342:-1,343:-1,345:-1`)
 - `homing_torque_nm` / `homing_second_pass_torque_nm` (`0.3` / `0.3`)
-- `homing_stop_verification_torque_nm` (`1.0`)
-- `homing_stop_verification_ramp_ms` (`2000`)
 - `homing_torque_ramp_ms` (`500`)
-- `homing_velocity_trip_rad_s` (`12.0`; homing only)
+- `homing_velocity_trip_rad_s` (`6.0`)
 - `homing_min_bus_voltage_v` (`10.0`)
-- `homing_stall_velocity_rad_s` / `homing_stall_dwell_ms` (`0.2` / `500`)
-- `homing_max_travel_rad` / `homing_timeout_ms` (`0.75` / `8000`)
+- `homing_stall_velocity_rad_s` / `homing_stall_dwell_ms` (`0.06` / `250`)
+- `homing_max_travel_rad` / `homing_timeout_ms` (`0.75` / `5000`)
 - `homing_backoff_rad` / `homing_repeatability_rad` (`0.03` / `0.015`)
-- `homing_min_motion_rad` (`0.005`)
+- `homing_min_motion_rad` (`0.01`)
 - `init_devices_zero` (`false`)
 
 Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then
