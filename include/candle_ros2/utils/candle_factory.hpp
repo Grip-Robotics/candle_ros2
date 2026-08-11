@@ -17,8 +17,8 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("gripper_closed_position_rad", 0.62);
     node->declare_parameter<double>("gripper_impedance_kp", 12.5);
     node->declare_parameter<double>("gripper_impedance_kd", 0.05);
-    node->declare_parameter<double>("gripper_velocity_limit_rad_s", 3.5);
-    node->declare_parameter<double>("gripper_torque_limit_nm", 4.0);
+    node->declare_parameter<double>("gripper_velocity_limit_rad_s", 6.0);
+    node->declare_parameter<double>("gripper_torque_limit_nm", 3.0);
     node->declare_parameter<double>("soft_close_fast_torque_limit_nm", 4.0);
     node->declare_parameter<double>("soft_close_slow_torque_limit_nm", 4.0);
     node->declare_parameter<double>("soft_close_profile_acceleration_rad_s2", 100.0);
@@ -37,17 +37,19 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<std::string>(
         "homing_direction_by_id", "342:-1,343:-1,345:-1");
     node->declare_parameter<double>("homing_torque_nm", 0.3);
-    node->declare_parameter<double>("homing_second_pass_torque_nm", 0.2);
+    node->declare_parameter<double>("homing_second_pass_torque_nm", 0.3);
+    node->declare_parameter<double>("homing_stop_verification_torque_nm", 1.0);
+    node->declare_parameter<int>("homing_stop_verification_ramp_ms", 2000);
     node->declare_parameter<int>("homing_torque_ramp_ms", 500);
-    node->declare_parameter<double>("homing_velocity_trip_rad_s", 1.0);
+    node->declare_parameter<double>("homing_velocity_trip_rad_s", 12.0);
     node->declare_parameter<double>("homing_min_bus_voltage_v", 10.0);
-    node->declare_parameter<double>("homing_stall_velocity_rad_s", 0.02);
-    node->declare_parameter<int>("homing_stall_dwell_ms", 250);
+    node->declare_parameter<double>("homing_stall_velocity_rad_s", 0.2);
+    node->declare_parameter<int>("homing_stall_dwell_ms", 500);
     node->declare_parameter<double>("homing_max_travel_rad", 0.75);
-    node->declare_parameter<int>("homing_timeout_ms", 5000);
+    node->declare_parameter<int>("homing_timeout_ms", 8000);
     node->declare_parameter<double>("homing_backoff_rad", 0.03);
     node->declare_parameter<double>("homing_repeatability_rad", 0.015);
-    node->declare_parameter<double>("homing_min_motion_rad", 0.01);
+    node->declare_parameter<double>("homing_min_motion_rad", 0.005);
     node->declare_parameter<bool>("init_devices_zero", false);
 
     candleParams_S params;
@@ -97,6 +99,10 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.homing_torque_nm = node->get_parameter("homing_torque_nm").as_double();
     params.homing_second_pass_torque_nm =
         node->get_parameter("homing_second_pass_torque_nm").as_double();
+    params.homing_stop_verification_torque_nm =
+        node->get_parameter("homing_stop_verification_torque_nm").as_double();
+    params.homing_stop_verification_ramp_ms =
+        node->get_parameter("homing_stop_verification_ramp_ms").as_int();
     params.homing_torque_ramp_ms = node->get_parameter("homing_torque_ramp_ms").as_int();
     params.homing_velocity_trip_rad_s =
         node->get_parameter("homing_velocity_trip_rad_s").as_double();

@@ -11,6 +11,41 @@ TEST(HomingMonitorTest, RequiresMotionBeforeAcceptingAStop)
     EXPECT_FALSE(state.stallStartMs.has_value());
 }
 
+TEST(HomingMonitorTest, RampsStopVerificationOnlyAfterMeasuredMotion)
+{
+    HomingSeekState state;
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.02, 0.5, 250, 0.01, 500),
+        0.0);
+    EXPECT_FALSE(state.verificationStartMs.has_value());
+
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.02, 1.0, 500, 0.01, 500),
+        0.0);
+    ASSERT_TRUE(state.verificationStartMs.has_value());
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.02, 1.0, 750, 0.01, 500),
+        0.5);
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.02, 1.0, 1000, 0.01, 500),
+        1.0);
+}
+
+TEST(HomingMonitorTest, KeepsStopVerificationRampingDuringMotion)
+{
+    HomingSeekState state;
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.02, 1.0, 500, 0.01, 500),
+        0.0);
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.02, 1.0, 750, 0.01, 500),
+        0.5);
+    EXPECT_DOUBLE_EQ(
+        updateHomingStopVerification(state, -0.03, 1.0, 800, 0.01, 500),
+        0.6);
+    EXPECT_TRUE(state.verificationStartMs.has_value());
+}
+
 TEST(HomingMonitorTest, RequiresContinuousStallDwell)
 {
     HomingSeekState state;
@@ -26,6 +61,20 @@ TEST(HomingMonitorTest, RequiresContinuousStallDwell)
               HomingSeekResult::Continue);
     EXPECT_EQ(updateHomingSeek(
                   state, -0.02, 0.0, 1.0, 1450, 0.01, 0.75, 1.0, 0.02, 250, 5000),
+              HomingSeekResult::StopDetected);
+}
+
+TEST(HomingMonitorTest, RejectsSlowCreepDuringStallDwell)
+{
+    HomingSeekState state;
+    EXPECT_EQ(updateHomingSeek(
+                  state, -0.020, 0.01, 1.0, 1000, 0.01, 0.75, 1.0, 0.02, 250, 5000),
+              HomingSeekResult::Continue);
+    EXPECT_EQ(updateHomingSeek(
+                  state, -0.026, 0.01, 1.0, 1250, 0.01, 0.75, 1.0, 0.02, 250, 5000),
+              HomingSeekResult::Continue);
+    EXPECT_EQ(updateHomingSeek(
+                  state, -0.026, 0.0, 1.0, 1500, 0.01, 0.75, 1.0, 0.02, 250, 5000),
               HomingSeekResult::StopDetected);
 }
 

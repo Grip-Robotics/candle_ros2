@@ -150,6 +150,8 @@ class MdNode : public rclcpp::Node
     double      positionStateMinChangeRad;
     double      homingTorqueNm;
     double      homingSecondPassTorqueNm;
+    double      homingStopVerificationTorqueNm;
+    int         homingStopVerificationRampMs;
     int         homingTorqueRampMs;
     double      homingVelocityTripRadS;
     double      homingMinBusVoltageV;

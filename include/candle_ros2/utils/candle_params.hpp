@@ -30,6 +30,8 @@ struct candleParams_S
     std::string homing_direction_by_id;
     double      homing_torque_nm;
     double      homing_second_pass_torque_nm;
+    double      homing_stop_verification_torque_nm;
+    int         homing_stop_verification_ramp_ms;
     int         homing_torque_ramp_ms;
     double      homing_velocity_trip_rad_s;
     double      homing_min_bus_voltage_v;

@@ -171,6 +171,10 @@ With the default `startup_position_policy:=restore_or_home`, a missing, corrupt,
 or incompatible state queues automatic open-stop homing. Homing is performed
 one drive at a time: a small initial backoff is followed by a ramped low-torque
 seek, another backoff, and a slower second seek. Both stop positions must agree.
+After detecting real motion at the normal `0.3 Nm` travel torque, the node keeps
+RAW_TORQUE active and continuously ramps to
+`homing_stop_verification_torque_nm`. A stop is accepted only when position
+remains stable within the encoder-noise window at the verification torque.
 The drive is then zeroed, persisted to the host-side state file, returned to
 impedance mode, and held at logical zero. Manual retry is available with:
 
@@ -285,13 +289,15 @@ Relevant MD-node parameters are:
 - `position_state_min_change_rad` (`0.005`)
 - `homing_direction_by_id` (`342:-1,343:-1,345:-1`)
 - `homing_torque_nm` / `homing_second_pass_torque_nm` (`0.3` / `0.3`)
+- `homing_stop_verification_torque_nm` (`1.0`)
+- `homing_stop_verification_ramp_ms` (`2000`)
 - `homing_torque_ramp_ms` (`500`)
-- `homing_velocity_trip_rad_s` (`6.0`)
+- `homing_velocity_trip_rad_s` (`12.0`; homing only)
 - `homing_min_bus_voltage_v` (`10.0`)
-- `homing_stall_velocity_rad_s` / `homing_stall_dwell_ms` (`0.06` / `250`)
-- `homing_max_travel_rad` / `homing_timeout_ms` (`0.75` / `5000`)
+- `homing_stall_velocity_rad_s` / `homing_stall_dwell_ms` (`0.2` / `500`)
+- `homing_max_travel_rad` / `homing_timeout_ms` (`0.75` / `8000`)
 - `homing_backoff_rad` / `homing_repeatability_rad` (`0.03` / `0.015`)
-- `homing_min_motion_rad` (`0.01`)
+- `homing_min_motion_rad` (`0.005`)
 - `init_devices_zero` (`false`)
 
 Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then

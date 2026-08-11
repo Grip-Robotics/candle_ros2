@@ -55,16 +55,22 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("homing_torque_nm", default_value="0.3"),
         DeclareLaunchArgument("homing_second_pass_torque_nm", default_value="0.3"),
+        DeclareLaunchArgument(
+            "homing_stop_verification_torque_nm", default_value="1.0"
+        ),
+        DeclareLaunchArgument(
+            "homing_stop_verification_ramp_ms", default_value="2000"
+        ),
         DeclareLaunchArgument("homing_torque_ramp_ms", default_value="500"),
-        DeclareLaunchArgument("homing_velocity_trip_rad_s", default_value="6.0"),
+        DeclareLaunchArgument("homing_velocity_trip_rad_s", default_value="12.0"),
         DeclareLaunchArgument("homing_min_bus_voltage_v", default_value="10.0"),
-        DeclareLaunchArgument("homing_stall_velocity_rad_s", default_value="0.06"),
-        DeclareLaunchArgument("homing_stall_dwell_ms", default_value="250"),
+        DeclareLaunchArgument("homing_stall_velocity_rad_s", default_value="0.2"),
+        DeclareLaunchArgument("homing_stall_dwell_ms", default_value="500"),
         DeclareLaunchArgument("homing_max_travel_rad", default_value="0.75"),
-        DeclareLaunchArgument("homing_timeout_ms", default_value="5000"),
+        DeclareLaunchArgument("homing_timeout_ms", default_value="8000"),
         DeclareLaunchArgument("homing_backoff_rad", default_value="0.03"),
         DeclareLaunchArgument("homing_repeatability_rad", default_value="0.015"),
-        DeclareLaunchArgument("homing_min_motion_rad", default_value="0.01"),
+        DeclareLaunchArgument("homing_min_motion_rad", default_value="0.005"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
     ]
 
@@ -164,6 +170,18 @@ def generate_launch_description():
                         "homing_second_pass_torque_nm": ParameterValue(
                             LaunchConfiguration("homing_second_pass_torque_nm"),
                             value_type=float,
+                        ),
+                        "homing_stop_verification_torque_nm": ParameterValue(
+                            LaunchConfiguration(
+                                "homing_stop_verification_torque_nm"
+                            ),
+                            value_type=float,
+                        ),
+                        "homing_stop_verification_ramp_ms": ParameterValue(
+                            LaunchConfiguration(
+                                "homing_stop_verification_ramp_ms"
+                            ),
+                            value_type=int,
                         ),
                         "homing_torque_ramp_ms": ParameterValue(
                             LaunchConfiguration("homing_torque_ramp_ms"), value_type=int

@@ -41,6 +41,8 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       positionStateMinChangeRad(params.position_state_min_change_rad),
       homingTorqueNm(params.homing_torque_nm),
       homingSecondPassTorqueNm(params.homing_second_pass_torque_nm),
+      homingStopVerificationTorqueNm(params.homing_stop_verification_torque_nm),
+      homingStopVerificationRampMs(params.homing_stop_verification_ramp_ms),
       homingTorqueRampMs(params.homing_torque_ramp_ms),
       homingVelocityTripRadS(params.homing_velocity_trip_rad_s),
       homingMinBusVoltageV(params.homing_min_bus_voltage_v),
@@ -79,6 +81,10 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         homingTorqueNm <= 0.0 || !std::isfinite(homingSecondPassTorqueNm) ||
         homingSecondPassTorqueNm <= 0.0 ||
         homingSecondPassTorqueNm > homingTorqueNm || homingTorqueRampMs <= 0 ||
+        !std::isfinite(homingStopVerificationTorqueNm) ||
+        homingStopVerificationTorqueNm < homingTorqueNm ||
+        homingStopVerificationTorqueNm > gripperTorqueLimitNm ||
+        homingStopVerificationRampMs <= 0 ||
         !std::isfinite(homingVelocityTripRadS) || homingVelocityTripRadS <= 0.0 ||
         !std::isfinite(homingMinBusVoltageV) || homingMinBusVoltageV <= 0.0 ||
         !std::isfinite(homingStallVelocityRadS) || homingStallVelocityRadS < 0.0 ||
@@ -1534,7 +1540,10 @@ void MdNode::tickHoming()
     {
         if (std::abs(velocity) > homingVelocityTripRadS)
         {
-            abortHoming(*md, "initial backoff velocity safety limit exceeded");
+            abortHoming(*md,
+                        "initial backoff velocity safety limit exceeded: |velocity|=" +
+                            std::to_string(std::abs(velocity)) +
+                            " rad/s, limit=" + std::to_string(homingVelocityTripRadS));
             return;
         }
         if (elapsed > std::chrono::milliseconds(3000))
@@ -1559,7 +1568,10 @@ void MdNode::tickHoming()
     {
         if (std::abs(velocity) > homingVelocityTripRadS)
         {
-            abortHoming(*md, "second backoff velocity safety limit exceeded");
+            abortHoming(*md,
+                        "second backoff velocity safety limit exceeded: |velocity|=" +
+                            std::to_string(std::abs(velocity)) +
+                            " rad/s, limit=" + std::to_string(homingVelocityTripRadS));
             return;
         }
         if (elapsed > std::chrono::milliseconds(3000))
@@ -1583,13 +1595,27 @@ void MdNode::tickHoming()
     const double passTorque = context.stage == HomingStage::FirstSeek
                                   ? homingTorqueNm
                                   : homingSecondPassTorqueNm;
-    const double rampFraction =
+    const double baseTorqueFraction =
         std::clamp(static_cast<double>(elapsed.count()) /
                        static_cast<double>(homingTorqueRampMs),
                    0.0,
                    1.0);
+    constexpr auto SEEK_VELOCITY_GRACE = std::chrono::milliseconds(100);
+    const double monitoredVelocity =
+        elapsed < SEEK_VELOCITY_GRACE ? 0.0 : velocity;
+    const double positionDelta = rawPosition - context.startRawPosition;
+    const double verificationFraction =
+        updateHomingStopVerification(context.seekState,
+                                     positionDelta,
+                                     baseTorqueFraction,
+                                     elapsed.count(),
+                                     homingMinMotionRad,
+                                     homingStopVerificationRampMs);
+    const double torqueMagnitude =
+        passTorque * baseTorqueFraction +
+        (homingStopVerificationTorqueNm - passTorque) * verificationFraction;
     const double torqueCommand =
-        static_cast<double>(m_homingDirections.at(id)) * passTorque * rampFraction;
+        static_cast<double>(m_homingDirections.at(id)) * torqueMagnitude;
     if (std::abs(torqueCommand - context.lastTorqueCommand) >= 0.005)
     {
         if (!writeTargetTorque(*md, torqueCommand))
@@ -1600,14 +1626,11 @@ void MdNode::tickHoming()
         context.lastTorqueCommand = torqueCommand;
     }
 
-    constexpr auto SEEK_VELOCITY_GRACE = std::chrono::milliseconds(100);
-    const double monitoredVelocity =
-        elapsed < SEEK_VELOCITY_GRACE ? 0.0 : velocity;
     const auto seekResult =
         updateHomingSeek(context.seekState,
-                         rawPosition - context.startRawPosition,
+                         positionDelta,
                          monitoredVelocity,
-                         rampFraction,
+                         verificationFraction,
                          elapsed.count(),
                          homingMinMotionRad,
                          homingMaxTravelRad,
@@ -1619,17 +1642,21 @@ void MdNode::tickHoming()
                          *this->get_clock(),
                          500,
                          "Drive %d homing seek: pass=%d delta=%.4f rad velocity=%.4f rad/s "
-                         "torque=%.3f Nm moved=%d",
+                         "torque=%.3f Nm verification=%.2f moved=%d",
                          id,
                          context.stage == HomingStage::FirstSeek ? 1 : 2,
-                         rawPosition - context.startRawPosition,
+                         positionDelta,
                          velocity,
                          torqueCommand,
+                         verificationFraction,
                          context.seekState.moved);
     if (seekResult != HomingSeekResult::StopDetected)
     {
         if (seekResult == HomingSeekResult::OverVelocity)
-            abortHoming(*md, "homing velocity safety limit exceeded");
+            abortHoming(*md,
+                        "homing velocity safety limit exceeded: |velocity|=" +
+                            std::to_string(std::abs(velocity)) +
+                            " rad/s, limit=" + std::to_string(homingVelocityTripRadS));
         else if (seekResult == HomingSeekResult::MaxTravel)
             abortHoming(*md, "maximum homing travel exceeded");
         else if (seekResult == HomingSeekResult::Timeout)
