@@ -1,5 +1,6 @@
 #include "candle_ros2/md_node.hpp"
 #include "candle_ros2/drive_health.hpp"
+#include "candle_ros2/gripper_state.hpp"
 
 #include <algorithm>
 #include <array>
@@ -56,6 +57,8 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       softCloseClosedTolRad(params.soft_close_closed_tol_rad),
       softCloseFastDurationMs(params.soft_close_fast_duration_ms),
       healthPublishPeriodMs(params.health_publish_period_ms),
+      gripperStatePositionToleranceRad(params.gripper_state_position_tolerance_rad),
+      gripperStateMovingVelocityRadS(params.gripper_state_moving_velocity_rad_s),
       encoderWrapPeriodRad(params.encoder_wrap_period_rad),
       positionRecoveryMaxDeltaRad(params.position_recovery_max_delta_rad),
       positionRecoverySamples(params.position_recovery_samples),
@@ -94,6 +97,10 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         softCloseProfileDecelerationRadS2 <= 0.0f ||
         !std::isfinite(softCloseClosedTolRad) || softCloseClosedTolRad <= 0.0 ||
         softCloseFastDurationMs <= 0 || healthPublishPeriodMs <= 0 ||
+        !std::isfinite(gripperStatePositionToleranceRad) ||
+        gripperStatePositionToleranceRad <= 0.0 ||
+        !std::isfinite(gripperStateMovingVelocityRadS) ||
+        gripperStateMovingVelocityRadS <= 0.0 ||
         !std::isfinite(encoderWrapPeriodRad) ||
         encoderWrapPeriodRad <= 0.0 || !std::isfinite(positionRecoveryMaxDeltaRad) ||
         positionRecoveryMaxDeltaRad <= 0.0 ||
@@ -146,6 +153,8 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         std::string(NODE_PREFIX) + "joint_states", defaultQoS);
     pubHealth = this->create_publisher<candle_ros2::msg::MdHealth>(
         std::string(NODE_PREFIX) + "health", defaultQoS);
+    pubGripperState = this->create_publisher<candle_ros2::msg::GripperState>(
+        std::string(NODE_PREFIX) + "gripper_state", defaultQoS);
 
     subMotionCmd = this->create_subscription<candle_ros2::msg::MotionCmd>(
         std::string(NODE_PREFIX) + "motion_command",
@@ -248,6 +257,7 @@ void MdNode::publishJointStates()
         const auto logicalPosition = readLogicalPosition(md);
         if (!logicalPosition.has_value())
         {
+            m_gripperSamples.erase(md.m_canId);
             const double nan = std::numeric_limits<double>::quiet_NaN();
             msgJointStates.position.push_back(nan);
             msgJointStates.velocity.push_back(nan);
@@ -260,6 +270,7 @@ void MdNode::publishJointStates()
         if (velocityErr != mab::MD::Error_t::OK || torqueErr != mab::MD::Error_t::OK)
         {
             beginRecovery(md.m_canId);
+            m_gripperSamples.erase(md.m_canId);
             const double nan = std::numeric_limits<double>::quiet_NaN();
             msgJointStates.position.push_back(nan);
             msgJointStates.velocity.push_back(nan);
@@ -267,6 +278,8 @@ void MdNode::publishJointStates()
             continue;
         }
 
+        m_gripperSamples[md.m_canId] =
+            GripperSample{*logicalPosition, static_cast<double>(velocity)};
         msgJointStates.position.push_back(*logicalPosition);
         msgJointStates.velocity.push_back(velocity);
         msgJointStates.effort.push_back(torque);
@@ -381,6 +394,49 @@ void MdNode::publishHealth()
     }
 
     pubHealth->publish(msg);
+    publishGripperStates();
+}
+
+void MdNode::publishGripperStates()
+{
+    candle_ros2::msg::GripperState msg;
+    msg.header.stamp = this->get_clock()->now();
+    msg.device_ids.reserve(m_mds.size());
+    msg.states.reserve(m_mds.size());
+
+    for (const auto& md : m_mds)
+    {
+        const auto startupIt = m_startupStates.find(md.m_canId);
+        const auto trackerIt = m_positionTrackers.find(md.m_canId);
+        const auto sampleIt = m_gripperSamples.find(md.m_canId);
+
+        const bool homing =
+            startupIt != m_startupStates.end() &&
+            startupIt->second == DriveStartupState::Homing;
+        const bool sampleAvailable =
+            startupIt != m_startupStates.end() &&
+            startupIt->second == DriveStartupState::Tracking &&
+            trackerIt != m_positionTrackers.end() && trackerIt->second.isTracking() &&
+            m_recoveryContexts.find(md.m_canId) == m_recoveryContexts.end() &&
+            sampleIt != m_gripperSamples.end();
+        const double position =
+            sampleIt == m_gripperSamples.end() ? 0.0 : sampleIt->second.position;
+        const double velocity =
+            sampleIt == m_gripperSamples.end() ? 0.0 : sampleIt->second.velocity;
+
+        const auto state = classifyGripperState(homing,
+                                                sampleAvailable,
+                                                position,
+                                                velocity,
+                                                gripperOpenPositionRad,
+                                                gripperClosedPositionRad,
+                                                gripperStatePositionToleranceRad,
+                                                gripperStateMovingVelocityRadS);
+        msg.device_ids.push_back(md.m_canId);
+        msg.states.emplace_back(gripperStateName(state));
+    }
+
+    pubGripperState->publish(msg);
 }
 
 void MdNode::cbMotionCmd(const candle_ros2::msg::MotionCmd& msg)

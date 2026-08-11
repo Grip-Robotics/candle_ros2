@@ -26,6 +26,8 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
     node->declare_parameter<int>("health_publish_period_ms", 200);
+    node->declare_parameter<double>("gripper_state_position_tolerance_rad", 0.01);
+    node->declare_parameter<double>("gripper_state_moving_velocity_rad_s", 0.05);
     node->declare_parameter<double>("encoder_wrap_period_rad", 0.62831853);
     node->declare_parameter<double>("position_recovery_max_delta_rad", 0.25);
     node->declare_parameter<int>("position_recovery_samples", 3);
@@ -82,6 +84,10 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("soft_close_fast_duration_ms").as_int();
     params.health_publish_period_ms =
         node->get_parameter("health_publish_period_ms").as_int();
+    params.gripper_state_position_tolerance_rad =
+        node->get_parameter("gripper_state_position_tolerance_rad").as_double();
+    params.gripper_state_moving_velocity_rad_s =
+        node->get_parameter("gripper_state_moving_velocity_rad_s").as_double();
     params.encoder_wrap_period_rad =
         node->get_parameter("encoder_wrap_period_rad").as_double();
     params.position_recovery_max_delta_rad =

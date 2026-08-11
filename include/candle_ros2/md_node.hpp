@@ -9,6 +9,7 @@
 #include "rclcpp/rclcpp.hpp"
 
 /* Messages */
+#include "candle_ros2/msg/gripper_state.hpp"
 #include "candle_ros2/msg/impedance_cmd.hpp"
 #include "candle_ros2/msg/md_health.hpp"
 #include "candle_ros2/msg/motion_cmd.hpp"
@@ -74,6 +75,12 @@ class MdNode : public rclcpp::Node
         bool                                  errorsCleared = false;
     };
 
+    struct GripperSample
+    {
+        double position = 0.0;
+        double velocity = 0.0;
+    };
+
     enum class DriveStartupState
     {
         Uninitialized,
@@ -120,6 +127,7 @@ class MdNode : public rclcpp::Node
     std::unordered_map<u16, PositionTracker> m_positionTrackers;
     std::unordered_map<u16, ResumeCommand> m_resumeCommands;
     std::unordered_map<u16, RecoveryContext> m_recoveryContexts;
+    std::unordered_map<u16, GripperSample> m_gripperSamples;
     std::unordered_map<u16, DriveStartupState> m_startupStates;
     std::unordered_map<u16, int> m_homingDirections;
     std::unordered_map<u16, double> m_lastPersistedLogicalPositions;
@@ -143,6 +151,8 @@ class MdNode : public rclcpp::Node
     double      softCloseClosedTolRad;
     int         softCloseFastDurationMs;
     int         healthPublishPeriodMs;
+    double      gripperStatePositionToleranceRad;
+    double      gripperStateMovingVelocityRadS;
     double      encoderWrapPeriodRad;
     double      positionRecoveryMaxDeltaRad;
     int         positionRecoverySamples;
@@ -168,6 +178,7 @@ class MdNode : public rclcpp::Node
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pubJointState;
     rclcpp::Publisher<candle_ros2::msg::MdHealth>::SharedPtr   pubHealth;
+    rclcpp::Publisher<candle_ros2::msg::GripperState>::SharedPtr pubGripperState;
 
     rclcpp::Subscription<candle_ros2::msg::MotionCmd>::SharedPtr      subMotionCmd;
     rclcpp::Subscription<candle_ros2::msg::PositionPidCmd>::SharedPtr subPositionCmd;
@@ -193,6 +204,7 @@ class MdNode : public rclcpp::Node
 
     void publishJointStates();
     void publishHealth();
+    void publishGripperStates();
     void tickSoftCloseJobs();
     void tickRecoveryJobs();
     void tickHoming();

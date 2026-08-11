@@ -174,6 +174,20 @@ message contract used by the larger stack. `TRACKING` adds no position error;
 `UNINITIALIZED`, `RESTORING`, `HOMING`, `RECOVERING`, and `FAULTED` set
 `error=true` and describe why commands are rejected.
 
+Per-gripper operational state is published separately, with arrays aligned by
+device ID:
+
+```bash
+ros2 topic echo /md/gripper_state
+```
+
+The reported state is `HOMING` while homing is queued or active, `UNKNOWN` when
+position tracking or telemetry is unavailable, and `MOVING` while measured
+velocity exceeds `gripper_state_moving_velocity_rad_s`. A stopped gripper near
+its configured endpoint is `OPEN` or `CLOSED`; a stopped gripper between those
+endpoints is `IDLE`. This topic reuses the regular joint-state samples and does
+not add CAN reads.
+
 ### Persistent startup restore and homing
 
 The node stores the last trusted logical position atomically in
@@ -292,6 +306,8 @@ Relevant MD-node parameters are:
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
 - `health_publish_period_ms` (`200`)
+- `gripper_state_position_tolerance_rad` (`0.01`)
+- `gripper_state_moving_velocity_rad_s` (`0.05`)
 - `encoder_wrap_period_rad` (`0.62831853`)
 - `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
 - `position_recovery_samples` (`3`)

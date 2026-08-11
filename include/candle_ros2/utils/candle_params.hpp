@@ -20,6 +20,8 @@ struct candleParams_S
     double      soft_close_closed_tol_rad;
     int         soft_close_fast_duration_ms;
     int         health_publish_period_ms;
+    double      gripper_state_position_tolerance_rad;
+    double      gripper_state_moving_velocity_rad_s;
     double      encoder_wrap_period_rad;
     double      position_recovery_max_delta_rad;
     int         position_recovery_samples;

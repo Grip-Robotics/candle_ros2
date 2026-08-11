@@ -26,6 +26,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
 set(msg_files
+  "msg/GripperState.msg"
   "msg/ImpedanceCmd.msg"
   "msg/MdHealth.msg"
   "msg/MotionCmd.msg"
@@ -108,6 +109,10 @@ if(BUILD_TESTING)
     include)
   ament_add_gtest(drive_health_test test/drive_health_test.cpp)
   target_include_directories(drive_health_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(gripper_state_test test/gripper_state_test.cpp)
+  target_include_directories(gripper_state_test BEFORE PRIVATE
     CANdle-SDK/commons/googletest/googletest/include
     include)
   ament_add_gtest(position_state_store_test
