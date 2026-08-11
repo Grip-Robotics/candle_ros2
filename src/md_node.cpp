@@ -335,6 +335,7 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
         }
 
         mab::MD md(id, m_candle.get());
+        md.m_timeout = 10;  // ms
         if (md.init() != mab::MD::Error_t::OK)
         {
             rsp->success.push_back(false);
@@ -373,8 +374,9 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         // stage to command this drive again after it is enabled.
         m_softCloseJobs.erase(req->device_ids[i]);
 
-        // A drive may still be enabled with a target latched in non-volatile
-        // registers. Disable it before setting either the mode or target.
+        // Disable first: MD motion mode resets on disable, and a previous
+        // close/soft-close target may still be latched until overwritten in
+        // the active motion mode.
         if (!resetDriveErrorsIfNeeded(*md) || md->disable() != mab::MD::Error_t::OK)
         {
             RCLCPP_WARN(this->get_logger(),
@@ -390,15 +392,6 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
             continue;
         }
 
-        const auto [currentPos, posErr] = md->getPosition();
-        if (posErr != mab::MD::Error_t::OK)
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "Init devices: failed to read current position for drive %d",
-                        req->device_ids[i]);
-            continue;
-        }
-
         const bool configured =
             req->mode != "IMPEDANCE" ||
             configureGripper(*md,
@@ -406,9 +399,12 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
                              gripperImpedanceKd,
                              gripperVelocityLimitRadS,
                              gripperTorqueLimitNm);
-        if (!configured || !setGripperTarget(*md, static_cast<double>(currentPos)))
+        if (!configured)
             continue;
 
+        // Mode must be selected before the hold target is written. Targets set
+        // while the drive is IDLE after disable are not reliably used on enable,
+        // so a stale closed target from soft-close can take effect otherwise.
         auto modeReq        = std::make_shared<candle_ros2::srv::SetMode::Request>();
         auto modeRsp        = std::make_shared<candle_ros2::srv::SetMode::Response>();
         modeReq->device_ids = {req->device_ids[i]};
@@ -417,7 +413,37 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         if (modeRsp->success.empty() || !modeRsp->success.front())
             continue;
 
-        rsp->success[i] = md->enable() == mab::MD::Error_t::OK;
+        const auto [holdPos, holdPosErr] = md->getPosition();
+        if (holdPosErr != mab::MD::Error_t::OK ||
+            !setGripperTarget(*md, static_cast<double>(holdPos)))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Init devices: failed to latch hold target for drive %d",
+                        req->device_ids[i]);
+            continue;
+        }
+
+        if (md->enable() != mab::MD::Error_t::OK)
+            continue;
+
+        // Reassert hold after enable so a briefly restored stale target cannot
+        // start a close motion.
+        const auto [holdPosAfterEnable, holdPosAfterEnableErr] = md->getPosition();
+        if (holdPosAfterEnableErr != mab::MD::Error_t::OK ||
+            !setGripperTarget(*md, static_cast<double>(holdPosAfterEnable)))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Init devices: failed to reassert hold target for drive %d after enable",
+                        req->device_ids[i]);
+            md->disable();
+            continue;
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Init devices: drive %d holding at %.4f rad",
+                    req->device_ids[i],
+                    static_cast<double>(holdPosAfterEnable));
+        rsp->success[i] = true;
     }
 }
 
@@ -435,10 +461,41 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
             continue;
         }
 
-        if (md->zero() == mab::MD::Error_t::OK)
-            rsp->success.push_back(true);
-        else
+        cancelSoftClose(id);
+
+        if (md->zero() != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(), "Failed to zero drive with ID: %d", id);
             rsp->success.push_back(false);
+            continue;
+        }
+
+        // Zero changes the position frame but does not update the active
+        // target. Replace the pre-zero target immediately so the drive holds
+        // the new mechanical-open reference instead of moving toward it.
+        if (!setGripperTarget(*md, 0.0))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Failed to hold drive %d at zero after calibration; disabling it",
+                        id);
+            md->disable();
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        if (md->save() != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Failed to save zero calibration for drive with ID: %d",
+                        id);
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d zeroed, holding at 0 rad, and saved to flash",
+                    id);
+        rsp->success.push_back(true);
     }
     return;
 }
@@ -639,9 +696,10 @@ bool MdNode::moveGripper(mab::MD& md, double targetPos)
                           gripperImpedanceKd,
                           gripperVelocityLimitRadS,
                           gripperTorqueLimitNm) ||
-        !setGripperTarget(md, targetPos) ||
         md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-        md.enable() != mab::MD::Error_t::OK)
+        !setGripperTarget(md, targetPos) ||
+        md.enable() != mab::MD::Error_t::OK ||
+        !setGripperTarget(md, targetPos))
     {
         RCLCPP_WARN(this->get_logger(),
                     "Failed to start impedance move for drive with ID: %d",
@@ -778,9 +836,10 @@ void MdNode::tickSoftCloseJobs()
                                   gripperImpedanceKd,
                                   job.slowVelocityRadS,
                                   softCloseSlowTorqueLimitNm) ||
-                !setGripperTarget(*md, gripperClosedPositionRad) ||
                 md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-                md->enable() != mab::MD::Error_t::OK)
+                !setGripperTarget(*md, gripperClosedPositionRad) ||
+                md->enable() != mab::MD::Error_t::OK ||
+                !setGripperTarget(*md, gripperClosedPositionRad))
             {
                 RCLCPP_WARN(this->get_logger(),
                             "Soft-close: failed to start slow stage for drive %d",
@@ -990,9 +1049,10 @@ void MdNode::cbSoftCloseGripper(
             !profilePidReady(*md) ||
             !configurePositionProfile(
                 *md, fastVelocityRadS, softCloseFastTorqueLimitNm) ||
-            !setGripperTarget(*md, fastTarget) ||
             md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
-            md->enable() != mab::MD::Error_t::OK)
+            !setGripperTarget(*md, fastTarget) ||
+            md->enable() != mab::MD::Error_t::OK ||
+            !setGripperTarget(*md, fastTarget))
         {
             RCLCPP_WARN(this->get_logger(),
                         "Soft-close: failed to start fast stage for drive %d",

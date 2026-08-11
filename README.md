@@ -28,7 +28,8 @@ For configuration, please use:
 The following commands are the calibrated sequence for drives `342`, `343`, and
 `345`. Encoder zeros are preserved during normal initialization. Zero a drive
 only as a deliberate calibration step while it is at its known mechanical open
-reference.
+reference. Before starting this sequence, place every gripper at that mechanical
+open reference.
 
 In terminal 1, launch the node and keep it running:
 
@@ -50,14 +51,16 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
   "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
 ```
 
-1. With every gripper at its known mechanical open reference, zero all drives:
+1. With every gripper still at its known mechanical open reference, zero all
+  drives. This command also replaces the old motion target with `0` and saves
+  the new zero calibration to drive flash:
 
 ```bash
 ros2 service call /md/zero candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-1. Apply the calibrated runtime position and velocity PID gains:
+1. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
 
 ```bash
 ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
@@ -110,8 +113,11 @@ ros2 service call /md/close_gripper candle_ros2/srv/Generic \
 ```
 
 The PID command above changes runtime registers and may need to be repeated
-after a drive reset or power cycle. Never use `init_devices_zero:=true` unless
-all mechanisms are physically at the intended zero reference.
+after a drive reset or power cycle. Keep `init_devices_zero:=false` during
+normal startup and fault recovery so re-initialization cannot redefine zero at
+an arbitrary mechanism position. Use `/md/zero` only as a deliberate calibration
+command while all requested mechanisms are physically at their intended open
+reference.
 
 ### Automated service test
 
@@ -231,4 +237,3 @@ Full CANdle ROS2 documentation:
 
 MAB controllers manuals:
 ➡️ [MAB documentation](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/intro.html)
-
