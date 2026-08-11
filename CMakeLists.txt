@@ -27,6 +27,7 @@ find_package(std_msgs REQUIRED)
 
 set(msg_files
   "msg/ImpedanceCmd.msg"
+  "msg/MdHealth.msg"
   "msg/MotionCmd.msg"
   "msg/Pid.msg"
   "msg/VelocityPidCmd.msg"

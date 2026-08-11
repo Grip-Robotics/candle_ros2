@@ -28,6 +28,7 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
           static_cast<float>(params.soft_close_profile_deceleration_rad_s2)),
       softCloseClosedTolRad(params.soft_close_closed_tol_rad),
       softCloseFastDurationMs(params.soft_close_fast_duration_ms),
+      healthPublishPeriodMs(params.health_publish_period_ms),
       initDevicesZero(params.init_devices_zero)
 {
     if (jointNamePrefix.empty())
@@ -44,9 +45,9 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         !std::isfinite(softCloseProfileDecelerationRadS2) ||
         softCloseProfileDecelerationRadS2 <= 0.0f ||
         !std::isfinite(softCloseClosedTolRad) || softCloseClosedTolRad <= 0.0 ||
-        softCloseFastDurationMs <= 0)
+        softCloseFastDurationMs <= 0 || healthPublishPeriodMs <= 0)
         throw std::invalid_argument(
-            "invalid gripper position, gain, velocity, torque, or soft-close parameter");
+            "invalid gripper position, gain, velocity, torque, soft-close, or health parameter");
 
     rclcpp::QoS defaultQoS(10);
     defaultQoS.reliable();
@@ -56,6 +57,8 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
 
     pubJointState = this->create_publisher<sensor_msgs::msg::JointState>(
         std::string(NODE_PREFIX) + "joint_states", defaultQoS);
+    pubHealth = this->create_publisher<candle_ros2::msg::MdHealth>(
+        std::string(NODE_PREFIX) + "health", defaultQoS);
 
     subMotionCmd = this->create_subscription<candle_ros2::msg::MotionCmd>(
         std::string(NODE_PREFIX) + "motion_command",
@@ -114,6 +117,8 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
 
     tmrPub = this->create_wall_timer(std::chrono::milliseconds(PUB_TIMER_MS),
                                      std::bind(&MdNode::publishJointStates, this));
+    tmrHealth = this->create_wall_timer(std::chrono::milliseconds(healthPublishPeriodMs),
+                                        std::bind(&MdNode::publishHealth, this));
 
     RCLCPP_INFO(this->get_logger(), "Candle ROS2 MD node started.");
 }
@@ -144,6 +149,115 @@ void MdNode::publishJointStates()
     }
     this->pubJointState->publish(msgJointStates);
     return;
+}
+
+namespace
+{
+/// Appends every raised flag of one detailed status map as "<category>: <flag name>".
+/// Returns true when at least one raised flag is a real error (not a warning).
+template <class BitsT>
+bool appendActiveFlags(const std::unordered_map<BitsT, mab::MDStatus::StatusItem_S>& status,
+                       const char*  category,
+                       std::string& description)
+{
+    bool anyError = false;
+    for (const auto& [bit, item] : status)
+    {
+        if (!item.isSet())
+            continue;
+        if (!description.empty())
+            description += "; ";
+        description += std::string(category) + ": " + item.name;
+        anyError = anyError || item.isError;
+    }
+    return anyError;
+}
+}  // namespace
+
+void MdNode::publishHealth()
+{
+    candle_ros2::msg::MdHealth msg;
+    msg.header.stamp = this->get_clock()->now();
+
+    msg.device_ids.reserve(m_mds.size());
+    msg.responsive.reserve(m_mds.size());
+    msg.error.reserve(m_mds.size());
+    msg.active_errors.reserve(m_mds.size());
+
+    for (auto& md : m_mds)
+    {
+        msg.device_ids.push_back(md.m_canId);
+
+        const auto [quickStatus, statusErr] = md.getQuickStatus();
+        if (statusErr != mab::MD::Error_t::OK)
+        {
+            msg.responsive.push_back(false);
+            msg.error.push_back(true);
+            msg.active_errors.emplace_back("drive did not answer the status query");
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                 *this->get_clock(),
+                                 5000,
+                                 "Health: failed to read quick status for drive %d",
+                                 md.m_canId);
+            continue;
+        }
+
+        using Bits = mab::MDStatus::QuickStatusBits;
+        bool        anyError = false;
+        std::string description;
+
+        // Detailed subsystem status is fetched only for categories flagged in the
+        // quick status, so a healthy drive costs a single CAN read per cycle.
+        const auto collect = [&](Bits bit, const char* category, auto&& readDetailedStatus)
+        {
+            if (!quickStatus.at(bit).isSet())
+                return;
+            const auto [detailedStatus, err] = readDetailedStatus();
+            if (err != mab::MD::Error_t::OK)
+            {
+                if (!description.empty())
+                    description += "; ";
+                description += std::string(category) + ": status unavailable";
+                anyError = true;
+                return;
+            }
+            anyError = appendActiveFlags(detailedStatus, category, description) || anyError;
+        };
+
+        collect(Bits::MainEncoderStatus,
+                "main encoder",
+                [&md] { return md.getMainEncoderStatus(); });
+        collect(Bits::OutputEncoderStatus,
+                "output encoder",
+                [&md] { return md.getOutputEncoderStatus(); });
+        collect(Bits::CalibrationEncoderStatus,
+                "calibration",
+                [&md] { return md.getCalibrationStatus(); });
+        collect(Bits::MosfetBridgeStatus,
+                "mosfet bridge",
+                [&md] { return md.getBridgeStatus(); });
+        collect(Bits::HardwareStatus, "hardware", [&md] { return md.getHardwareStatus(); });
+        collect(Bits::CommunicationStatus,
+                "communication",
+                [&md] { return md.getCommunicationStatus(); });
+        collect(Bits::MotionStatus, "motion", [&md] { return md.getMotionStatus(); });
+
+        if (anyError)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(),
+                                 *this->get_clock(),
+                                 5000,
+                                 "Health: drive %d reports errors: %s",
+                                 md.m_canId,
+                                 description.c_str());
+        }
+
+        msg.responsive.push_back(true);
+        msg.error.push_back(anyError);
+        msg.active_errors.push_back(std::move(description));
+    }
+
+    this->pubHealth->publish(msg);
 }
 
 void MdNode::cbMotionCmd(const candle_ros2::msg::MotionCmd& msg)

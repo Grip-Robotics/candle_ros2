@@ -19,5 +19,6 @@ struct candleParams_S
     double      soft_close_profile_deceleration_rad_s2;
     double      soft_close_closed_tol_rad;
     int         soft_close_fast_duration_ms;
+    int         health_publish_period_ms;
     bool        init_devices_zero;
 };

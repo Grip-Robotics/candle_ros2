@@ -39,6 +39,7 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="100.0"),
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
+        DeclareLaunchArgument("health_publish_period_ms", default_value="200"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
     ]
 
@@ -103,6 +104,9 @@ def generate_launch_description():
                         ),
                         "soft_close_fast_duration_ms": ParameterValue(
                             LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int
+                        ),
+                        "health_publish_period_ms": ParameterValue(
+                            LaunchConfiguration("health_publish_period_ms"), value_type=int
                         ),
                         "init_devices_zero": ParameterValue(
                             LaunchConfiguration("init_devices_zero"), value_type=bool

@@ -14,8 +14,30 @@ For configuration, please use:
 
 - Control MD drive controllers
 - Publish joint state data
+- Publish per-drive health/error status on `md/health`
 - Accept position, velocity, motion, and impedance commands
 - Provide enable/disable/zero/mode setup services
+
+### Health monitoring
+
+The MD node periodically queries every added drive and publishes a
+`candle_ros2/msg/MdHealth` message on `md/health` (default `5 Hz`, set by the
+`health_publish_period_ms` parameter). All arrays share the `device_ids` order:
+
+- `responsive[i]` — `false` when the drive did not answer the status query.
+- `error[i]` — `true` when the drive raises any error flag (or its status is
+  unreadable). Warnings alone do not set it.
+- `active_errors[i]` — human-readable list of raised flags, e.g.
+  `hardware: Error Motor Temperature; motion: Warning Torque`. Empty when
+  healthy.
+
+A healthy drive costs one CAN status read per cycle; detailed subsystem status
+is fetched only when the drive flags a problem. The autonomy stack should
+treat `responsive == false` or `error == true` as a faulted gripper:
+
+```bash
+ros2 topic echo /md/health
+```
 
 
 
@@ -199,6 +221,7 @@ Relevant MD-node parameters are:
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
+- `health_publish_period_ms` (`200`) — period of the `md/health` status topic
 - `init_devices_zero` (`false`)
 
 Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then

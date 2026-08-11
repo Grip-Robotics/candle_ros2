@@ -6,6 +6,7 @@
 
 /* Messages */
 #include "candle_ros2/msg/impedance_cmd.hpp"
+#include "candle_ros2/msg/md_health.hpp"
 #include "candle_ros2/msg/motion_cmd.hpp"
 #include "candle_ros2/msg/position_pid_cmd.hpp"
 #include "candle_ros2/msg/velocity_pid_cmd.hpp"
@@ -78,9 +79,11 @@ class MdNode : public rclcpp::Node
     float       softCloseProfileDecelerationRadS2;
     double      softCloseClosedTolRad;
     int         softCloseFastDurationMs;
+    int         healthPublishPeriodMs;
     bool        initDevicesZero;
 
-    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pubJointState;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr  pubJointState;
+    rclcpp::Publisher<candle_ros2::msg::MdHealth>::SharedPtr    pubHealth;
 
     rclcpp::Subscription<candle_ros2::msg::MotionCmd>::SharedPtr      subMotionCmd;
     rclcpp::Subscription<candle_ros2::msg::PositionPidCmd>::SharedPtr subPositionCmd;
@@ -101,8 +104,10 @@ class MdNode : public rclcpp::Node
     rclcpp::Service<candle_ros2::srv::SoftCloseGripper>::SharedPtr srvSoftClose;
 
     rclcpp::TimerBase::SharedPtr tmrPub;
+    rclcpp::TimerBase::SharedPtr tmrHealth;
 
     void publishJointStates();
+    void publishHealth();
     void tickSoftCloseJobs();
 
     void cbMotionCmd(const candle_ros2::msg::MotionCmd& msg);
