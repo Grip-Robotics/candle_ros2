@@ -307,7 +307,7 @@ Relevant MD-node parameters are:
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
 - `health_publish_period_ms` (`200`)
 - `gripper_state_position_tolerance_rad` (`0.01`)
-- `gripper_state_moving_velocity_rad_s` (`0.05`)
+- `gripper_state_moving_velocity_rad_s` (`0.12`)
 - `encoder_wrap_period_rad` (`0.62831853`)
 - `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
 - `position_recovery_samples` (`3`)

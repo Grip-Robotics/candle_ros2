@@ -1937,6 +1937,7 @@ void MdNode::completeHoming(mab::MD& md, HomingContext& context, double stopRawP
     }
 
     const u16 id = md.m_canId;
+    m_gripperSamples[id] = GripperSample{gripperOpenPositionRad, 0.0};
     m_activeHoming.reset();
     maybePersistPositionState(true);
     RCLCPP_INFO(this->get_logger(),

@@ -41,7 +41,7 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
         DeclareLaunchArgument("health_publish_period_ms", default_value="200"),
         DeclareLaunchArgument("gripper_state_position_tolerance_rad", default_value="0.01"),
-        DeclareLaunchArgument("gripper_state_moving_velocity_rad_s", default_value="0.05"),
+        DeclareLaunchArgument("gripper_state_moving_velocity_rad_s", default_value="0.12"),
         DeclareLaunchArgument("encoder_wrap_period_rad", default_value="0.62831853"),
         DeclareLaunchArgument("position_recovery_max_delta_rad", default_value="0.25"),
         DeclareLaunchArgument("position_recovery_samples", default_value="3"),
