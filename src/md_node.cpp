@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -29,6 +30,10 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       softCloseClosedTolRad(params.soft_close_closed_tol_rad),
       softCloseFastDurationMs(params.soft_close_fast_duration_ms),
       healthPublishPeriodMs(params.health_publish_period_ms),
+      encoderWrapPeriodRad(params.encoder_wrap_period_rad),
+      positionRecoveryMaxDeltaRad(params.position_recovery_max_delta_rad),
+      positionRecoverySamples(params.position_recovery_samples),
+      positionRecoveryRetryMs(params.position_recovery_retry_ms),
       initDevicesZero(params.init_devices_zero)
 {
     if (jointNamePrefix.empty())
@@ -45,7 +50,12 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         !std::isfinite(softCloseProfileDecelerationRadS2) ||
         softCloseProfileDecelerationRadS2 <= 0.0f ||
         !std::isfinite(softCloseClosedTolRad) || softCloseClosedTolRad <= 0.0 ||
-        softCloseFastDurationMs <= 0 || healthPublishPeriodMs <= 0)
+        softCloseFastDurationMs <= 0 || healthPublishPeriodMs <= 0 ||
+        !std::isfinite(encoderWrapPeriodRad) ||
+        encoderWrapPeriodRad <= 0.0 || !std::isfinite(positionRecoveryMaxDeltaRad) ||
+        positionRecoveryMaxDeltaRad <= 0.0 ||
+        positionRecoveryMaxDeltaRad >= encoderWrapPeriodRad / 2.0 ||
+        positionRecoverySamples <= 0 || positionRecoveryRetryMs <= 0)
         throw std::invalid_argument(
             "invalid gripper position, gain, velocity, torque, soft-close, or health parameter");
 
@@ -130,6 +140,7 @@ MdNode::~MdNode()
 
 void MdNode::publishJointStates()
 {
+    tickRecoveryJobs();
     tickSoftCloseJobs();
 
     sensor_msgs::msg::JointState msgJointStates;
@@ -143,9 +154,31 @@ void MdNode::publishJointStates()
     for (auto& md : m_mds)
     {
         msgJointStates.name.push_back(jointNamePrefix + std::to_string(md.m_canId));
-        msgJointStates.position.push_back(md.getPosition().first);
-        msgJointStates.velocity.push_back(md.getVelocity().first);
-        msgJointStates.effort.push_back(md.getTorque().first);
+        const auto logicalPosition = readLogicalPosition(md);
+        if (!logicalPosition.has_value())
+        {
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            msgJointStates.position.push_back(nan);
+            msgJointStates.velocity.push_back(nan);
+            msgJointStates.effort.push_back(nan);
+            continue;
+        }
+
+        const auto [velocity, velocityErr] = md.getVelocity();
+        const auto [torque, torqueErr]     = md.getTorque();
+        if (velocityErr != mab::MD::Error_t::OK || torqueErr != mab::MD::Error_t::OK)
+        {
+            beginRecovery(md.m_canId);
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            msgJointStates.position.push_back(nan);
+            msgJointStates.velocity.push_back(nan);
+            msgJointStates.effort.push_back(nan);
+            continue;
+        }
+
+        msgJointStates.position.push_back(*logicalPosition);
+        msgJointStates.velocity.push_back(velocity);
+        msgJointStates.effort.push_back(torque);
     }
     this->pubJointState->publish(msgJointStates);
     return;
@@ -188,12 +221,25 @@ void MdNode::publishHealth()
     {
         msg.device_ids.push_back(md.m_canId);
 
+        const auto trackerIt = m_positionTrackers.find(md.m_canId);
+        const bool positionLost =
+            trackerIt != m_positionTrackers.end() &&
+            trackerIt->second.state() == PositionTracker::State::Faulted;
+        const bool positionRecovering =
+            !positionLost &&
+            (m_recoveryContexts.find(md.m_canId) != m_recoveryContexts.end() ||
+             (trackerIt != m_positionTrackers.end() &&
+              trackerIt->second.state() == PositionTracker::State::Recovering));
+
         const auto [quickStatus, statusErr] = md.getQuickStatus();
         if (statusErr != mab::MD::Error_t::OK)
         {
             msg.responsive.push_back(false);
             msg.error.push_back(true);
-            msg.active_errors.emplace_back("drive did not answer the status query");
+            msg.active_errors.emplace_back(
+                positionLost ? "drive did not answer the status query; position: reference "
+                               "lost, manual /md/zero calibration required"
+                             : "drive did not answer the status query");
             RCLCPP_WARN_THROTTLE(this->get_logger(),
                                  *this->get_clock(),
                                  5000,
@@ -205,6 +251,19 @@ void MdNode::publishHealth()
         using Bits = mab::MDStatus::QuickStatusBits;
         bool        anyError = false;
         std::string description;
+
+        // Position-tracker state matters to the stack: while it is not
+        // Tracking, the node rejects every motion command for this drive.
+        if (positionLost)
+        {
+            description = "position: reference lost, manual /md/zero calibration required";
+            anyError    = true;
+        }
+        else if (positionRecovering)
+        {
+            description = "position: recovering after communication loss, commands rejected";
+            anyError    = true;
+        }
 
         // Detailed subsystem status is fetched only for categories flagged in the
         // quick status, so a healthy drive costs a single CAN read per cycle.
@@ -281,18 +340,36 @@ void MdNode::cbMotionCmd(const candle_ros2::msg::MotionCmd& msg)
             RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", msg.device_ids[i]);
             continue;
         }
+        if (!canAcceptPositionCommand(msg.device_ids[i]))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d position is invalid or recovering; motion command rejected",
+                        msg.device_ids[i]);
+            continue;
+        }
 
         mab::MDRegisters_S mdRegisters;
-        mdRegisters.targetPosition = msg.target_position[i];
+        mdRegisters.targetPosition =
+            m_positionTrackers.at(msg.device_ids[i]).logicalToRaw(msg.target_position[i]);
         mdRegisters.targetVelocity = msg.target_velocity[i];
         mdRegisters.targetTorque   = msg.target_torque[i];
 
         if (md->writeRegisters(mdRegisters.targetPosition,
                                mdRegisters.targetVelocity,
                                mdRegisters.targetTorque) != mab::MD::Error_t::OK)
+        {
             RCLCPP_WARN(this->get_logger(),
                         "Failed to set Motion Command for drive with ID: %d",
                         msg.device_ids[i]);
+            beginRecovery(msg.device_ids[i]);
+        }
+        else
+        {
+            rememberResumeCommand(msg.device_ids[i],
+                                  msg.target_position[i],
+                                  false,
+                                  gripperVelocityLimitRadS);
+        }
     }
     return;
 }
@@ -449,12 +526,18 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
         }
 
         mab::MD md(id, m_candle.get());
+        md.m_timeout = 10;  // ms
         if (md.init() != mab::MD::Error_t::OK)
         {
             rsp->success.push_back(false);
             continue;
         }
 
+        m_positionTrackers.emplace(
+            id,
+            PositionTracker(encoderWrapPeriodRad,
+                            positionRecoveryMaxDeltaRad,
+                            static_cast<std::size_t>(positionRecoverySamples)));
         m_mds.push_back(std::move(md));
         rsp->success.push_back(true);
     }
@@ -487,8 +570,9 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         // stage to command this drive again after it is enabled.
         m_softCloseJobs.erase(req->device_ids[i]);
 
-        // A drive may still be enabled with a target latched in non-volatile
-        // registers. Disable it before setting either the mode or target.
+        // Disable first: MD motion mode resets on disable, and a previous
+        // close/soft-close target may still be latched until overwritten in
+        // the active motion mode.
         if (!resetDriveErrorsIfNeeded(*md) || md->disable() != mab::MD::Error_t::OK)
         {
             RCLCPP_WARN(this->get_logger(),
@@ -503,15 +587,8 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
                 this->get_logger(), "Init devices: failed to zero drive %d", req->device_ids[i]);
             continue;
         }
-
-        const auto [currentPos, posErr] = md->getPosition();
-        if (posErr != mab::MD::Error_t::OK)
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "Init devices: failed to read current position for drive %d",
-                        req->device_ids[i]);
-            continue;
-        }
+        if (initDevicesZero)
+            m_positionTrackers.at(req->device_ids[i]).resetAtZero();
 
         const bool configured =
             req->mode != "IMPEDANCE" ||
@@ -520,9 +597,12 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
                              gripperImpedanceKd,
                              gripperVelocityLimitRadS,
                              gripperTorqueLimitNm);
-        if (!configured || !setGripperTarget(*md, static_cast<double>(currentPos)))
+        if (!configured)
             continue;
 
+        // Mode must be selected before the hold target is written. Targets set
+        // while the drive is IDLE after disable are not reliably used on enable,
+        // so a stale closed target from soft-close can take effect otherwise.
         auto modeReq        = std::make_shared<candle_ros2::srv::SetMode::Request>();
         auto modeRsp        = std::make_shared<candle_ros2::srv::SetMode::Response>();
         modeReq->device_ids = {req->device_ids[i]};
@@ -531,7 +611,38 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         if (modeRsp->success.empty() || !modeRsp->success.front())
             continue;
 
-        rsp->success[i] = md->enable() == mab::MD::Error_t::OK;
+        const auto holdPos = readLogicalPosition(*md, false);
+        if (!holdPos.has_value() || !setGripperTarget(*md, *holdPos))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Init devices: failed to latch hold target for drive %d",
+                        req->device_ids[i]);
+            continue;
+        }
+
+        if (md->enable() != mab::MD::Error_t::OK)
+            continue;
+
+        // Reassert hold after enable so a briefly restored stale target cannot
+        // start a close motion.
+        const auto holdPosAfterEnable = readLogicalPosition(*md, false);
+        if (!holdPosAfterEnable.has_value() ||
+            !setGripperTarget(*md, *holdPosAfterEnable))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Init devices: failed to reassert hold target for drive %d after enable",
+                        req->device_ids[i]);
+            md->disable();
+            continue;
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Init devices: drive %d holding at %.4f rad",
+                    req->device_ids[i],
+                    *holdPosAfterEnable);
+        rememberResumeCommand(
+            req->device_ids[i], *holdPosAfterEnable, false, gripperVelocityLimitRadS);
+        rsp->success[i] = true;
     }
 }
 
@@ -549,10 +660,34 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
             continue;
         }
 
-        if (md->zero() == mab::MD::Error_t::OK)
-            rsp->success.push_back(true);
-        else
+        cancelSoftClose(id);
+
+        if (md->zero() != mab::MD::Error_t::OK)
+        {
+            RCLCPP_WARN(this->get_logger(), "Failed to zero drive with ID: %d", id);
             rsp->success.push_back(false);
+            continue;
+        }
+
+        m_recoveryContexts.erase(id);
+        m_positionTrackers.at(id).resetAtZero();
+
+        // Zero changes the position frame but does not update the active
+        // target. Replace the pre-zero target immediately so the drive holds
+        // the new mechanical-open reference instead of moving toward it.
+        if (!setGripperTarget(*md, 0.0))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Failed to hold drive %d at zero after calibration; disabling it",
+                        id);
+            md->disable();
+            rsp->success.push_back(false);
+            continue;
+        }
+
+        rememberResumeCommand(id, 0.0, false, gripperVelocityLimitRadS);
+        RCLCPP_INFO(this->get_logger(), "Drive %d zeroed and holding at logical 0 rad", id);
+        rsp->success.push_back(true);
     }
     return;
 }
@@ -675,6 +810,10 @@ bool MdNode::profilePidReady(mab::MD& md)
 
 bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit)
 {
+    auto tracker = m_positionTrackers.find(md.m_canId);
+    if (tracker == m_positionTrackers.end() || !tracker->second.isTracking())
+        return false;
+
     // The drive's global limit registers (positionLimitMin/Max, maxVelocity) are
     // intentionally never written: they persist after soft-close and previously
     // latched "Error Velocity Limit"/"Warning Position" flags during later
@@ -719,8 +858,22 @@ bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double 
 
 bool MdNode::setGripperTarget(mab::MD& md, double targetPos)
 {
+    auto tracker = m_positionTrackers.find(md.m_canId);
+    if (tracker == m_positionTrackers.end() || !tracker->second.isTracking())
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d has no valid position reference; target rejected",
+                    md.m_canId);
+        return false;
+    }
+
+    return writeRawTarget(md, tracker->second.logicalToRaw(targetPos));
+}
+
+bool MdNode::writeRawTarget(mab::MD& md, double rawTargetPos)
+{
     mab::MDRegisters_S motionRegs;
-    motionRegs.targetPosition = targetPos;
+    motionRegs.targetPosition = rawTargetPos;
     motionRegs.targetVelocity = 0.0;
     motionRegs.targetTorque   = 0.0;
     if (md.writeRegisters(motionRegs.targetPosition,
@@ -729,6 +882,7 @@ bool MdNode::setGripperTarget(mab::MD& md, double targetPos)
     {
         RCLCPP_WARN(
             this->get_logger(), "Failed to set target position for drive with ID: %d", md.m_canId);
+        beginRecovery(md.m_canId);
         return false;
     }
 
@@ -742,6 +896,7 @@ bool MdNode::moveGripper(mab::MD& md, double targetPos)
         RCLCPP_WARN(this->get_logger(),
                     "Failed to disable drive with ID: %d before impedance move",
                     md.m_canId);
+        beginRecovery(md.m_canId);
         return false;
     }
 
@@ -750,13 +905,15 @@ bool MdNode::moveGripper(mab::MD& md, double targetPos)
                           gripperImpedanceKd,
                           gripperVelocityLimitRadS,
                           gripperTorqueLimitNm) ||
-        !setGripperTarget(md, targetPos) ||
         md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-        md.enable() != mab::MD::Error_t::OK)
+        !setGripperTarget(md, targetPos) ||
+        md.enable() != mab::MD::Error_t::OK ||
+        !setGripperTarget(md, targetPos))
     {
         RCLCPP_WARN(this->get_logger(),
                     "Failed to start impedance move for drive with ID: %d",
                     md.m_canId);
+        beginRecovery(md.m_canId);
         return false;
     }
 
@@ -792,9 +949,10 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
             return true;
 
         RCLCPP_WARN(this->get_logger(),
-                    "Failed to read quick status for drive %d; attempting error reset before "
-                    "motion command",
+                    "Failed to read quick status for drive %d; motion rejected until recovery",
                     md.m_canId);
+        beginRecovery(md.m_canId);
+        return false;
     }
     else
     {
@@ -810,9 +968,213 @@ bool MdNode::resetDriveErrorsIfNeeded(mab::MD& md)
         return false;
     }
 
-    // Do not enable here: the caller must first configure its mode and target,
-    // then enable the drive. Error recovery never calls zero().
+    const auto [statusAfterClear, statusAfterClearErr] = md.getQuickStatus();
+    if (statusAfterClearErr != mab::MD::Error_t::OK ||
+        statusAfterClear.at(Bits::MainEncoderStatus).isSet() ||
+        statusAfterClear.at(Bits::OutputEncoderStatus).isSet() ||
+        statusAfterClear.at(Bits::CalibrationEncoderStatus).isSet() ||
+        statusAfterClear.at(Bits::MosfetBridgeStatus).isSet() ||
+        statusAfterClear.at(Bits::HardwareStatus).isSet() ||
+        statusAfterClear.at(Bits::MotionStatus).isSet())
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d is not healthy after clearing errors; motion rejected",
+                    md.m_canId);
+        beginRecovery(md.m_canId);
+        return false;
+    }
+
     return true;
+}
+
+std::optional<double> MdNode::readLogicalPosition(mab::MD& md, bool triggerRecovery)
+{
+    auto tracker = m_positionTrackers.find(md.m_canId);
+    if (tracker == m_positionTrackers.end())
+        return std::nullopt;
+
+    if (tracker->second.state() == PositionTracker::State::Recovering ||
+        tracker->second.state() == PositionTracker::State::Faulted)
+        return std::nullopt;
+
+    const auto [rawPosition, positionErr] = md.getPosition();
+    if (positionErr != mab::MD::Error_t::OK)
+    {
+        if (triggerRecovery)
+            beginRecovery(md.m_canId);
+        return std::nullopt;
+    }
+
+    return tracker->second.observe(static_cast<double>(rawPosition));
+}
+
+void MdNode::beginRecovery(u16 id)
+{
+    auto tracker = m_positionTrackers.find(id);
+    if (tracker == m_positionTrackers.end() ||
+        tracker->second.state() == PositionTracker::State::Faulted)
+        return;
+
+    if (tracker->second.state() == PositionTracker::State::Tracking)
+    {
+        auto softClose = m_softCloseJobs.find(id);
+        if (softClose != m_softCloseJobs.end())
+        {
+            rememberResumeCommand(
+                id, gripperClosedPositionRad, true, softClose->second.slowVelocityRadS);
+        }
+        tracker->second.markCommunicationLost();
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d lost communication; position invalid until automatic recovery",
+                    id);
+    }
+
+    m_recoveryContexts.try_emplace(
+        id, RecoveryContext{std::chrono::steady_clock::now(), false});
+}
+
+bool MdNode::resumeAfterRecovery(mab::MD& md)
+{
+    auto tracker = m_positionTrackers.find(md.m_canId);
+    if (tracker == m_positionTrackers.end() || !tracker->second.isTracking())
+        return false;
+
+    const auto command = m_resumeCommands.find(md.m_canId);
+    const double target =
+        command != m_resumeCommands.end() ? command->second.targetPosition
+                                          : tracker->second.continuousPosition();
+    const bool softClose = command != m_resumeCommands.end() && command->second.softClose;
+    const double velocity =
+        softClose ? command->second.slowVelocity : gripperVelocityLimitRadS;
+    const double torque = softClose ? softCloseSlowTorqueLimitNm : gripperTorqueLimitNm;
+
+    if (md.disable() != mab::MD::Error_t::OK ||
+        !configureGripper(
+            md, gripperImpedanceKp, gripperImpedanceKd, velocity, torque) ||
+        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+        !setGripperTarget(md, target) ||
+        md.enable() != mab::MD::Error_t::OK ||
+        !setGripperTarget(md, target))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d position recovered but target resume failed",
+                    md.m_canId);
+        return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+                "Drive %d recovered at logical %.4f rad; resumed target %.4f rad",
+                md.m_canId,
+                tracker->second.continuousPosition(),
+                target);
+    return true;
+}
+
+bool MdNode::canAcceptPositionCommand(u16 id) const
+{
+    const auto tracker = m_positionTrackers.find(id);
+    return tracker != m_positionTrackers.end() && tracker->second.isTracking() &&
+           m_recoveryContexts.find(id) == m_recoveryContexts.end();
+}
+
+void MdNode::rememberResumeCommand(u16 id, double target, bool softClose, double slowVelocity)
+{
+    m_resumeCommands[id] = ResumeCommand{target, softClose, slowVelocity};
+    auto tracker = m_positionTrackers.find(id);
+    if (tracker != m_positionTrackers.end())
+        tracker->second.setLastTarget(target);
+}
+
+void MdNode::tickRecoveryJobs()
+{
+    if (m_recoveryContexts.empty())
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<u16> recovered;
+    std::vector<u16> faulted;
+
+    for (auto& [id, context] : m_recoveryContexts)
+    {
+        if (now < context.nextAttempt)
+            continue;
+
+        context.nextAttempt = now + std::chrono::milliseconds(positionRecoveryRetryMs);
+        auto md = findMd(m_mds, id);
+        auto tracker = m_positionTrackers.find(id);
+        if (md == m_mds.end() || tracker == m_positionTrackers.end())
+        {
+            faulted.push_back(id);
+            continue;
+        }
+
+        if (!context.errorsCleared)
+        {
+            if (md->clearErrors() != mab::MD::Error_t::OK)
+                continue;
+            context.errorsCleared = true;
+        }
+
+        const auto [quickStatus, statusErr] = md->getQuickStatus();
+        using Bits = mab::MDStatus::QuickStatusBits;
+        if (statusErr != mab::MD::Error_t::OK)
+            continue;
+
+        const bool criticalError =
+            quickStatus.at(Bits::MainEncoderStatus).isSet() ||
+            quickStatus.at(Bits::OutputEncoderStatus).isSet() ||
+            quickStatus.at(Bits::CalibrationEncoderStatus).isSet() ||
+            quickStatus.at(Bits::MosfetBridgeStatus).isSet() ||
+            quickStatus.at(Bits::HardwareStatus).isSet() ||
+            quickStatus.at(Bits::MotionStatus).isSet();
+        if (criticalError)
+        {
+            context.errorsCleared = false;
+            continue;
+        }
+
+        const auto [rawPosition, positionErr] = md->getPosition();
+        if (positionErr != mab::MD::Error_t::OK)
+            continue;
+
+        if (tracker->second.state() == PositionTracker::State::Uninitialized)
+        {
+            tracker->second.initialize(static_cast<double>(rawPosition));
+            recovered.push_back(id);
+            continue;
+        }
+
+        const auto result = tracker->second.observeRecovery(static_cast<double>(rawPosition));
+        if (result == PositionTracker::RecoveryResult::Rejected)
+        {
+            md->disable();
+            RCLCPP_ERROR(this->get_logger(),
+                         "Drive %d recovery is ambiguous; manual open calibration is required",
+                         id);
+            faulted.push_back(id);
+            continue;
+        }
+        if (result == PositionTracker::RecoveryResult::Pending)
+        {
+            context.nextAttempt = now;
+            continue;
+        }
+
+        if (resumeAfterRecovery(*md))
+        {
+            recovered.push_back(id);
+        }
+        else
+        {
+            tracker->second.markCommunicationLost();
+            context.errorsCleared = false;
+        }
+    }
+
+    for (u16 id : recovered)
+        m_recoveryContexts.erase(id);
+    for (u16 id : faulted)
+        m_recoveryContexts.erase(id);
 }
 
 void MdNode::cancelSoftClose(u16 id)
@@ -824,10 +1186,12 @@ void MdNode::cancelSoftClose(u16 id)
     auto md = findMd(m_mds, id);
     if (md != m_mds.end())
     {
-        const auto [position, err] = md->getPosition();
-        if (err == mab::MD::Error_t::OK)
-            setGripperTarget(*md, static_cast<double>(position));
-        restoreNormalGripperConfig(*md);
+        const auto position = readLogicalPosition(*md);
+        if (position.has_value())
+        {
+            setGripperTarget(*md, *position);
+            restoreNormalGripperConfig(*md);
+        }
     }
 
     m_softCloseJobs.erase(it);
@@ -871,6 +1235,12 @@ void MdNode::tickSoftCloseJobs()
 
     for (auto& [id, job] : m_softCloseJobs)
     {
+        if (m_recoveryContexts.find(id) != m_recoveryContexts.end())
+        {
+            finished.push_back(id);
+            continue;
+        }
+
         auto md = findMd(m_mds, id);
         if (md == m_mds.end())
         {
@@ -889,15 +1259,26 @@ void MdNode::tickSoftCloseJobs()
                                   gripperImpedanceKd,
                                   job.slowVelocityRadS,
                                   softCloseSlowTorqueLimitNm) ||
-                !setGripperTarget(*md, gripperClosedPositionRad) ||
                 md->setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-                md->enable() != mab::MD::Error_t::OK)
+                !setGripperTarget(*md, gripperClosedPositionRad) ||
+                md->enable() != mab::MD::Error_t::OK ||
+                !setGripperTarget(*md, gripperClosedPositionRad))
             {
                 RCLCPP_WARN(this->get_logger(),
                             "Soft-close: failed to start slow stage for drive %d",
                             id);
-                restoreNormalGripperConfig(*md);
-                md->enable();
+                if (m_recoveryContexts.find(id) == m_recoveryContexts.end())
+                {
+                    const auto [status, statusErr] = md->getQuickStatus();
+                    (void)status;
+                    if (statusErr != mab::MD::Error_t::OK)
+                        beginRecovery(id);
+                    else
+                    {
+                        restoreNormalGripperConfig(*md);
+                        md->enable();
+                    }
+                }
                 finished.push_back(id);
                 continue;
             }
@@ -914,14 +1295,15 @@ void MdNode::tickSoftCloseJobs()
             continue;
         }
 
-        const auto [pos, posErr] = md->getPosition();
-        if (posErr != mab::MD::Error_t::OK)
+        const auto pos = readLogicalPosition(*md);
+        if (!pos.has_value())
         {
             RCLCPP_WARN_THROTTLE(this->get_logger(),
                                  *this->get_clock(),
                                  1000,
                                  "Soft-close: failed to read position for drive %d",
                                  id);
+            finished.push_back(id);
             continue;
         }
 
@@ -933,7 +1315,7 @@ void MdNode::tickSoftCloseJobs()
                              "torque=%.3f Nm",
                              id,
                              stageName,
-                             static_cast<double>(pos),
+                             *pos,
                              job.preClosePos,
                              gripperClosedPositionRad,
                              static_cast<double>(md->getTorque().first));
@@ -951,7 +1333,7 @@ void MdNode::tickSoftCloseJobs()
             quickStatus.at(mab::MDStatus::QuickStatusBits::TargetPositionReached).isSet();
 
         if (statusReached ||
-            std::abs(static_cast<double>(pos) - gripperClosedPositionRad) <
+            std::abs(*pos - gripperClosedPositionRad) <
                 softCloseClosedTolRad ||
             slowTimedOut)
         {
@@ -987,6 +1369,15 @@ void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Requ
         }
 
         cancelSoftClose(id);
+        if (!canAcceptPositionCommand(id))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d position is invalid or recovering; open rejected",
+                        id);
+            rsp->success.push_back(false);
+            continue;
+        }
+        rememberResumeCommand(id, gripperOpenPositionRad, false, gripperVelocityLimitRadS);
         if (!resetDriveErrorsIfNeeded(*md))
         {
             rsp->success.push_back(false);
@@ -1012,6 +1403,15 @@ void MdNode::cbCloseGripper(const std::shared_ptr<candle_ros2::srv::Generic::Req
         }
 
         cancelSoftClose(id);
+        if (!canAcceptPositionCommand(id))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d position is invalid or recovering; close rejected",
+                        id);
+            rsp->success.push_back(false);
+            continue;
+        }
+        rememberResumeCommand(id, gripperClosedPositionRad, false, gripperVelocityLimitRadS);
         if (!resetDriveErrorsIfNeeded(*md))
         {
             rsp->success.push_back(false);
@@ -1095,21 +1495,41 @@ void MdNode::cbSoftCloseGripper(
         }
 
         cancelSoftClose(id);
+        if (!canAcceptPositionCommand(id))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d position is invalid or recovering; soft-close rejected",
+                        id);
+            rsp->success.push_back(false);
+            continue;
+        }
+        rememberResumeCommand(id, gripperClosedPositionRad, true, slowVelocityRadS);
 
         if (!resetDriveErrorsIfNeeded(*md) ||
             md->disable() != mab::MD::Error_t::OK ||
             !profilePidReady(*md) ||
             !configurePositionProfile(
                 *md, fastVelocityRadS, softCloseFastTorqueLimitNm) ||
-            !setGripperTarget(*md, fastTarget) ||
             md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
-            md->enable() != mab::MD::Error_t::OK)
+            !setGripperTarget(*md, fastTarget) ||
+            md->enable() != mab::MD::Error_t::OK ||
+            !setGripperTarget(*md, fastTarget))
         {
             RCLCPP_WARN(this->get_logger(),
                         "Soft-close: failed to start fast stage for drive %d",
                         id);
-            restoreNormalGripperConfig(*md);
-            md->enable();
+            if (m_recoveryContexts.find(id) == m_recoveryContexts.end())
+            {
+                const auto [status, statusErr] = md->getQuickStatus();
+                (void)status;
+                if (statusErr != mab::MD::Error_t::OK)
+                    beginRecovery(id);
+                else
+                {
+                    restoreNormalGripperConfig(*md);
+                    md->enable();
+                }
+            }
             rsp->success.push_back(false);
             continue;
         }
@@ -1168,6 +1588,15 @@ void MdNode::cbSetGripperTargets(
             RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", req->device_ids[i]);
             continue;
         }
+        if (!canAcceptPositionCommand(req->device_ids[i]))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d position is invalid or recovering; target rejected",
+                        req->device_ids[i]);
+            continue;
+        }
+        rememberResumeCommand(
+            req->device_ids[i], target, false, gripperVelocityLimitRadS);
         rsp->success[i] = setGripperTarget(*md, target);
     }
 }

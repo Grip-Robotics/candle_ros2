@@ -26,6 +26,10 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
     node->declare_parameter<int>("health_publish_period_ms", 200);
+    node->declare_parameter<double>("encoder_wrap_period_rad", 0.62831853);
+    node->declare_parameter<double>("position_recovery_max_delta_rad", 0.25);
+    node->declare_parameter<int>("position_recovery_samples", 3);
+    node->declare_parameter<int>("position_recovery_retry_ms", 25);
     node->declare_parameter<bool>("init_devices_zero", false);
 
     candleParams_S params;
@@ -57,6 +61,14 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("soft_close_fast_duration_ms").as_int();
     params.health_publish_period_ms =
         node->get_parameter("health_publish_period_ms").as_int();
+    params.encoder_wrap_period_rad =
+        node->get_parameter("encoder_wrap_period_rad").as_double();
+    params.position_recovery_max_delta_rad =
+        node->get_parameter("position_recovery_max_delta_rad").as_double();
+    params.position_recovery_samples =
+        node->get_parameter("position_recovery_samples").as_int();
+    params.position_recovery_retry_ms =
+        node->get_parameter("position_recovery_retry_ms").as_int();
     params.init_devices_zero = node->get_parameter("init_devices_zero").as_bool();
     return params;
 }

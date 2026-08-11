@@ -1,5 +1,7 @@
 #pragma once
+#include <chrono>
 #include <cmath>
+#include <optional>
 #include <unordered_map>
 
 #include "rclcpp/rclcpp.hpp"
@@ -24,6 +26,7 @@
 
 /* Utils */
 #include "candle_ros2/utils/candle_params.hpp"
+#include "candle_ros2/position_tracker.hpp"
 
 /* CANdle-SDK */
 #include "candle.hpp"
@@ -54,6 +57,19 @@ class MdNode : public rclcpp::Node
         rclcpp::Time   slowStageStart;
     };
 
+    struct ResumeCommand
+    {
+        double targetPosition = 0.0;
+        bool   softClose      = false;
+        double slowVelocity   = 0.0;
+    };
+
+    struct RecoveryContext
+    {
+        std::chrono::steady_clock::time_point nextAttempt;
+        bool                                  errorsCleared = false;
+    };
+
     std::shared_ptr<mab::Candle> m_candle;
     std::vector<mab::MD>         m_mds;
 
@@ -65,6 +81,9 @@ class MdNode : public rclcpp::Node
     static constexpr double SOFT_CLOSE_MAX_SPEED_RAD_S = 6.0;
 
     std::unordered_map<u16, SoftCloseJob> m_softCloseJobs;
+    std::unordered_map<u16, PositionTracker> m_positionTrackers;
+    std::unordered_map<u16, ResumeCommand> m_resumeCommands;
+    std::unordered_map<u16, RecoveryContext> m_recoveryContexts;
 
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
@@ -80,6 +99,10 @@ class MdNode : public rclcpp::Node
     double      softCloseClosedTolRad;
     int         softCloseFastDurationMs;
     int         healthPublishPeriodMs;
+    double      encoderWrapPeriodRad;
+    double      positionRecoveryMaxDeltaRad;
+    int         positionRecoverySamples;
+    int         positionRecoveryRetryMs;
     bool        initDevicesZero;
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr  pubJointState;
@@ -109,6 +132,7 @@ class MdNode : public rclcpp::Node
     void publishJointStates();
     void publishHealth();
     void tickSoftCloseJobs();
+    void tickRecoveryJobs();
 
     void cbMotionCmd(const candle_ros2::msg::MotionCmd& msg);
     void cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg);
@@ -147,9 +171,15 @@ class MdNode : public rclcpp::Node
     bool profilePidReady(mab::MD& md);
     bool configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
+    bool writeRawTarget(mab::MD& md, double rawTargetPos);
     bool moveGripper(mab::MD& md, double targetPos);
     bool restoreNormalGripperConfig(mab::MD& md);
     bool resetDriveErrorsIfNeeded(mab::MD& md);
+    std::optional<double> readLogicalPosition(mab::MD& md, bool triggerRecovery = true);
+    void beginRecovery(u16 id);
+    bool resumeAfterRecovery(mab::MD& md);
+    bool canAcceptPositionCommand(u16 id) const;
+    void rememberResumeCommand(u16 id, double target, bool softClose, double slowVelocity);
     void cancelSoftClose(u16 id);
 
     /** Piecewise-linear calibration: finger gap [mm] → motor position [rad]. */

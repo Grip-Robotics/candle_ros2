@@ -96,4 +96,12 @@ install(PROGRAMS
   scripts/test_grippers.sh
   DESTINATION lib/${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(position_tracker_test test/position_tracker_test.cpp)
+  target_include_directories(position_tracker_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+endif()
+
 ament_package()

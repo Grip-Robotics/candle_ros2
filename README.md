@@ -31,6 +31,12 @@ The MD node periodically queries every added drive and publishes a
   `hardware: Error Motor Temperature; motion: Warning Torque`. Empty when
   healthy.
 
+Brownout position continuity is also reported: while a drive is recovering,
+`active_errors` contains `position: recovering after communication loss` and
+`error` is `true`; if recovery was rejected it contains
+`position: reference lost, manual /md/zero calibration required` until the
+drive is re-zeroed.
+
 A healthy drive costs one CAN status read per cycle; detailed subsystem status
 is fetched only when the drive flags a problem. The autonomy stack should
 treat `responsive == false` or `error == true` as a faulted gripper:
@@ -50,7 +56,8 @@ ros2 topic echo /md/health
 The following commands are the calibrated sequence for drives `342`, `343`, and
 `345`. Encoder zeros are preserved during normal initialization. Zero a drive
 only as a deliberate calibration step while it is at its known mechanical open
-reference.
+reference. Before starting this sequence, place every gripper at that mechanical
+open reference.
 
 In terminal 1, launch the node and keep it running:
 
@@ -72,14 +79,16 @@ ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
   "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
 ```
 
-1. With every gripper at its known mechanical open reference, zero all drives:
+1. With every gripper still at its known mechanical open reference, zero all
+  drives. This command also replaces the old motion target with logical `0`.
+  Runtime zero is not retained by the MD across a drive power reset:
 
 ```bash
 ros2 service call /md/zero candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
-1. Apply the calibrated runtime position and velocity PID gains:
+1. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
 
 ```bash
 ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
@@ -132,8 +141,31 @@ ros2 service call /md/close_gripper candle_ros2/srv/Generic \
 ```
 
 The PID command above changes runtime registers and may need to be repeated
-after a drive reset or power cycle. Never use `init_devices_zero:=true` unless
-all mechanisms are physically at the intended zero reference.
+after a drive reset or power cycle. Keep `init_devices_zero:=false` during
+normal startup and fault recovery so re-initialization cannot redefine zero at
+an arbitrary mechanism position. Use `/md/zero` only as a deliberate calibration
+command while all requested mechanisms are physically at their intended open
+reference.
+
+### Brownout position continuity
+
+The MD main encoder retains one motor revolution after a drive reset, while its
+turn count and runtime zero are lost. For the 10:1 gripper drive this produces
+position jumps of approximately `2π / 10 = 0.62831853 rad`. While this ROS node
+remains running, it keeps a continuous logical position per drive and unwraps
+such jumps against the last trusted position.
+
+On a CAN outage the node publishes `NaN` joint-state values, rejects new motion
+commands, retries communication every `25 ms`, and requires three healthy
+position/status samples. Recovery succeeds only when inferred unpowered motion
+is at most `0.25 rad`. The interrupted target is then resumed automatically;
+an interrupted soft-close resumes its final closed target with the slow
+impedance configuration.
+
+If recovery is ambiguous, the drive remains disabled. Place it manually at the
+mechanical open reference and call `/md/zero`. Continuity state is intentionally
+not stored on disk, so a simultaneous MD and ROS-node restart also requires this
+manual calibration.
 
 ### Automated service test
 
@@ -213,7 +245,7 @@ Relevant MD-node parameters are:
 
 - `joint_name_prefix` (`md_`)
 - `gripper_open_position_rad` (`0.0`)
-- `gripper_closed_position_rad` (`0.65`)
+- `gripper_closed_position_rad` (`0.63` from the launch file)
 - `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
 - `gripper_velocity_limit_rad_s` (`3.5`)
 - `gripper_torque_limit_nm` (`4.0`)
@@ -222,6 +254,10 @@ Relevant MD-node parameters are:
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
 - `health_publish_period_ms` (`200`) — period of the `md/health` status topic
+- `encoder_wrap_period_rad` (`0.62831853`)
+- `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
+- `position_recovery_samples` (`3`)
+- `position_recovery_retry_ms` (`25`)
 - `init_devices_zero` (`false`)
 
 Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then
@@ -255,4 +291,3 @@ Full CANdle ROS2 documentation:
 
 MAB controllers manuals:
 ➡️ [MAB documentation](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/intro.html)
-
