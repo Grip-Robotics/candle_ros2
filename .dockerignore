@@ -1,0 +1,12 @@
+# Version control (nested .git repos exist inside CANdle-SDK 3rd_party)
+.git
+**/.git
+
+# Local build artifacts
+build
+install
+log
+CANdle-SDK/build
+
+Dockerfile
+.dockerignore
