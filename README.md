@@ -45,7 +45,34 @@ treat `responsive == false` or `error == true` as a faulted gripper:
 ros2 topic echo /md/health
 ```
 
+## Running
 
+### MD Node
+```bash
+ros2 launch candle_ros2 md_node_launch.py
+```
+
+### PDS Node
+```bash
+ros2 launch candle_ros2 pds_node_launch.py
+```
+
+### Both Nodes
+```bash
+ros2 launch candle_ros2 both_launch.py
+```
+
+### Launch arguments
+
+- `bus` — desired communication bus with CANdle device, possible values: `USB` and `SPI` (default: `USB`).
+- `usb_serial` — complete USB serial of the CANdle adapter to open. An empty value selects the first available adapter for backwards compatibility (default: empty).
+- `data_rate` — data rate of CAN network, possible values: `1M`, `2M`, `5M` and `8M` (default: `1M`).
+- `default_qos` — ROS message quality of service for node's publishers, possible values: `Reliable` and `BestEffort` (default: `Reliable`).
+
+Example launch command with custom arguments:
+```bash
+ros2 launch candle_ros2 md_node_launch.py usb_serial:=205D366D3036 data_rate:=5M
+```
 
 ## Example MD service calls - GRIPPER CONTROL
 

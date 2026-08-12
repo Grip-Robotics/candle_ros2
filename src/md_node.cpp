@@ -151,25 +151,45 @@ void MdNode::publishJointStates()
     msgJointStates.effort.reserve(m_mds.size());
 
     msgJointStates.header.stamp = this->get_clock()->now();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
     for (auto& md : m_mds)
     {
         msgJointStates.name.push_back(jointNamePrefix + std::to_string(md.m_canId));
-        const auto logicalPosition = readLogicalPosition(md);
-        if (!logicalPosition.has_value())
+
+        // Skip the bus entirely while the drive is recovering or faulted; the
+        // NaN entries tell downstream consumers the reading is invalid.
+        auto tracker = m_positionTrackers.find(md.m_canId);
+        if (tracker == m_positionTrackers.end() ||
+            tracker->second.state() == PositionTracker::State::Recovering ||
+            tracker->second.state() == PositionTracker::State::Faulted)
         {
-            const double nan = std::numeric_limits<double>::quiet_NaN();
             msgJointStates.position.push_back(nan);
             msgJointStates.velocity.push_back(nan);
             msgJointStates.effort.push_back(nan);
             continue;
         }
 
-        const auto [velocity, velocityErr] = md.getVelocity();
-        const auto [torque, torqueErr]     = md.getTorque();
-        if (velocityErr != mab::MD::Error_t::OK || torqueErr != mab::MD::Error_t::OK)
+        // One batched register read per drive is a third of the bus and USB
+        // load of the per-register getters, and a failed read must never be
+        // published as a measurement (the getters return a literal 0.0 on
+        // error, which downstream consumers cannot tell from a real reading).
+        if (md.readRegisters(md.m_mdRegisters.mainEncoderPosition,
+                             md.m_mdRegisters.mainEncoderVelocity,
+                             md.m_mdRegisters.motorTorque) != mab::MD::Error_t::OK)
         {
             beginRecovery(md.m_canId);
-            const double nan = std::numeric_limits<double>::quiet_NaN();
+            msgJointStates.position.push_back(nan);
+            msgJointStates.velocity.push_back(nan);
+            msgJointStates.effort.push_back(nan);
+            continue;
+        }
+
+        // The tracker unwraps brown-out encoder jumps onto the continuous
+        // logical gripper axis.
+        const auto logicalPosition = tracker->second.observe(
+            static_cast<double>(md.m_mdRegisters.mainEncoderPosition.value));
+        if (!logicalPosition.has_value())
+        {
             msgJointStates.position.push_back(nan);
             msgJointStates.velocity.push_back(nan);
             msgJointStates.effort.push_back(nan);
@@ -177,8 +197,8 @@ void MdNode::publishJointStates()
         }
 
         msgJointStates.position.push_back(*logicalPosition);
-        msgJointStates.velocity.push_back(velocity);
-        msgJointStates.effort.push_back(torque);
+        msgJointStates.velocity.push_back(md.m_mdRegisters.mainEncoderVelocity.value);
+        msgJointStates.effort.push_back(md.m_mdRegisters.motorTorque.value);
     }
     this->pubJointState->publish(msgJointStates);
     return;
@@ -526,7 +546,14 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
         }
 
         mab::MD md(id, m_candle.get());
-        md.m_timeout = 10;  // ms
+        // Give the drive 10 ms (100 x 100 us) to answer instead of the 1 ms
+        // SDK default. On a loaded host the USB round trip alone can exceed
+        // the default window, and the SDK misreports that as "CAN frame did
+        // not reach target device" even though the bus is healthy. This is
+        // only an upper bound: a healthy drive's reply completes the
+        // transfer immediately, so the wider window costs nothing when the
+        // bus is working.
+        md.m_timeout = 100;
         if (md.init() != mab::MD::Error_t::OK)
         {
             rsp->success.push_back(false);
