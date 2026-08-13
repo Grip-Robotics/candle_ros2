@@ -27,6 +27,8 @@ inline bool isOpeningTargetDirectionValid(double currentRawPosition,
     if (openingDirection == 0.0)
         return false;
 
+    constexpr double OPENING_DIRECTION_TOLERANCE_RAD = 0.005;
     const double rawMovement = targetRawPosition - currentRawPosition;
-    return rawMovement * openingDirection >= 0.0;
+    return std::abs(rawMovement) <= OPENING_DIRECTION_TOLERANCE_RAD ||
+           rawMovement * openingDirection >= 0.0;
 }
