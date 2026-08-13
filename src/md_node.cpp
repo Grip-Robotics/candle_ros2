@@ -29,7 +29,10 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
           static_cast<float>(params.soft_close_profile_deceleration_rad_s2)),
       softCloseClosedTolRad(params.soft_close_closed_tol_rad),
       softCloseFastDurationMs(params.soft_close_fast_duration_ms),
+      jointStatePublishPeriodMs(params.joint_state_publish_period_ms),
       healthPublishPeriodMs(params.health_publish_period_ms),
+      mdCanResponseTimeout100us(params.md_can_response_timeout_100us),
+      mdHostTimeoutMs(params.md_host_timeout_ms),
       encoderWrapPeriodRad(params.encoder_wrap_period_rad),
       positionRecoveryMaxDeltaRad(params.position_recovery_max_delta_rad),
       positionRecoverySamples(params.position_recovery_samples),
@@ -50,14 +53,17 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         !std::isfinite(softCloseProfileDecelerationRadS2) ||
         softCloseProfileDecelerationRadS2 <= 0.0f ||
         !std::isfinite(softCloseClosedTolRad) || softCloseClosedTolRad <= 0.0 ||
-        softCloseFastDurationMs <= 0 || healthPublishPeriodMs <= 0 ||
+        softCloseFastDurationMs <= 0 || jointStatePublishPeriodMs <= 0 ||
+        healthPublishPeriodMs <= 0 || mdCanResponseTimeout100us <= 0 ||
+        mdCanResponseTimeout100us > std::numeric_limits<u8>::max() ||
+        mdHostTimeoutMs <= (mdCanResponseTimeout100us + 9) / 10 ||
         !std::isfinite(encoderWrapPeriodRad) ||
         encoderWrapPeriodRad <= 0.0 || !std::isfinite(positionRecoveryMaxDeltaRad) ||
         positionRecoveryMaxDeltaRad <= 0.0 ||
         positionRecoveryMaxDeltaRad >= encoderWrapPeriodRad / 2.0 ||
         positionRecoverySamples <= 0 || positionRecoveryRetryMs <= 0)
         throw std::invalid_argument(
-            "invalid gripper position, gain, velocity, torque, soft-close, or health parameter");
+            "invalid gripper, telemetry, communication-timeout, or health parameter");
 
     rclcpp::QoS defaultQoS(10);
     defaultQoS.reliable();
@@ -125,12 +131,17 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         std::string(NODE_PREFIX) + "soft_close_gripper",
         std::bind(&MdNode::cbSoftCloseGripper, this, std::placeholders::_1, std::placeholders::_2));
 
-    tmrPub = this->create_wall_timer(std::chrono::milliseconds(PUB_TIMER_MS),
+    tmrPub = this->create_wall_timer(std::chrono::milliseconds(jointStatePublishPeriodMs),
                                      std::bind(&MdNode::publishJointStates, this));
     tmrHealth = this->create_wall_timer(std::chrono::milliseconds(healthPublishPeriodMs),
                                         std::bind(&MdNode::publishHealth, this));
 
-    RCLCPP_INFO(this->get_logger(), "Candle ROS2 MD node started.");
+    RCLCPP_INFO(this->get_logger(),
+                "Candle ROS2 MD node started: joint states every %d ms, "
+                "CAN response timeout %.1f ms, host USB timeout %d ms.",
+                jointStatePublishPeriodMs,
+                mdCanResponseTimeout100us / 10.0,
+                mdHostTimeoutMs);
 }
 
 MdNode::~MdNode()
@@ -546,14 +557,11 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
         }
 
         mab::MD md(id, m_candle.get());
-        // Give the drive 10 ms (100 x 100 us) to answer instead of the 1 ms
-        // SDK default. On a loaded host the USB round trip alone can exceed
-        // the default window, and the SDK misreports that as "CAN frame did
-        // not reach target device" even though the bus is healthy. This is
-        // only an upper bound: a healthy drive's reply completes the
-        // transfer immediately, so the wider window costs nothing when the
-        // bus is working.
-        md.m_timeout = 100;
+        // The CANdle firmware deadline and host USB deadline use
+        // different units and must not be derived from the same integer.
+        // A missing drive therefore blocks this single-threaded node only
+        // for the bounded host timeout, not 10x the intended CAN window.
+        md.m_timeout = static_cast<u32>(mdCanResponseTimeout100us);
         if (md.init() != mab::MD::Error_t::OK)
         {
             rsp->success.push_back(false);

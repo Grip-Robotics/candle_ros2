@@ -73,8 +73,7 @@ class MdNode : public rclcpp::Node
     std::shared_ptr<mab::Candle> m_candle;
     std::vector<mab::MD>         m_mds;
 
-    static constexpr const char* NODE_PREFIX  = "md/";
-    static constexpr int         PUB_TIMER_MS = 5;  // 200 Hz
+    static constexpr const char* NODE_PREFIX = "md/";
 
     static constexpr int SLOW_STAGE_TIMEOUT_MS = 1000;
     static constexpr double SOFT_CLOSE_MIN_SPEED_RAD_S = 0.4;
@@ -98,7 +97,10 @@ class MdNode : public rclcpp::Node
     float       softCloseProfileDecelerationRadS2;
     double      softCloseClosedTolRad;
     int         softCloseFastDurationMs;
+    int         jointStatePublishPeriodMs;
     int         healthPublishPeriodMs;
+    int         mdCanResponseTimeout100us;
+    int         mdHostTimeoutMs;
     double      encoderWrapPeriodRad;
     double      positionRecoveryMaxDeltaRad;
     int         positionRecoverySamples;

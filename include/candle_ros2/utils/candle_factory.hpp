@@ -1,7 +1,9 @@
 #pragma once
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -10,6 +12,49 @@
 
 /* CANdle-SDK */
 #include "candle.hpp"
+
+namespace candle_ros2::detail
+{
+class HostTimeoutBoundedInterface final : public mab::I_CommunicationInterface
+{
+  public:
+    HostTimeoutBoundedInterface(
+        std::unique_ptr<mab::I_CommunicationInterface>&& interface, u32 hostTimeoutMs)
+        : m_interface(std::move(interface)), m_hostTimeoutMs(hostTimeoutMs)
+    {
+    }
+
+    Error_t connect() override
+    {
+        return m_interface->connect();
+    }
+
+    Error_t disconnect() override
+    {
+        return m_interface->disconnect();
+    }
+
+    Error_t transfer(std::vector<u8> data, const u32 timeoutMs) override
+    {
+        return m_interface->transfer(
+            std::move(data), std::min(timeoutMs, m_hostTimeoutMs));
+    }
+
+    std::pair<std::vector<u8>, Error_t> transfer(
+        std::vector<u8> data,
+        const u32       timeoutMs,
+        const size_t    expectedReceivedDataSize) override
+    {
+        return m_interface->transfer(std::move(data),
+                                     std::min(timeoutMs, m_hostTimeoutMs),
+                                     expectedReceivedDataSize);
+    }
+
+  private:
+    std::unique_ptr<mab::I_CommunicationInterface> m_interface;
+    u32                                            m_hostTimeoutMs;
+};
+}  // namespace candle_ros2::detail
 
 inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
 {
@@ -30,7 +75,10 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
+    node->declare_parameter<int>("joint_state_publish_period_ms", 50);
     node->declare_parameter<int>("health_publish_period_ms", 200);
+    node->declare_parameter<int>("md_can_response_timeout_100us", 100);
+    node->declare_parameter<int>("md_host_timeout_ms", 20);
     node->declare_parameter<double>("encoder_wrap_period_rad", 0.62831853);
     node->declare_parameter<double>("position_recovery_max_delta_rad", 0.25);
     node->declare_parameter<int>("position_recovery_samples", 3);
@@ -65,8 +113,14 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("soft_close_closed_tol_rad").as_double();
     params.soft_close_fast_duration_ms =
         node->get_parameter("soft_close_fast_duration_ms").as_int();
+    params.joint_state_publish_period_ms =
+        node->get_parameter("joint_state_publish_period_ms").as_int();
     params.health_publish_period_ms =
         node->get_parameter("health_publish_period_ms").as_int();
+    params.md_can_response_timeout_100us =
+        node->get_parameter("md_can_response_timeout_100us").as_int();
+    params.md_host_timeout_ms =
+        node->get_parameter("md_host_timeout_ms").as_int();
     params.encoder_wrap_period_rad =
         node->get_parameter("encoder_wrap_period_rad").as_double();
     params.position_recovery_max_delta_rad =
@@ -96,10 +150,16 @@ inline std::shared_ptr<mab::Candle> createCandle(const candleParams_S& params)
 
     if (bus == mab::candleTypes::busTypes_t::USB)
     {
-        std::unique_ptr<mab::I_CommunicationInterface> usb =
+        if (params.md_host_timeout_ms <= 0)
+            throw std::invalid_argument("md_host_timeout_ms must be positive");
+        std::unique_ptr<mab::I_CommunicationInterface> rawUsb =
             std::make_unique<mab::USB>(mab::Candle::CANDLE_VID,
                                        mab::Candle::CANDLE_PID,
                                        params.usb_serial);
+        std::unique_ptr<mab::I_CommunicationInterface> usb =
+            std::make_unique<candle_ros2::detail::HostTimeoutBoundedInterface>(
+                std::move(rawUsb),
+                static_cast<u32>(params.md_host_timeout_ms));
         if (usb->connect() != mab::I_CommunicationInterface::Error_t::OK)
             throw std::runtime_error("Could not connect selected USB device!");
         return std::shared_ptr<mab::Candle>(

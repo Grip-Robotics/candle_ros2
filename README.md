@@ -13,7 +13,8 @@ For configuration, please use:
 ### MD Node
 
 - Control MD drive controllers
-- Publish joint state data
+- Publish joint state data (default `20 Hz`, set by
+  `joint_state_publish_period_ms`)
 - Publish per-drive health/error status on `md/health`
 - Accept position, velocity, motion, and impedance commands
 - Provide enable/disable/zero/mode setup services
@@ -68,6 +69,12 @@ ros2 launch candle_ros2 both_launch.py
 - `usb_serial` — complete USB serial of the CANdle adapter to open. An empty value selects the first available adapter for backwards compatibility (default: empty).
 - `data_rate` — data rate of CAN network, possible values: `1M`, `2M`, `5M` and `8M` (default: `1M`).
 - `default_qos` — ROS message quality of service for node's publishers, possible values: `Reliable` and `BestEffort` (default: `Reliable`).
+- `joint_state_publish_period_ms` — period of the batched per-drive position,
+  velocity, and torque reads (default: `50`, or `20 Hz`).
+- `md_can_response_timeout_100us` — CANdle firmware wait for an MD response in
+  units of 100 microseconds (default: `100`, or `10 ms`).
+- `md_host_timeout_ms` — independent host USB deadline applied to each SDK
+  transport wait (default: `20 ms`). It must exceed the CAN response timeout.
 
 Example launch command with custom arguments:
 ```bash
@@ -183,11 +190,12 @@ remains running, it keeps a continuous logical position per drive and unwraps
 such jumps against the last trusted position.
 
 On a CAN outage the node publishes `NaN` joint-state values, rejects new motion
-commands, retries communication every `25 ms`, and requires three healthy
-position/status samples. Recovery succeeds only when inferred unpowered motion
-is at most `0.25 rad`. The interrupted target is then resumed automatically;
-an interrupted soft-close resumes its final closed target with the slow
-impedance configuration.
+commands, schedules communication retries no faster than `25 ms` (bounded by
+the joint-state timer cadence), and requires three healthy position/status
+samples. Recovery succeeds only when inferred unpowered motion is at most
+`0.25 rad`. The interrupted target is then resumed automatically; an
+interrupted soft-close resumes its final closed target with the slow impedance
+configuration.
 
 If recovery is ambiguous, the drive remains disabled. Place it manually at the
 mechanical open reference and call `/md/zero`. Continuity state is intentionally
@@ -280,7 +288,10 @@ Relevant MD-node parameters are:
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)
 - `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
+- `joint_state_publish_period_ms` (`50`) — `20 Hz` joint feedback and drive keepalive
 - `health_publish_period_ms` (`200`) — period of the `md/health` status topic
+- `md_can_response_timeout_100us` (`100`) — `10 ms` CANdle firmware response window
+- `md_host_timeout_ms` (`20`) — independent host USB transport deadline
 - `encoder_wrap_period_rad` (`0.62831853`)
 - `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
 - `position_recovery_samples` (`3`)
