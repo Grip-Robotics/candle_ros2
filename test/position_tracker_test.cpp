@@ -116,6 +116,8 @@ TEST(OpeningProfileTest, AcceptsOnlyRawMotionTowardLogicalOpen)
 {
     EXPECT_TRUE(isOpeningTargetDirectionValid(0.63, 0.0, 0.0, 0.63));
     EXPECT_TRUE(isOpeningTargetDirectionValid(0.0, 0.0, 0.0, 0.63));
+    EXPECT_TRUE(isOpeningTargetDirectionValid(-0.0033, 0.0, 0.0, 0.63));
+    EXPECT_FALSE(isOpeningTargetDirectionValid(-0.006, 0.0, 0.0, 0.63));
     EXPECT_FALSE(isOpeningTargetDirectionValid(-0.05, 0.0, 0.0, 0.63));
 
     EXPECT_TRUE(isOpeningTargetDirectionValid(-0.63, 0.0, 0.63, 0.0));
