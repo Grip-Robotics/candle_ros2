@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "candle_ros2/opening_profile.hpp"
 #include "candle_ros2/position_tracker.hpp"
 
 namespace
@@ -82,4 +83,47 @@ TEST(PositionTrackerTest, RestoresExplicitLogicalBranchAndTarget)
     EXPECT_NEAR(tracker.logicalToRaw(0.63), 0.63 - PERIOD, 1e-9);
     ASSERT_TRUE(tracker.lastTarget().has_value());
     EXPECT_DOUBLE_EQ(*tracker.lastTarget(), 0.63);
+}
+
+TEST(PositionTrackerTest, TracksSparseFullOpeningWithoutAliasing)
+{
+    PositionTracker tracker(PERIOD, 0.25, 3);
+    tracker.initialize(0.63);
+
+    const auto opened = tracker.observe(0.0);
+
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_DOUBLE_EQ(*opened, 0.0);
+    EXPECT_DOUBLE_EQ(tracker.rawOffset(), 0.0);
+}
+
+TEST(PositionTrackerTest, TracksContinuousMultiWrapMotionWithFixedOffset)
+{
+    PositionTracker tracker(PERIOD, 0.25, 3);
+    ASSERT_TRUE(tracker.restore(-0.20, 0.42831853, std::nullopt));
+
+    const auto first = tracker.observe(0.75);
+    const auto second = tracker.observe(1.80);
+
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    EXPECT_NEAR(*first, 0.75 + PERIOD, 1e-9);
+    EXPECT_NEAR(*second, 1.80 + PERIOD, 1e-9);
+    EXPECT_NEAR(tracker.rawOffset(), PERIOD, 1e-9);
+}
+
+TEST(OpeningProfileTest, AcceptsOnlyRawMotionTowardLogicalOpen)
+{
+    EXPECT_TRUE(isOpeningTargetDirectionValid(0.63, 0.0, 0.0, 0.63));
+    EXPECT_TRUE(isOpeningTargetDirectionValid(0.0, 0.0, 0.0, 0.63));
+    EXPECT_FALSE(isOpeningTargetDirectionValid(-0.05, 0.0, 0.0, 0.63));
+
+    EXPECT_TRUE(isOpeningTargetDirectionValid(-0.63, 0.0, 0.63, 0.0));
+    EXPECT_FALSE(isOpeningTargetDirectionValid(0.05, 0.0, 0.63, 0.0));
+}
+
+TEST(OpeningProfileTest, SelectsPositionProfileOnlyForProfileOpening)
+{
+    EXPECT_EQ(resumeModeForProfileOpening(true), GripperResumeMode::PositionProfile);
+    EXPECT_EQ(resumeModeForProfileOpening(false), GripperResumeMode::Impedance);
 }

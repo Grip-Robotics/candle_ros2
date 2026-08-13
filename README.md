@@ -101,6 +101,14 @@ ros2 service call /md/open_gripper candle_ros2/srv/Generic \
   "{device_ids: [342, 343, 345]}"
 ```
 
+The requested drives are configured sequentially over CAN and then move
+concurrently toward logical zero in `POSITION_PROFILE` mode. Opening uses the
+configured `6 rad/s` velocity, `3 Nm` torque limit, and dedicated acceleration
+and deceleration parameters. Both the position and velocity PID Kp registers
+must already be configured; otherwise that drive remains disabled and its
+service result is false. A raw target that would move opposite the logical
+opening direction is rejected and faults the position reference.
+
 1. Run the calibrated two-stage close for one drive at a time. Adjust
   `pre_close_gap_mm` when a different transition gap is required:
 
@@ -140,9 +148,12 @@ reference.
 
 The MD main encoder retains its single-turn reference after a drive reset, while
 its accumulated gearbox turn section is lost. For the 10:1 gripper drive this produces
-position jumps of approximately `2π / 10 = 0.62831853 rad`. While this ROS node
-remains running, it keeps a continuous logical position per drive and unwraps
-such jumps against the last trusted position.
+position jumps of approximately `2π / 10 = 0.62831853 rad`. While the drive
+remains powered, its accumulated MD position is already continuous, so normal
+tracking applies one fixed raw-to-logical offset even across sparse, fast
+samples. Nearest-wrap selection is used only during explicit communication
+recovery and persisted startup restore, where the accumulated-turn component
+may actually have been lost.
 
 On a CAN outage the node publishes `NaN` joint-state values, rejects new motion
 commands, retries communication every `25 ms`, and requires three healthy
@@ -235,9 +246,9 @@ By default, the script preserves existing encoder zeros and requires typing
 `RUN` before moving. After confirmation, it automatically:
 
 1. Applies the calibrated position and velocity PID gains.
-2. Closes and opens each gripper individually.
-3. Soft-closes each gripper individually with `40`, `30`, and `25` mm
-  transition gaps, reopening after every test.
+2. Closes and opens each gripper individually for five cycles.
+3. Soft-closes each gripper for five cycles with `40`, `30`, and `25` mm
+  transition gaps, reopening after every movement.
 
 The soft-close values are the gaps where motion changes from fast to slow; they
 are not final commanded widths. The script intentionally avoids simultaneous
@@ -256,10 +267,11 @@ Use `--yes` only when it is safe to skip the interactive motion confirmation:
 ros2 run candle_ros2 test_grippers.sh --yes
 ```
 
-Motion delays and service timeout can be overridden when slower hardware needs
-more time:
+The default waits are one second after normal motion and two seconds after a
+soft close. Movement cycles, delays, and service timeout can be overridden:
 
 ```bash
+MOVEMENT_CYCLES=3 \
 MOVE_WAIT_SECONDS=3 \
 SOFT_CLOSE_WAIT_SECONDS=9 \
 SERVICE_TIMEOUT_SECONDS=20 \
@@ -301,6 +313,7 @@ Relevant MD-node parameters are:
 - `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
 - `gripper_velocity_limit_rad_s` (`6.0`)
 - `gripper_torque_limit_nm` (`3.0`)
+- `opening_profile_acceleration_rad_s2` / `opening_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`4.0` / `4.0`)
 - `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
 - `soft_close_closed_tol_rad` (`0.005`)

@@ -82,10 +82,10 @@ class PositionTracker
         if (m_state != State::Tracking)
             return std::nullopt;
 
-        const double delta = std::remainder(rawPosition - m_lastRawPosition, m_wrapPeriodRad);
-        m_continuousPosition += delta;
-        m_lastRawPosition = rawPosition;
-        m_rawOffset       = m_continuousPosition - rawPosition;
+        // The powered MD position already includes accumulated turns. Preserve the
+        // established calibration offset instead of aliasing sparse motion by a wrap period.
+        m_lastRawPosition    = rawPosition;
+        m_continuousPosition = rawPosition + m_rawOffset;
         return m_continuousPosition;
     }
 

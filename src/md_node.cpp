@@ -48,6 +48,10 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       gripperImpedanceKd(static_cast<float>(params.gripper_impedance_kd)),
       gripperVelocityLimitRadS(static_cast<float>(params.gripper_velocity_limit_rad_s)),
       gripperTorqueLimitNm(static_cast<float>(params.gripper_torque_limit_nm)),
+      openingProfileAccelerationRadS2(
+          static_cast<float>(params.opening_profile_acceleration_rad_s2)),
+      openingProfileDecelerationRadS2(
+          static_cast<float>(params.opening_profile_deceleration_rad_s2)),
       softCloseFastTorqueLimitNm(static_cast<float>(params.soft_close_fast_torque_limit_nm)),
       softCloseSlowTorqueLimitNm(static_cast<float>(params.soft_close_slow_torque_limit_nm)),
       softCloseProfileAccelerationRadS2(
@@ -89,6 +93,10 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
         !std::isfinite(gripperImpedanceKd) || gripperImpedanceKd < 0.0f ||
         !std::isfinite(gripperVelocityLimitRadS) || gripperVelocityLimitRadS <= 0.0f ||
         !std::isfinite(gripperTorqueLimitNm) || gripperTorqueLimitNm <= 0.0f ||
+        !std::isfinite(openingProfileAccelerationRadS2) ||
+        openingProfileAccelerationRadS2 <= 0.0f ||
+        !std::isfinite(openingProfileDecelerationRadS2) ||
+        openingProfileDecelerationRadS2 <= 0.0f ||
         !std::isfinite(softCloseFastTorqueLimitNm) || softCloseFastTorqueLimitNm <= 0.0f ||
         !std::isfinite(softCloseSlowTorqueLimitNm) || softCloseSlowTorqueLimitNm <= 0.0f ||
         !std::isfinite(softCloseProfileAccelerationRadS2) ||
@@ -945,7 +953,7 @@ bool MdNode::profilePidReady(mab::MD& md)
                          regs.motorVelPidWindup) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to read profile PID gains for drive %d",
+                    "Failed to read position-profile PID gains for drive %d",
                     md.m_canId);
         return false;
     }
@@ -958,7 +966,7 @@ bool MdNode::profilePidReady(mab::MD& md)
     if (!finite || regs.motorPosPidKp.value <= 0.0f || regs.motorVelPidKp.value <= 0.0f)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: POSITION_PROFILE PID is not configured for drive %d "
+                    "POSITION_PROFILE PID is not configured for drive %d "
                     "(position kp=%.3f, velocity kp=%.3f)",
                     md.m_canId,
                     regs.motorPosPidKp.value,
@@ -967,7 +975,8 @@ bool MdNode::profilePidReady(mab::MD& md)
     }
 
     RCLCPP_INFO(this->get_logger(),
-                "Soft-close PID drive %d: position[kp=%.3f ki=%.3f kd=%.3f windup=%.3f] "
+                "Position-profile PID drive %d: "
+                "position[kp=%.3f ki=%.3f kd=%.3f windup=%.3f] "
                 "velocity[kp=%.3f ki=%.3f kd=%.3f windup=%.3f]",
                 md.m_canId,
                 regs.motorPosPidKp.value,
@@ -982,7 +991,11 @@ bool MdNode::profilePidReady(mab::MD& md)
     return true;
 }
 
-bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit)
+bool MdNode::configurePositionProfile(mab::MD& md,
+                                      double   velocityLimit,
+                                      double   torqueLimit,
+                                      double   acceleration,
+                                      double   deceleration)
 {
     auto tracker = m_positionTrackers.find(md.m_canId);
     if (tracker == m_positionTrackers.end() || !tracker->second.isTracking())
@@ -993,25 +1006,25 @@ bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double 
     if (md.writeRegisters(regs.maxTorque) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to set torque limit for drive %d",
+                    "Failed to set position-profile torque limit for drive %d",
                     md.m_canId);
         return false;
     }
 
-    regs.maxAcceleration = softCloseProfileAccelerationRadS2;
-    regs.maxDeceleration = softCloseProfileDecelerationRadS2;
+    regs.maxAcceleration = static_cast<float>(acceleration);
+    regs.maxDeceleration = static_cast<float>(deceleration);
     if (md.writeRegisters(regs.maxAcceleration, regs.maxDeceleration) !=
         mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to set global profile limits for drive %d",
+                    "Failed to set global position-profile acceleration limits for drive %d",
                     md.m_canId);
         return false;
     }
 
     regs.profileVelocity     = static_cast<float>(velocityLimit);
-    regs.profileAcceleration = softCloseProfileAccelerationRadS2;
-    regs.profileDeceleration = softCloseProfileDecelerationRadS2;
+    regs.profileAcceleration = static_cast<float>(acceleration);
+    regs.profileDeceleration = static_cast<float>(deceleration);
     regs.positionWindow      = static_cast<float>(softCloseClosedTolRad);
     if (md.writeRegisters(regs.profileVelocity,
                           regs.profileAcceleration,
@@ -1019,7 +1032,7 @@ bool MdNode::configurePositionProfile(mab::MD& md, double velocityLimit, double 
                           regs.positionWindow) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Soft-close: failed to configure position profile for drive %d",
+                    "Failed to configure position profile for drive %d",
                     md.m_canId);
         return false;
     }
@@ -1057,6 +1070,78 @@ bool MdNode::writeRawTarget(mab::MD& md, double rawTargetPos)
         return false;
     }
 
+    return true;
+}
+
+bool MdNode::startProfileOpening(mab::MD& md)
+{
+    auto tracker = m_positionTrackers.find(md.m_canId);
+    if (tracker == m_positionTrackers.end() || !tracker->second.isTracking())
+        return false;
+
+    const double currentRawPosition = tracker->second.rawPosition();
+    const double rawOpenTarget = tracker->second.logicalToRaw(gripperOpenPositionRad);
+    if (!isOpeningTargetDirectionValid(currentRawPosition,
+                                       rawOpenTarget,
+                                       gripperOpenPositionRad,
+                                       gripperClosedPositionRad))
+    {
+        md.disable();
+        tracker->second.markFaulted();
+        m_startupStates[md.m_canId] = DriveStartupState::Faulted;
+        RCLCPP_ERROR(this->get_logger(),
+                     "Drive %d opening target rejected: raw target %.4f is opposite the "
+                     "logical opening direction from raw position %.4f",
+                     md.m_canId,
+                     rawOpenTarget,
+                     currentRawPosition);
+        return false;
+    }
+
+    if (md.disable() != mab::MD::Error_t::OK)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to disable drive %d before position-profile opening",
+                    md.m_canId);
+        beginRecovery(md.m_canId);
+        return false;
+    }
+
+    if (!profilePidReady(md))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d remains disabled because position-profile PID is not ready",
+                    md.m_canId);
+        return false;
+    }
+
+    if (!configurePositionProfile(md,
+                                  gripperVelocityLimitRadS,
+                                  gripperTorqueLimitNm,
+                                  openingProfileAccelerationRadS2,
+                                  openingProfileDecelerationRadS2) ||
+        md.setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
+        !writeRawTarget(md, rawOpenTarget) ||
+        md.enable() != mab::MD::Error_t::OK ||
+        !writeRawTarget(md, rawOpenTarget))
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to start position-profile opening for drive %d",
+                    md.m_canId);
+        beginRecovery(md.m_canId);
+        return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+                "Drive %d opening toward logical %.4f rad in POSITION_PROFILE "
+                "(velocity=%.3f rad/s, acceleration=%.3f rad/s^2, "
+                "deceleration=%.3f rad/s^2, torque limit=%.3f Nm)",
+                md.m_canId,
+                gripperOpenPositionRad,
+                gripperVelocityLimitRadS,
+                openingProfileAccelerationRadS2,
+                openingProfileDecelerationRadS2,
+                gripperTorqueLimitNm);
     return true;
 }
 
@@ -1265,9 +1350,29 @@ bool MdNode::resumeAfterRecovery(mab::MD& md)
         command != m_resumeCommands.end() ? command->second.targetPosition
                                           : tracker->second.continuousPosition();
     const bool softClose = command != m_resumeCommands.end() && command->second.softClose;
+    const GripperResumeMode resumeMode =
+        command != m_resumeCommands.end() ? command->second.mode
+                                          : GripperResumeMode::Impedance;
     const double velocity =
         softClose ? command->second.slowVelocity : gripperVelocityLimitRadS;
     const double torque = softClose ? softCloseSlowTorqueLimitNm : gripperTorqueLimitNm;
+
+    if (resumeMode == GripperResumeMode::PositionProfile)
+    {
+        if (!startProfileOpening(md))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Drive %d position recovered but profile opening resume failed",
+                        md.m_canId);
+            return false;
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d recovered at logical %.4f rad; resumed profile opening",
+                    md.m_canId,
+                    tracker->second.continuousPosition());
+        return true;
+    }
 
     if (md.disable() != mab::MD::Error_t::OK ||
         !configureGripper(md, gripperImpedanceKp, gripperImpedanceKd, velocity, torque) ||
@@ -1300,9 +1405,13 @@ bool MdNode::canAcceptPositionCommand(u16 id) const
            m_recoveryContexts.find(id) == m_recoveryContexts.end();
 }
 
-void MdNode::rememberResumeCommand(u16 id, double target, bool softClose, double slowVelocity)
+void MdNode::rememberResumeCommand(u16               id,
+                                   double            target,
+                                   bool              softClose,
+                                   double            slowVelocity,
+                                   GripperResumeMode mode)
 {
-    m_resumeCommands[id] = ResumeCommand{target, softClose, slowVelocity};
+    m_resumeCommands[id] = ResumeCommand{target, softClose, slowVelocity, mode};
     auto tracker = m_positionTrackers.find(id);
     if (tracker != m_positionTrackers.end())
         tracker->second.setLastTarget(target);
@@ -2046,6 +2155,12 @@ void MdNode::tickRecoveryJobs()
         }
         else
         {
+            if (tracker->second.state() == PositionTracker::State::Faulted)
+            {
+                m_startupStates[id] = DriveStartupState::Faulted;
+                faulted.push_back(id);
+                continue;
+            }
             tracker->second.markCommunicationLost();
             m_startupStates[id] = DriveStartupState::Recovering;
             context.errorsCleared = false;
@@ -2258,13 +2373,17 @@ void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Requ
             rsp->success.push_back(false);
             continue;
         }
-        rememberResumeCommand(id, gripperOpenPositionRad, false, gripperVelocityLimitRadS);
         if (!resetDriveErrorsIfNeeded(*md))
         {
             rsp->success.push_back(false);
             continue;
         }
-        rsp->success.push_back(moveGripper(*md, gripperOpenPositionRad));
+        rememberResumeCommand(id,
+                              gripperOpenPositionRad,
+                              false,
+                              gripperVelocityLimitRadS,
+                              resumeModeForProfileOpening(true));
+        rsp->success.push_back(startProfileOpening(*md));
     }
 }
 
@@ -2390,7 +2509,11 @@ void MdNode::cbSoftCloseGripper(
             md->disable() != mab::MD::Error_t::OK ||
             !profilePidReady(*md) ||
             !configurePositionProfile(
-                *md, fastVelocityRadS, softCloseFastTorqueLimitNm) ||
+                *md,
+                fastVelocityRadS,
+                softCloseFastTorqueLimitNm,
+                softCloseProfileAccelerationRadS2,
+                softCloseProfileDecelerationRadS2) ||
             md->setMotionMode(mab::MdMode_E::POSITION_PROFILE) != mab::MD::Error_t::OK ||
             !setGripperTarget(*md, fastTarget) ||
             md->enable() != mab::MD::Error_t::OK ||

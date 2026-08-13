@@ -13,6 +13,8 @@ struct candleParams_S
     double      gripper_impedance_kd;
     double      gripper_velocity_limit_rad_s;
     double      gripper_torque_limit_nm;
+    double      opening_profile_acceleration_rad_s2;
+    double      opening_profile_deceleration_rad_s2;
     double      soft_close_fast_torque_limit_nm;
     double      soft_close_slow_torque_limit_nm;
     double      soft_close_profile_acceleration_rad_s2;

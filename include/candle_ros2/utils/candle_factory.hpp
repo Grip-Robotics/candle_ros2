@@ -19,6 +19,8 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("gripper_impedance_kd", 0.05);
     node->declare_parameter<double>("gripper_velocity_limit_rad_s", 6.0);
     node->declare_parameter<double>("gripper_torque_limit_nm", 3.0);
+    node->declare_parameter<double>("opening_profile_acceleration_rad_s2", 100.0);
+    node->declare_parameter<double>("opening_profile_deceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_fast_torque_limit_nm", 4.0);
     node->declare_parameter<double>("soft_close_slow_torque_limit_nm", 4.0);
     node->declare_parameter<double>("soft_close_profile_acceleration_rad_s2", 100.0);
@@ -70,6 +72,10 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("gripper_velocity_limit_rad_s").as_double();
     params.gripper_torque_limit_nm =
         node->get_parameter("gripper_torque_limit_nm").as_double();
+    params.opening_profile_acceleration_rad_s2 =
+        node->get_parameter("opening_profile_acceleration_rad_s2").as_double();
+    params.opening_profile_deceleration_rad_s2 =
+        node->get_parameter("opening_profile_deceleration_rad_s2").as_double();
     params.soft_close_fast_torque_limit_nm =
         node->get_parameter("soft_close_fast_torque_limit_nm").as_double();
     params.soft_close_slow_torque_limit_nm =

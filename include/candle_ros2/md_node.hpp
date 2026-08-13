@@ -30,6 +30,7 @@
 /* Utils */
 #include "candle_ros2/utils/candle_params.hpp"
 #include "candle_ros2/homing_monitor.hpp"
+#include "candle_ros2/opening_profile.hpp"
 #include "candle_ros2/position_tracker.hpp"
 #include "candle_ros2/position_state_store.hpp"
 
@@ -64,9 +65,10 @@ class MdNode : public rclcpp::Node
 
     struct ResumeCommand
     {
-        double targetPosition = 0.0;
-        bool   softClose      = false;
-        double slowVelocity   = 0.0;
+        double            targetPosition = 0.0;
+        bool              softClose      = false;
+        double            slowVelocity   = 0.0;
+        GripperResumeMode mode           = GripperResumeMode::Impedance;
     };
 
     struct RecoveryContext
@@ -144,6 +146,8 @@ class MdNode : public rclcpp::Node
     float       gripperImpedanceKd;
     float       gripperVelocityLimitRadS;
     float       gripperTorqueLimitNm;
+    float       openingProfileAccelerationRadS2;
+    float       openingProfileDecelerationRadS2;
     float       softCloseFastTorqueLimitNm;
     float       softCloseSlowTorqueLimitNm;
     float       softCloseProfileAccelerationRadS2;
@@ -251,9 +255,14 @@ class MdNode : public rclcpp::Node
         double   velocityLimit,
         double   torqueLimit);
     bool profilePidReady(mab::MD& md);
-    bool configurePositionProfile(mab::MD& md, double velocityLimit, double torqueLimit);
+    bool configurePositionProfile(mab::MD& md,
+                                  double   velocityLimit,
+                                  double   torqueLimit,
+                                  double   acceleration,
+                                  double   deceleration);
     bool setGripperTarget(mab::MD& md, double targetPos);
     bool writeRawTarget(mab::MD& md, double rawTargetPos);
+    bool startProfileOpening(mab::MD& md);
     bool moveGripper(mab::MD& md, double targetPos);
     bool restoreNormalGripperConfig(mab::MD& md);
     bool resetDriveErrorsIfNeeded(mab::MD& md);
@@ -261,7 +270,11 @@ class MdNode : public rclcpp::Node
     void beginRecovery(u16 id);
     bool resumeAfterRecovery(mab::MD& md);
     bool canAcceptPositionCommand(u16 id) const;
-    void rememberResumeCommand(u16 id, double target, bool softClose, double slowVelocity);
+    void rememberResumeCommand(u16               id,
+                               double            target,
+                               bool              softClose,
+                               double            slowVelocity,
+                               GripperResumeMode mode = GripperResumeMode::Impedance);
     bool tryRestorePosition(mab::MD& md);
     bool queueHoming(u16 id);
     bool startNextHoming();

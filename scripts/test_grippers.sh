@@ -2,13 +2,14 @@
 
 set -Eeuo pipefail
 
-readonly DEVICE_IDS=(342 343 345)
-readonly DEVICE_IDS_YAML="[342, 343, 345]"
+readonly DEVICE_IDS=(342 343 345 111 113 447)
+readonly DEVICE_IDS_YAML="[342, 343, 345 111 113 447]"
 readonly SOFT_CLOSE_GAPS=(40 30 25)
 
-MOVE_WAIT_SECONDS="${MOVE_WAIT_SECONDS:-2}"
-SOFT_CLOSE_WAIT_SECONDS="${SOFT_CLOSE_WAIT_SECONDS:-7}"
+MOVE_WAIT_SECONDS="${MOVE_WAIT_SECONDS:-1}"
+SOFT_CLOSE_WAIT_SECONDS="${SOFT_CLOSE_WAIT_SECONDS:-2}"
 SERVICE_TIMEOUT_SECONDS="${SERVICE_TIMEOUT_SECONDS:-15}"
+MOVEMENT_CYCLES="${MOVEMENT_CYCLES:-5}"
 ASSUME_YES=false
 ZERO_DRIVES=false
 
@@ -20,8 +21,8 @@ Usage: test_grippers.sh [--zero] [--yes]
 Runs the calibrated service test for drives 342, 343, and 345:
   1. Initialize all drives while preserving their encoder zeros.
   2. Apply calibrated position and velocity PID gains.
-  3. Close/open each gripper individually.
-  4. Soft-close each gripper individually with transition gaps 40, 30, and 25 mm.
+  3. Close/open each gripper individually for five cycles.
+  4. Soft-close each gripper for five cycles with transition gaps 40, 30, and 25 mm.
 
 Options:
   --zero    Explicitly zero all drives at their current mechanical positions.
@@ -29,9 +30,10 @@ Options:
   -h        Show this help.
 
 Environment:
-  MOVE_WAIT_SECONDS        Delay after normal open/close (default: 2).
-  SOFT_CLOSE_WAIT_SECONDS  Delay after soft close (default: 7).
+  MOVE_WAIT_SECONDS        Delay after normal open/close (default: 1).
+  SOFT_CLOSE_WAIT_SECONDS  Delay after soft close (default: 2).
   SERVICE_TIMEOUT_SECONDS  ROS service timeout (default: 15).
+  MOVEMENT_CYCLES          Number of normal and soft-close cycles (default: 5).
 EOF
 }
 
@@ -65,6 +67,11 @@ done
 if [[ ! "$SERVICE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
     printf 'SERVICE_TIMEOUT_SECONDS must be a positive integer, got: %s\n' \
         "$SERVICE_TIMEOUT_SECONDS" >&2
+    exit 2
+fi
+if [[ ! "$MOVEMENT_CYCLES" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'MOVEMENT_CYCLES must be a positive integer, got: %s\n' \
+        "$MOVEMENT_CYCLES" >&2
     exit 2
 fi
 
@@ -222,28 +229,34 @@ call_service /md/open_gripper candle_ros2/srv/Generic \
 sleep "$MOVE_WAIT_SECONDS"
 
 printf '\n=== Individual impedance close/open tests ===\n'
-for id in "${DEVICE_IDS[@]}"; do
-    printf '\nTesting drive %d individually.\n' "$id"
-    call_service /md/close_gripper candle_ros2/srv/Generic \
-        "{device_ids: [${id}]}"
-    sleep "$MOVE_WAIT_SECONDS"
-    call_service /md/open_gripper candle_ros2/srv/Generic \
-        "{device_ids: [${id}]}"
-    sleep "$MOVE_WAIT_SECONDS"
-done
-
-printf '\n=== Soft-close transition-gap tests ===\n'
-for gap in "${SOFT_CLOSE_GAPS[@]}"; do
+for ((cycle = 1; cycle <= MOVEMENT_CYCLES; ++cycle)); do
+    printf '\n--- Impedance movement cycle %d/%d ---\n' "$cycle" "$MOVEMENT_CYCLES"
     for id in "${DEVICE_IDS[@]}"; do
-        printf '\nTesting drive %d with a %d mm fast-to-slow transition gap.\n' "$id" "$gap"
-        call_service /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-            "{device_ids: [${id}], pre_close_enabled: true, pre_close_gap_mm: ${gap}.0,
-              pre_close_offset_mm: 0.0,
-              fast_speed: 1.0, slow_speed: 0.4}"
-        sleep "$SOFT_CLOSE_WAIT_SECONDS"
+        printf '\nTesting drive %d individually.\n' "$id"
+        call_service /md/close_gripper candle_ros2/srv/Generic \
+            "{device_ids: [${id}]}"
+        sleep "$MOVE_WAIT_SECONDS"
         call_service /md/open_gripper candle_ros2/srv/Generic \
             "{device_ids: [${id}]}"
         sleep "$MOVE_WAIT_SECONDS"
+    done
+done
+
+printf '\n=== Soft-close transition-gap tests ===\n'
+for ((cycle = 1; cycle <= MOVEMENT_CYCLES; ++cycle)); do
+    printf '\n--- Soft-close movement cycle %d/%d ---\n' "$cycle" "$MOVEMENT_CYCLES"
+    for gap in "${SOFT_CLOSE_GAPS[@]}"; do
+        for id in "${DEVICE_IDS[@]}"; do
+            printf '\nTesting drive %d with a %d mm fast-to-slow transition gap.\n' "$id" "$gap"
+            call_service /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
+                "{device_ids: [${id}], pre_close_enabled: true, pre_close_gap_mm: ${gap}.0,
+                  pre_close_offset_mm: 0.0,
+                  fast_speed: 1.0, slow_speed: 0.4}"
+            sleep "$SOFT_CLOSE_WAIT_SECONDS"
+            call_service /md/open_gripper candle_ros2/srv/Generic \
+                "{device_ids: [${id}]}"
+            sleep "$MOVE_WAIT_SECONDS"
+        done
     done
 done
 

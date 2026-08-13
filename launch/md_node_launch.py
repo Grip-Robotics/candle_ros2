@@ -28,15 +28,17 @@ def generate_launch_description():
     gripper_args = [
         DeclareLaunchArgument("joint_name_prefix", default_value="md_"),
         DeclareLaunchArgument("gripper_open_position_rad", default_value="0.0"),
-        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.63"),
-        DeclareLaunchArgument("gripper_impedance_kp", default_value="12.5"),
-        DeclareLaunchArgument("gripper_impedance_kd", default_value="0.05"),
+        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.60"),
+        DeclareLaunchArgument("gripper_impedance_kp", default_value="6.5"),
+        DeclareLaunchArgument("gripper_impedance_kd", default_value="0.1"),
         DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="6.0"),
         DeclareLaunchArgument("gripper_torque_limit_nm", default_value="3.0"),
-        DeclareLaunchArgument("soft_close_fast_torque_limit_nm", default_value="4.0"),
-        DeclareLaunchArgument("soft_close_slow_torque_limit_nm", default_value="4.0"),
-        DeclareLaunchArgument("soft_close_profile_acceleration_rad_s2", default_value="100.0"),
-        DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="100.0"),
+        DeclareLaunchArgument("opening_profile_acceleration_rad_s2", default_value="100.0"),
+        DeclareLaunchArgument("opening_profile_deceleration_rad_s2", default_value="100.0"),
+        DeclareLaunchArgument("soft_close_fast_torque_limit_nm", default_value="2.0"),
+        DeclareLaunchArgument("soft_close_slow_torque_limit_nm", default_value="2.0"),
+        DeclareLaunchArgument("soft_close_profile_acceleration_rad_s2", default_value="50.0"),
+        DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="50.0"),
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
         DeclareLaunchArgument("health_publish_period_ms", default_value="200"),
@@ -116,6 +118,14 @@ def generate_launch_description():
                         ),
                         "gripper_torque_limit_nm": ParameterValue(
                             LaunchConfiguration("gripper_torque_limit_nm"), value_type=float
+                        ),
+                        "opening_profile_acceleration_rad_s2": ParameterValue(
+                            LaunchConfiguration("opening_profile_acceleration_rad_s2"),
+                            value_type=float,
+                        ),
+                        "opening_profile_deceleration_rad_s2": ParameterValue(
+                            LaunchConfiguration("opening_profile_deceleration_rad_s2"),
+                            value_type=float,
                         ),
                         "soft_close_fast_torque_limit_nm": ParameterValue(
                             LaunchConfiguration("soft_close_fast_torque_limit_nm"),
