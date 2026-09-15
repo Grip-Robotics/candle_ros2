@@ -75,6 +75,12 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
+    node->declare_parameter<double>("close_target_lead_rad", 0.04);
+    node->declare_parameter<double>("close_contact_torque_nm", 0.35);
+    node->declare_parameter<double>("close_contact_velocity_rad_s", 0.03);
+    node->declare_parameter<double>("close_contact_duration_s", 0.15);
+    node->declare_parameter<double>("close_timeout_s", 5.0);
+    node->declare_parameter<double>("close_feedback_timeout_s", 0.25);
     node->declare_parameter<int>("joint_state_publish_period_ms", 50);
     node->declare_parameter<int>("health_publish_period_ms", 200);
     node->declare_parameter<int>("md_can_response_timeout_100us", 100);
@@ -101,18 +107,16 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
         node->get_parameter("gripper_velocity_limit_rad_s").as_double();
     params.gripper_torque_limit_nm =
         node->get_parameter("gripper_torque_limit_nm").as_double();
-    params.soft_close_fast_torque_limit_nm =
-        node->get_parameter("soft_close_fast_torque_limit_nm").as_double();
     params.soft_close_slow_torque_limit_nm =
         node->get_parameter("soft_close_slow_torque_limit_nm").as_double();
-    params.soft_close_profile_acceleration_rad_s2 =
-        node->get_parameter("soft_close_profile_acceleration_rad_s2").as_double();
-    params.soft_close_profile_deceleration_rad_s2 =
-        node->get_parameter("soft_close_profile_deceleration_rad_s2").as_double();
-    params.soft_close_closed_tol_rad =
-        node->get_parameter("soft_close_closed_tol_rad").as_double();
-    params.soft_close_fast_duration_ms =
-        node->get_parameter("soft_close_fast_duration_ms").as_int();
+    params.close.lead = node->get_parameter("close_target_lead_rad").as_double();
+    params.close.tolerance = node->get_parameter("soft_close_closed_tol_rad").as_double();
+    params.close.contactTorque = node->get_parameter("close_contact_torque_nm").as_double();
+    params.close.contactVelocity = node->get_parameter("close_contact_velocity_rad_s").as_double();
+    params.close.contactDuration = node->get_parameter("close_contact_duration_s").as_double();
+    params.close.timeout = node->get_parameter("close_timeout_s").as_double();
+    params.close.feedbackTimeout = node->get_parameter("close_feedback_timeout_s").as_double();
+    params.close.maxStep = node->get_parameter("joint_state_publish_period_ms").as_int() / 1000.0;
     params.joint_state_publish_period_ms =
         node->get_parameter("joint_state_publish_period_ms").as_int();
     params.health_publish_period_ms =

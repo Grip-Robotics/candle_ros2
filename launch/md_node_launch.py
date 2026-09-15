@@ -45,6 +45,12 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="100.0"),
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
+        DeclareLaunchArgument("close_target_lead_rad", default_value="0.04"),
+        DeclareLaunchArgument("close_contact_torque_nm", default_value="0.35"),
+        DeclareLaunchArgument("close_contact_velocity_rad_s", default_value="0.03"),
+        DeclareLaunchArgument("close_contact_duration_s", default_value="0.15"),
+        DeclareLaunchArgument("close_timeout_s", default_value="5.0"),
+        DeclareLaunchArgument("close_feedback_timeout_s", default_value="0.25"),
         DeclareLaunchArgument("joint_state_publish_period_ms", default_value="50"),
         DeclareLaunchArgument("health_publish_period_ms", default_value="200"),
         DeclareLaunchArgument("md_can_response_timeout_100us", default_value="100"),
@@ -120,6 +126,24 @@ def generate_launch_description():
                         ),
                         "soft_close_fast_duration_ms": ParameterValue(
                             LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int
+                        ),
+                        "close_target_lead_rad": ParameterValue(
+                            LaunchConfiguration("close_target_lead_rad"), value_type=float
+                        ),
+                        "close_contact_torque_nm": ParameterValue(
+                            LaunchConfiguration("close_contact_torque_nm"), value_type=float
+                        ),
+                        "close_contact_velocity_rad_s": ParameterValue(
+                            LaunchConfiguration("close_contact_velocity_rad_s"), value_type=float
+                        ),
+                        "close_contact_duration_s": ParameterValue(
+                            LaunchConfiguration("close_contact_duration_s"), value_type=float
+                        ),
+                        "close_timeout_s": ParameterValue(
+                            LaunchConfiguration("close_timeout_s"), value_type=float
+                        ),
+                        "close_feedback_timeout_s": ParameterValue(
+                            LaunchConfiguration("close_feedback_timeout_s"), value_type=float
                         ),
                         "joint_state_publish_period_ms": ParameterValue(
                             LaunchConfiguration("joint_state_publish_period_ms"), value_type=int

@@ -102,6 +102,10 @@ if(BUILD_TESTING)
   target_include_directories(position_tracker_test BEFORE PRIVATE
     CANdle-SDK/commons/googletest/googletest/include
     include)
+  ament_add_gtest(impedance_close_test test/impedance_close_test.cpp)
+  target_include_directories(impedance_close_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
 endif()
 
 ament_package()

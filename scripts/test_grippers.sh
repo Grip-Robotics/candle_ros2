@@ -2,9 +2,9 @@
 
 set -Eeuo pipefail
 
-readonly DEVICE_IDS=(342 343 345)
-readonly DEVICE_IDS_YAML="[342, 343, 345]"
-readonly SOFT_CLOSE_GAPS=(40 30 25)
+readonly DEVICE_IDS=(111 113 447)
+readonly DEVICE_IDS_YAML="[111, 113, 447]"
+readonly CLOSE_SPEEDS=(0.0 0.2 0.4)
 
 MOVE_WAIT_SECONDS="${MOVE_WAIT_SECONDS:-2}"
 SOFT_CLOSE_WAIT_SECONDS="${SOFT_CLOSE_WAIT_SECONDS:-7}"
@@ -17,11 +17,10 @@ usage()
     cat <<'EOF'
 Usage: test_grippers.sh [--zero] [--yes]
 
-Runs the calibrated service test for drives 342, 343, and 345:
+Runs the calibrated service test for drives 111, 113, and 447:
   1. Initialize all drives while preserving their encoder zeros.
-  2. Apply calibrated position and velocity PID gains.
-  3. Close/open each gripper individually.
-  4. Soft-close each gripper individually with transition gaps 40, 30, and 25 mm.
+  2. Close/open each gripper individually in impedance mode.
+  3. Repeat continuous closes with normalized speeds 0.0, 0.2, and 0.4.
 
 Options:
   --zero    Explicitly zero all drives at their current mechanical positions.
@@ -202,21 +201,6 @@ if [[ "$ZERO_DRIVES" == true && "$init_will_zero" != true ]]; then
         "{device_ids: ${DEVICE_IDS_YAML}}"
 fi
 
-printf '\nApplying calibrated runtime PID gains...\n'
-timeout "${SERVICE_TIMEOUT_SECONDS}s" ros2 topic pub --once \
-    /md/position_command candle_ros2/msg/PositionPidCmd \
-    "{device_ids: ${DEVICE_IDS_YAML},
-      position_pid: [
-        {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0},
-        {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0},
-        {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0}
-      ],
-      velocity_pid: [
-        {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0},
-        {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0},
-        {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0}
-      ]}"
-
 call_service /md/open_gripper candle_ros2/srv/Generic \
     "{device_ids: ${DEVICE_IDS_YAML}}"
 sleep "$MOVE_WAIT_SECONDS"
@@ -232,14 +216,12 @@ for id in "${DEVICE_IDS[@]}"; do
     sleep "$MOVE_WAIT_SECONDS"
 done
 
-printf '\n=== Soft-close transition-gap tests ===\n'
-for gap in "${SOFT_CLOSE_GAPS[@]}"; do
+printf '\n=== Continuous impedance close speed tests ===\n'
+for speed in "${CLOSE_SPEEDS[@]}"; do
     for id in "${DEVICE_IDS[@]}"; do
-        printf '\nTesting drive %d with a %d mm fast-to-slow transition gap.\n' "$id" "$gap"
+        printf '\nTesting drive %d with normalized close speed %s.\n' "$id" "$speed"
         call_service /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-            "{device_ids: [${id}], pre_close_enabled: true, pre_close_gap_mm: ${gap}.0,
-              pre_close_offset_mm: 0.0,
-              fast_speed: 1.0, slow_speed: 0.4}"
+            "{device_ids: [${id}], slow_speed: ${speed}}"
         sleep "$SOFT_CLOSE_WAIT_SECONDS"
         call_service /md/open_gripper candle_ros2/srv/Generic \
             "{device_ids: [${id}]}"
@@ -248,4 +230,4 @@ for gap in "${SOFT_CLOSE_GAPS[@]}"; do
 done
 
 trap - ERR INT TERM
-printf '\nAll gripper tests completed successfully; grippers are open.\n'
+printf '\nService sequence finished; check md/health and logs for close outcomes.\n'

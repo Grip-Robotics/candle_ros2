@@ -1,331 +1,193 @@
 # CANdle ROS2
 
-This repository provides ROS2 interfaces for controlling **MD electric drive controllers** and **PDS power distribution systems** using the [CANdle-SDK](https://github.com/mabrobotics/CANdle-SDK).
-It exposes both systems as ROS2 nodes with services and topics for operational control and telemetry.
+ROS 2 interfaces for MD motor controllers and PDS power distribution systems,
+using the bundled [CANdle-SDK](https://github.com/mabrobotics/CANdle-SDK).
+One process owns the bus; each added MD has independent command state.
 
-This package acts as a **runtime control interface**.
-For configuration, please use:
+## Continuous impedance closing
 
-➡️ [CANdleTool](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/CANdle-SDK/CANdleTool.html)
+Both `md/close_gripper` and `md/soft_close_gripper` now close in IMPEDANCE
+mode from the first movement. There is no pre-close stage, gap estimate,
+position-profile dependency, or timed fast-to-slow switch.
 
-## Features
+The driver starts with a target at the measured position. Each fresh feedback
+sample advances it toward the calibrated closed endpoint at the requested
+target ramp speed, bounded to `close_target_lead_rad` ahead of the measured
+finger. The MD runs its own impedance PD controller with zero velocity and
+torque feedforward and a torque cap throughout closing and holding.
 
-### MD Node
+For a large object touching the fingers immediately, the position target
+therefore cannot continue advancing through the remaining sweep. The lead
+bound applies before contact is detected. At rest, the spring contribution
+to motor torque is at most approximately `kp * lead`; the configured torque
+cap also applies. These are motor torques, not calibrated fingertip forces.
 
-- Control MD drive controllers
-- Publish joint state data (default `20 Hz`, set by
-  `joint_state_publish_period_ms`)
-- Publish per-drive health/error status on `md/health`
-- Accept position, velocity, motion, and impedance commands
-- Provide enable/disable/zero/mode setup services
+Contact is inferred when closing-direction torque exceeds the threshold,
+measured speed is low, and the applied target is ahead of the finger for
+the configured dwell. Then the target stops advancing. If an object pushes
+the finger backward, the target retreats as needed to maintain the lead
+bound. Losing contact does not restart closing. A new close request is
+required to advance again. Reaching the closed endpoint is reported
+separately from inferred contact.
 
-### Health monitoring
+This is an inferred contact detector: friction or a jam can resemble an
+object. The default gains and thresholds require commissioning on the actual
+mechanism. In particular, contact torque must be lower than both torque caps
+and `kp * lead`.
 
-The MD node periodically queries every added drive and publishes a
-`candle_ros2/msg/MdHealth` message on `md/health` (default `5 Hz`, set by the
-`health_publish_period_ms` parameter). All arrays share the `device_ids` order:
+### Timing and failures
 
-- `responsive[i]` — `false` when the drive did not answer the status query.
-- `error[i]` — `true` when the drive raises any error flag (or its status is
-  unreadable). Warnings alone do not set it.
-- `active_errors[i]` — human-readable list of raised flags, e.g.
-  `hardware: Error Motor Temperature; motion: Warning Torque`. Empty when
-  healthy.
+Control reuses each drive's batched position/velocity/torque feedback. The
+default timer is 50 ms. Delayed ticks advance the target by at most one
+nominal period; they do not catch up with a large setpoint jump. Gaps above
+`close_feedback_timeout_s`, invalid feedback, travel violations, and close
+timeouts abort the job and request drive disable.
 
-Brownout position continuity is also reported: while a drive is recovering,
-`active_errors` contains `position: recovering after communication loss` and
-`error` is `true`; if recovery was rejected it contains
-`position: reference lost, manual /md/zero calibration required` until the
-drive is re-zeroed.
+Contact and endpoint holds remain monitored until replaced or disabled.
+A setup failure never falls back to enabling a stale target. Configuration
+writes that could change gains or torque limits are rejected while closing
+or holding; cancel the operation first.
 
-A healthy drive costs one CAN status read per cycle; detailed subsystem status
-is fetched only when the drive flags a problem. The autonomy stack should
-treat `responsive == false` or `error == true` as a faulted gripper:
+Explicit disable cancels the job even if the hardware write fails. Bus
+recovery cannot restart motion. After a fault or disable, explicit
+`md/enable` or successful `md/init_devices` is required; enable establishes
+a hold at the measured position. Keep the MD hardware communication watchdog
+enabled: software cannot confirm a disable across a disconnected bus.
 
-```bash
-ros2 topic echo /md/health
-```
+Services return per-drive **command startup acknowledgments**, not final
+grasp results. Logs report `contact inferred` or `closed endpoint`.
+Abort reasons are latched in `md/health` until successful enable/init.
+Applications must not treat service acceptance as proof of a successful pick.
 
-## Running
-
-### MD Node
-```bash
-ros2 launch candle_ros2 md_node_launch.py
-```
-
-### PDS Node
-```bash
-ros2 launch candle_ros2 pds_node_launch.py
-```
-
-### Both Nodes
-```bash
-ros2 launch candle_ros2 both_launch.py
-```
-
-### Launch arguments
-
-- `bus` — desired communication bus with CANdle device, possible values: `USB` and `SPI` (default: `USB`).
-- `usb_serial` — complete USB serial of the CANdle adapter to open. An empty value selects the first available adapter for backwards compatibility (default: empty).
-- `data_rate` — data rate of CAN network, possible values: `1M`, `2M`, `5M` and `8M` (default: `1M`).
-- `default_qos` — ROS message quality of service for node's publishers, possible values: `Reliable` and `BestEffort` (default: `Reliable`).
-- `joint_state_publish_period_ms` — period of the batched per-drive position,
-  velocity, and torque reads (default: `50`, or `20 Hz`).
-- `md_can_response_timeout_100us` — CANdle firmware wait for an MD response in
-  units of 100 microseconds (default: `100`, or `10 ms`).
-- `md_host_timeout_ms` — independent host USB deadline applied to each SDK
-  transport wait (default: `20 ms`). It must exceed the CAN response timeout.
-
-Example launch command with custom arguments:
-```bash
-ros2 launch candle_ros2 md_node_launch.py usb_serial:=205D366D3036 data_rate:=5M
-```
-
-## Example MD service calls - GRIPPER CONTROL
-
-
-
-### Calibrated three-drive soft close
-
-The following commands are the calibrated sequence for drives `342`, `343`, and
-`345`. Encoder zeros are preserved during normal initialization. Zero a drive
-only as a deliberate calibration step while it is at its known mechanical open
-reference. Before starting this sequence, place every gripper at that mechanical
-open reference.
-
-In terminal 1, launch the node and keep it running:
-
-```bash
-ros2 launch candle_ros2 md_node_launch.py
-```
-
-In terminal 2, source the workspace and run the remaining commands in order:
-
-```bash
-source install/setup.bash
-```
-
-1. Add, configure, and enable all drives in impedance mode without changing
-  their encoder zeros:
-
-```bash
-ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
-  "{device_ids: [342, 343, 345], mode: 'IMPEDANCE'}"
-```
-
-1. With every gripper still at its known mechanical open reference, zero all
-  drives. This command also replaces the old motion target with logical `0`.
-  Runtime zero is not retained by the MD across a drive power reset:
-
-```bash
-ros2 service call /md/zero candle_ros2/srv/Generic \
-  "{device_ids: [342, 343, 345]}"
-```
-
-1. (OPTIONAL) Apply the calibrated runtime position and velocity PID gains:
-
-```bash
-ros2 topic pub --once /md/position_command candle_ros2/msg/PositionPidCmd \
-  "{device_ids: [342, 343, 345],
-    position_pid: [
-      {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0},
-      {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0},
-      {kp: 12.5, ki: 0.5, kd: 0.05, i_windup: 1.0, max_output: 10.0}
-    ],
-    velocity_pid: [
-      {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0},
-      {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0},
-      {kp: 1.5, ki: 0.02, kd: 0.0, i_windup: 1.0, max_output: 4.0}
-    ]}"
-```
-
-1. Open all grippers:
-
-```bash
-ros2 service call /md/open_gripper candle_ros2/srv/Generic \
-  "{device_ids: [342, 343, 345]}"
-```
-
-1. Run the calibrated two-stage close for one drive at a time. Adjust
-  `pre_close_gap_mm` when a different transition gap is required:
-
-```bash
-ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-  "{device_ids: [342], pre_close_enabled: true, pre_close_gap_mm: 30.0,
-    pre_close_offset_mm: 0.0,
-    fast_speed: 1.0, slow_speed: 0.4}"
-```
-
-Set `pre_close_enabled: false` for one direct profile to the closed position.
-In this mode `pre_close_gap_mm`, `pre_close_offset_mm`, and `slow_speed` do not
-affect motion:
-
-```bash
-ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
-  "{device_ids: [342], pre_close_enabled: false, pre_close_gap_mm: 0.0,
-    pre_close_offset_mm: 0.0,
-    fast_speed: 1.0, slow_speed: 0.0}"
-```
-
-1. Or close one drive all the way using impedance mode:
-
-```bash
-ros2 service call /md/close_gripper candle_ros2/srv/Generic \
-  "{device_ids: [342]}"
-```
-
-The PID command above changes runtime registers and may need to be repeated
-after a drive reset or power cycle. Keep `init_devices_zero:=false` during
-normal startup and fault recovery so re-initialization cannot redefine zero at
-an arbitrary mechanism position. Use `/md/zero` only as a deliberate calibration
-command while all requested mechanisms are physically at their intended open
-reference.
-
-### Brownout position continuity
-
-The MD main encoder retains one motor revolution after a drive reset, while its
-turn count and runtime zero are lost. For the 10:1 gripper drive this produces
-position jumps of approximately `2π / 10 = 0.62831853 rad`. While this ROS node
-remains running, it keeps a continuous logical position per drive and unwraps
-such jumps against the last trusted position.
-
-On a CAN outage the node publishes `NaN` joint-state values, rejects new motion
-commands, schedules communication retries no faster than `25 ms` (bounded by
-the joint-state timer cadence), and requires three healthy position/status
-samples. Recovery succeeds only when inferred unpowered motion is at most
-`0.25 rad`. The interrupted target is then resumed automatically; an
-interrupted soft-close resumes its final closed target with the slow impedance
-configuration.
-
-If recovery is ambiguous, the drive remains disabled. Place it manually at the
-mechanical open reference and call `/md/zero`. Continuity state is intentionally
-not stored on disk, so a simultaneous MD and ROS-node restart also requires this
-manual calibration.
-
-### Automated service test
-
-The installed test script runs the complete calibrated procedure for drives
-`342`, `343`, and `345`. Build and source the package, keep the calibrated node
-launch above running in another terminal, then execute:
+## Build and run
 
 ```bash
 colcon build --packages-select candle_ros2
 source install/setup.bash
-ros2 run candle_ros2 test_grippers.sh
+ros2 launch candle_ros2 md_node_launch.py
 ```
 
-By default, the script preserves existing encoder zeros and requires typing
-`RUN` before moving. After confirmation, it automatically:
+PDS-only and combined launches remain `pds_node_launch.py` and
+`both_launch.py`.
 
-1. Applies the calibrated position and velocity PID gains.
-2. Closes and opens each gripper individually.
-3. Soft-closes each gripper individually with `40`, `30`, and `25` mm
-  transition gaps, reopening after every test.
+The node accepts `bus:=USB|SPI`, `data_rate:=1M|2M|5M|8M`,
+`usb_serial:=SERIAL` (empty selects the first available adapter), and
+`default_qos:=Reliable|BestEffort`. The MD launch exposes the settings below.
 
-The soft-close values are the gaps where motion changes from fast to slow; they
-are not final commanded widths. The script intentionally avoids simultaneous
-closing because the combined current draw can cause an undervoltage fault.
+## Configuration
 
-Use `--zero` only for deliberate encoder calibration after placing every
-mechanism at its mechanical open reference:
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `gripper_open_position_rad` | 0.0 | Calibrated open endpoint |
+| `gripper_closed_position_rad` | 0.63 | Calibrated closed endpoint; reverse direction is supported |
+| `gripper_impedance_kp` / `gripper_impedance_kd` | 12.5 / 0.05 | MD impedance spring and damping gains |
+| `gripper_velocity_limit_rad_s` | 3.5 | Close target ramp speed/cap; not a measured speed guarantee |
+| `gripper_torque_limit_nm` | 4.0 | Normal motor torque cap |
+| `soft_close_slow_torque_limit_nm` | 4.0 | Close/hold torque cap, bounded by the normal cap |
+| `close_target_lead_rad` | 0.04 | Maximum closing target lead at each control sample |
+| `soft_close_closed_tol_rad` | 0.005 | Closed endpoint tolerance |
+| `close_contact_torque_nm` | 0.35 | Minimum measured closing torque for inferred contact |
+| `close_contact_velocity_rad_s` | 0.03 | Maximum absolute speed for contact/endpoint detection |
+| `close_contact_duration_s` | 0.15 | Consecutive contact evidence required |
+| `close_timeout_s` | 5.0 | Time allowed to reach contact or the endpoint |
+| `close_feedback_timeout_s` | 0.25 | Maximum interval between valid control samples |
+| `joint_state_publish_period_ms` | 50 | Batched feedback and close control period |
+| `health_publish_period_ms` | 200 | Diagnostic status period |
+| `md_can_response_timeout_100us` | 100 | CAN response window in 100 microsecond units |
+| `md_host_timeout_ms` | 20 | Host USB wait deadline; must exceed the CAN window |
+| `init_devices_zero` | false | Preserve existing zeros during initialization |
+
+Legacy request fields `pre_close_enabled`, `pre_close_gap_mm`,
+`pre_close_offset_mm`, and `fast_speed` are retained for wire compatibility
+but ignored. `slow_speed` always selects the continuous target ramp:
+`0.4 + 5.6 * slow_speed` rad/s, capped by `gripper_velocity_limit_rad_s`.
+Values must be finite and in [0, 1]. Zero still means 0.4 rad/s.
+
+Legacy launch parameters `soft_close_fast_torque_limit_nm`,
+`soft_close_profile_acceleration_rad_s2`,
+`soft_close_profile_deceleration_rad_s2`, and
+`soft_close_fast_duration_ms` are accepted but unused.
+
+## Three-drive example
+
+For motors 111, 113, and 447, initialize without changing their zeros:
 
 ```bash
-ros2 run candle_ros2 test_grippers.sh --zero
+ros2 service call /md/init_devices candle_ros2/srv/InitDevices \
+  "{device_ids: [111, 113, 447], mode: 'IMPEDANCE'}"
 ```
 
-Use `--yes` only when it is safe to skip the interactive motion confirmation:
+Calibration is deliberate: only at each finger's known mechanical open
+reference, call:
 
 ```bash
-ros2 run candle_ros2 test_grippers.sh --yes
+ros2 service call /md/zero candle_ros2/srv/Generic \
+  "{device_ids: [111, 113, 447]}"
 ```
 
-Motion delays and service timeout can be overridden when slower hardware needs
-more time:
+Close one finger continuously at a 0.4 rad/s target ramp:
 
 ```bash
-MOVE_WAIT_SECONDS=3 \
-SOFT_CLOSE_WAIT_SECONDS=9 \
-SERVICE_TIMEOUT_SECONDS=20 \
-ros2 run candle_ros2 test_grippers.sh
+ros2 service call /md/soft_close_gripper candle_ros2/srv/SoftCloseGripper \
+  "{device_ids: [111], slow_speed: 0.0}"
 ```
 
-If a service reports failure, times out, or the script is interrupted, the
-script requests `/md/disable` for all three drives.
-
-### Additional gripper commands
-
-Set impedance gains explicitly when needed; normal open/close writes the
-node-wide impedance settings again:
+Open or disable:
 
 ```bash
-ros2 topic pub /md/impedance_command candle_ros2/msg/ImpedanceCmd \
-  "{device_ids: [343], kp: [12.5], kd: [0.05], max_output: [4.0]}" --once
-
-# Three independently calibrated motors in one acknowledged batch request
-ros2 service call /md/configure_gripper candle_ros2/srv/ConfigureGripper \
-  "{device_ids: [342, 343, 345], kp: [12.5, 12.5, 12.5], kd: [0.05, 0.05, 0.05],
-    velocity_limit_rad_s: [3.5, 3.5, 3.5],
-    torque_limit_nm: [4.0, 4.0, 4.0]}"
-ros2 service call /md/set_gripper_targets candle_ros2/srv/SetGripperTargets \
-  "{device_ids: [342, 343, 345], target_position_rad: [0.62, 0.62, 0.62]}"
+ros2 service call /md/open_gripper candle_ros2/srv/Generic "{device_ids: [111]}"
+ros2 service call /md/disable candle_ros2/srv/Generic "{device_ids: [111, 113, 447]}"
 ```
 
-The legacy open/close services use the node-wide gripper parameters. A
-multi-motor gripper with independently calibrated targets should use
-`/md/set_gripper_targets`, which accepts one target and limit set per drive.
+Opening retains the existing impedance move to the configured open target.
+After disable, explicitly enable before sending another movement:
 
-Individual steps are also available as `/md/add_mds`, `/md/set_mode`, `/md/zero`, and `/md/enable`.
+```bash
+ros2 service call /md/enable candle_ros2/srv/Generic "{device_ids: [111]}"
+```
 
-Relevant MD-node parameters are:
+The generic `md/close_gripper` uses the same bounded controller with the
+node's `gripper_velocity_limit_rad_s` target ramp.
 
-- `joint_name_prefix` (`md_`)
-- `gripper_open_position_rad` (`0.0`)
-- `gripper_closed_position_rad` (`0.63` from the launch file)
-- `gripper_impedance_kp` / `gripper_impedance_kd` (`12.5` / `0.05`)
-- `gripper_velocity_limit_rad_s` (`3.5`)
-- `gripper_torque_limit_nm` (`4.0`)
-- `soft_close_fast_torque_limit_nm` / `soft_close_slow_torque_limit_nm` (`4.0` / `4.0`)
-- `soft_close_profile_acceleration_rad_s2` / `soft_close_profile_deceleration_rad_s2` (`100.0` / `100.0`)
-- `soft_close_closed_tol_rad` (`0.005`)
-- `soft_close_fast_duration_ms` (`300`) — slow stage starts this long after the request
-- `joint_state_publish_period_ms` (`50`) — `20 Hz` joint feedback and drive keepalive
-- `health_publish_period_ms` (`200`) — period of the `md/health` status topic
-- `md_can_response_timeout_100us` (`100`) — `10 ms` CANdle firmware response window
-- `md_host_timeout_ms` (`20`) — independent host USB transport deadline
-- `encoder_wrap_period_rad` (`0.62831853`)
-- `position_recovery_max_delta_rad` (`0.25`, must be less than half the wrap period)
-- `position_recovery_samples` (`3`)
-- `position_recovery_retry_ms` (`25`)
-- `init_devices_zero` (`false`)
+## Telemetry and position reference
 
-Soft-close adds the signed `pre_close_offset_mm` to `pre_close_gap_mm`, then
-converts the resulting effective gap to motor position using piecewise-linear
-interpolation between measured calibration points: `0 mm → 0.63 rad`,
-`15 mm → 0.44 rad`, `30 mm → 0.366 rad`, `50 mm → 0.228 rad`, and
-`90 mm → 0.05 rad`. Requested gaps outside `0`–`90 mm` are clamped to the
-nearest endpoint.
+`md/joint_states` publishes position, velocity and torque. Invalid or
+recovering measurements are NaN. `md/health` publishes ordered arrays of
+drive IDs, responsiveness, errors and detailed diagnostic strings.
 
-The slow-stage monitoring timeout is `1000 ms`. Reaching the timeout ends the
-software job, but leaves impedance control active and holding its target.
+Normal powered encoder readings already include accumulated turns. The driver
+preserves their calibration offset, including across delayed samples.
+The existing position recovery heuristic uses `encoder_wrap_period_rad`
+(default 0.62831853), `position_recovery_max_delta_rad` (0.25),
+`position_recovery_samples` (3), and `position_recovery_retry_ms` (25).
 
-Soft-close speed fields are normalized request values in `[0, 1]`. They map
-linearly to physical velocity using `velocity = 0.4 + speed * 5.6` rad/s, so
-`0.0` means `0.4 rad/s` and `1.0` means `6.0 rad/s`. Requests outside this
-range are rejected.
+Recovery is only a nearest-angle estimate and cannot disambiguate large
+unobserved movement or restore a lost reference after a node/drive restart.
+It does not authorize movement or replay commands. If the reference is
+uncertain, calibrate at the mechanical open stop before enabling.
 
-The fast soft-close stage uses the position and velocity PID gains stored in
-the drive. The service rejects the request when either position Kp or velocity
-Kp is not configured. The slow stage uses impedance control with
-`gripper_impedance_kp`, `gripper_impedance_kd`, the requested slow speed as its
-velocity limit, and `soft_close_slow_torque_limit_nm`. Soft close does not
-write the drive's global position or velocity limit registers
-(`positionLimitMin/Max`, `maxVelocity`); motion bounds come from the commanded
-target and the profile registers, and no target overtravel is used.
+## Tests
 
-## Documentation
+Hardware-free control and position regression tests:
 
-Full CANdle ROS2 documentation:
-➡️ [CANdle ROS2 nodes documentation](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/CANdle_ROS2/intro.html)
+```bash
+colcon build --packages-select candle_ros2 --cmake-args -DBUILD_TESTING=ON
+colcon test --packages-select candle_ros2 --return-code-on-test-failure
+colcon test-result --verbose
+```
 
-MAB controllers manuals:
-➡️ [MAB documentation](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/intro.html)
+They cover immediate contact with a large object, lead bounds while holding,
+free travel, signed contact debounce, reverse closing, delayed/stale feedback,
+timeouts, invalid measurements and sparse powered encoder movement.
+
+`ros2 run candle_ros2 test_grippers.sh` is a separate **hardware motion**
+sequence for 111, 113, and 447. It requires confirmation, preserves zeros by
+default, and exercises motors individually. Use `--zero` only at a verified
+open reference. Its service acknowledgments alone do not verify a grasp;
+inspect feedback and outcomes during commissioning.
+
+## MAB documentation
+
+- [Motion modes](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/MD/motion.html)
+- [Safety and watchdog](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/MD/safety.html)
+- [CANdleTool](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/CANdle-SDK/CANdleTool.html)

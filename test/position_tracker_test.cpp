@@ -69,3 +69,12 @@ TEST(PositionTrackerTest, RejectsAmbiguousRecoveryMotion)
     EXPECT_EQ(tracker.observeRecovery(0.30), PositionTracker::RecoveryResult::Rejected);
     EXPECT_EQ(tracker.state(), PositionTracker::State::Faulted);
 }
+
+TEST(PositionTrackerTest, SparsePoweredMotionDoesNotChangeCalibrationOffset)
+{
+    PositionTracker tracker(PERIOD, 0.25, 3);
+    tracker.initialize(0.0);
+    ASSERT_TRUE(tracker.observe(0.36).has_value());
+    EXPECT_NEAR(tracker.continuousPosition(), 0.36, 1e-9);
+    EXPECT_NEAR(tracker.logicalToRaw(0.615), 0.615, 1e-9);
+}
