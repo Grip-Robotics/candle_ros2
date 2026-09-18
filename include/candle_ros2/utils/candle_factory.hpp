@@ -64,22 +64,33 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<std::string>("default_qos", "Reliable");
     node->declare_parameter<std::string>("joint_name_prefix", "md_");
     node->declare_parameter<double>("gripper_open_position_rad", 0.0);
-    node->declare_parameter<double>("gripper_closed_position_rad", 0.62);
+    node->declare_parameter<double>("gripper_closed_position_rad", 0.75);
     node->declare_parameter<double>("gripper_impedance_kp", 12.5);
     node->declare_parameter<double>("gripper_impedance_kd", 0.05);
-    node->declare_parameter<double>("gripper_velocity_limit_rad_s", 3.5);
-    node->declare_parameter<double>("gripper_torque_limit_nm", 4.0);
+    node->declare_parameter<double>("gripper_impedance_ki", 2.0);
+    node->declare_parameter<double>("gripper_hold_torque_nm", 2.0);
+    node->declare_parameter<double>("gripper_closed_hold_torque_nm", 0.25);
+    node->declare_parameter<double>("gripper_hold_torque_ramp_nm_s", 2.0);
+    node->declare_parameter<double>("close_object_margin_rad", 0.01);
+    node->declare_parameter<double>("gripper_velocity_limit_rad_s", 1.5);
+    node->declare_parameter<double>("gripper_open_velocity_limit_rad_s", 10.0);
+    node->declare_parameter<double>("gripper_torque_limit_nm", 2.0);
     node->declare_parameter<double>("soft_close_fast_torque_limit_nm", 4.0);
-    node->declare_parameter<double>("soft_close_slow_torque_limit_nm", 4.0);
+    node->declare_parameter<double>("soft_close_slow_torque_limit_nm", 2.0);
     node->declare_parameter<double>("soft_close_profile_acceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
+    node->declare_parameter<double>("gripper_travel_min_rad", -0.05);
+    node->declare_parameter<double>("gripper_travel_max_rad", 0.75);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
     node->declare_parameter<double>("close_target_lead_rad", 0.04);
+    node->declare_parameter<double>("open_target_lead_rad",
+                                    node->get_parameter("close_target_lead_rad").as_double());
     node->declare_parameter<double>("close_contact_torque_nm", 0.35);
     node->declare_parameter<double>("close_contact_velocity_rad_s", 0.03);
     node->declare_parameter<double>("close_contact_duration_s", 0.15);
-    node->declare_parameter<double>("close_timeout_s", 5.0);
+    node->declare_parameter<double>("close_timeout_s", 2.0);
+    node->declare_parameter<double>("open_timeout_s", 0.5);
     node->declare_parameter<double>("close_feedback_timeout_s", 0.25);
     node->declare_parameter<int>("joint_state_publish_period_ms", 50);
     node->declare_parameter<int>("health_publish_period_ms", 200);
@@ -90,6 +101,13 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<int>("position_recovery_samples", 3);
     node->declare_parameter<int>("position_recovery_retry_ms", 25);
     node->declare_parameter<bool>("init_devices_zero", false);
+    node->declare_parameter<bool>("homing_required", false);
+    node->declare_parameter<double>("homing_torque_nm", 1.0);
+    node->declare_parameter<double>("homing_damping_nm_s_rad", 0.5);
+    node->declare_parameter<double>("homing_torque_limit_nm", 2.0);
+    node->declare_parameter<double>("homing_max_travel_rad", 0.85);
+    node->declare_parameter<double>("homing_contact_duration_s", 0.25);
+    node->declare_parameter<double>("homing_timeout_s", 2.0);
 
     candleParams_S params;
     params.data_rate   = node->get_parameter("data_rate").as_string();
@@ -105,16 +123,27 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.gripper_impedance_kd = node->get_parameter("gripper_impedance_kd").as_double();
     params.gripper_velocity_limit_rad_s =
         node->get_parameter("gripper_velocity_limit_rad_s").as_double();
+    params.gripper_open_velocity_limit_rad_s =
+        node->get_parameter("gripper_open_velocity_limit_rad_s").as_double();
     params.gripper_torque_limit_nm =
         node->get_parameter("gripper_torque_limit_nm").as_double();
     params.soft_close_slow_torque_limit_nm =
         node->get_parameter("soft_close_slow_torque_limit_nm").as_double();
     params.close.lead = node->get_parameter("close_target_lead_rad").as_double();
+    params.close.openLead = node->get_parameter("open_target_lead_rad").as_double();
+    params.close.ki = node->get_parameter("gripper_impedance_ki").as_double();
+    params.close.holdTorque = node->get_parameter("gripper_hold_torque_nm").as_double();
+    params.close.closedHoldTorque = node->get_parameter("gripper_closed_hold_torque_nm").as_double();
+    params.close.holdTorqueRate = node->get_parameter("gripper_hold_torque_ramp_nm_s").as_double();
+    params.close.objectMargin = node->get_parameter("close_object_margin_rad").as_double();
     params.close.tolerance = node->get_parameter("soft_close_closed_tol_rad").as_double();
+    params.close.travelMin = node->get_parameter("gripper_travel_min_rad").as_double();
+    params.close.travelMax = node->get_parameter("gripper_travel_max_rad").as_double();
     params.close.contactTorque = node->get_parameter("close_contact_torque_nm").as_double();
     params.close.contactVelocity = node->get_parameter("close_contact_velocity_rad_s").as_double();
     params.close.contactDuration = node->get_parameter("close_contact_duration_s").as_double();
     params.close.timeout = node->get_parameter("close_timeout_s").as_double();
+    params.close.openTimeout = node->get_parameter("open_timeout_s").as_double();
     params.close.feedbackTimeout = node->get_parameter("close_feedback_timeout_s").as_double();
     params.close.maxStep = node->get_parameter("joint_state_publish_period_ms").as_int() / 1000.0;
     params.joint_state_publish_period_ms =
@@ -134,6 +163,13 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.position_recovery_retry_ms =
         node->get_parameter("position_recovery_retry_ms").as_int();
     params.init_devices_zero = node->get_parameter("init_devices_zero").as_bool();
+    params.homing_required = node->get_parameter("homing_required").as_bool();
+    params.home.seekTorque = node->get_parameter("homing_torque_nm").as_double();
+    params.home.damping = node->get_parameter("homing_damping_nm_s_rad").as_double();
+    params.home.torque = node->get_parameter("homing_torque_limit_nm").as_double();
+    params.home.maxTravel = node->get_parameter("homing_max_travel_rad").as_double();
+    params.home.contactDuration = node->get_parameter("homing_contact_duration_s").as_double();
+    params.home.timeout = node->get_parameter("homing_timeout_s").as_double();
     return params;
 }
 

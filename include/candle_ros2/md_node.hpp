@@ -29,6 +29,7 @@
 #include "candle_ros2/utils/candle_params.hpp"
 #include "candle_ros2/position_tracker.hpp"
 #include "candle_ros2/impedance_close.hpp"
+#include "candle_ros2/drive_state.hpp"
 
 /* CANdle-SDK */
 #include "candle.hpp"
@@ -48,12 +49,38 @@ class MdNode : public rclcpp::Node
     {
         ImpedanceClose control;
         std::chrono::steady_clock::time_point lastUpdate;
+        bool opening;
     };
 
     struct RecoveryContext
     {
         std::chrono::steady_clock::time_point nextAttempt;
         bool                                  errorsCleared = false;
+    };
+
+    struct HomingJob
+    {
+        u16 id;
+        ImpedanceHome control;
+        std::chrono::steady_clock::time_point lastUpdate;
+        std::shared_ptr<rmw_request_id_t> header; // Null for automatic power recovery.
+    };
+    std::optional<HomingJob> m_homingJob; // One mechanical-stop search at a time.
+    std::unordered_set<u16> m_homingRequired;
+    std::unordered_set<u16> m_autoHomePending;
+
+    struct DisableRequest
+    {
+        std::shared_ptr<rmw_request_id_t> header;
+        std::vector<u16> ids;
+    };
+
+    struct PendingDisable : candle_ros2::DisableTransition
+    {
+        using candle_ros2::DisableTransition::DisableTransition;
+        explicit PendingDisable(candle_ros2::DisableTransition stop)
+            : candle_ros2::DisableTransition(std::move(stop)) {}
+        bool reported = false;
     };
 
     std::shared_ptr<mab::Candle> m_candle;
@@ -69,6 +96,8 @@ class MdNode : public rclcpp::Node
     std::unordered_set<u16> m_motionInhibited;
     std::unordered_map<u16, std::string> m_commandErrors;
     std::unordered_map<u16, RecoveryContext> m_recoveryContexts;
+    std::unordered_map<u16, PendingDisable> m_pendingDisables;
+    std::vector<DisableRequest> m_disableRequests;
 
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
@@ -76,9 +105,12 @@ class MdNode : public rclcpp::Node
     float       gripperImpedanceKp;
     float       gripperImpedanceKd;
     float       gripperVelocityLimitRadS;
+    float       gripperOpenVelocityLimitRadS;
     float       gripperTorqueLimitNm;
     float       softCloseSlowTorqueLimitNm;
     ImpedanceClose::Config closeConfig;
+    ImpedanceHome::Config homeConfig;
+    bool homingRequired;
     int         jointStatePublishPeriodMs;
     int         healthPublishPeriodMs;
     int         mdCanResponseTimeout100us;
@@ -100,6 +132,7 @@ class MdNode : public rclcpp::Node
     rclcpp::Service<candle_ros2::srv::AddDevices>::SharedPtr        srvAddMd;
     rclcpp::Service<candle_ros2::srv::InitDevices>::SharedPtr       srvInitDevices;
     rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvZero;
+    rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvHome;
     rclcpp::Service<candle_ros2::srv::SetMode>::SharedPtr           srvSetMode;
     rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvEnable;
     rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr           srvDisable;
@@ -116,9 +149,18 @@ class MdNode : public rclcpp::Node
     void publishJointStates();
     void publishHealth();
     void tickSoftClose(mab::MD& md, double position, double velocity, double torque);
-    bool startImpedanceClose(mab::MD& md, double speed);
+    bool startImpedanceMotion(mab::MD& md, double speed, bool opening = false);
     void stopDrive(mab::MD& md, const std::string& reason);
+    bool prepareDriveDisabled(mab::MD& md);
+    void tickDisableJobs();
     void tickRecoveryJobs();
+    bool isHoming(u16 id) const;
+    bool startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header = nullptr);
+    void tickHoming(mab::MD& md, double position, double velocity, double torque);
+    void finishHoming(bool success);
+    void completeHomingZero(mab::MD& md);
+    void cbHome(std::shared_ptr<rmw_request_id_t> header,
+                std::shared_ptr<candle_ros2::srv::Generic::Request> req);
 
     void cbMotionCmd(const candle_ros2::msg::MotionCmd& msg);
     void cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg);
@@ -135,8 +177,8 @@ class MdNode : public rclcpp::Node
                    std::shared_ptr<candle_ros2::srv::SetMode::Response>      rsp);
     void cbEnable(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
                   std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp);
-    void cbDisable(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
-                   std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp);
+    void cbDisable(std::shared_ptr<rmw_request_id_t> header,
+                   std::shared_ptr<candle_ros2::srv::Generic::Request> req);
     void cbSetLimits(const std::shared_ptr<candle_ros2::srv::SetLimits::Request> req,
                      std::shared_ptr<candle_ros2::srv::SetLimits::Response>      rsp);
     void cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
@@ -155,6 +197,7 @@ class MdNode : public rclcpp::Node
     bool configureGripper(
         mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
+    bool setGripperCommand(mab::MD& md, const ImpedanceClose::Command& command);
     bool writeRawTarget(mab::MD& md, double rawTargetPos);
     bool moveGripper(mab::MD& md, double targetPos);
     bool resetDriveErrorsIfNeeded(mab::MD& md);

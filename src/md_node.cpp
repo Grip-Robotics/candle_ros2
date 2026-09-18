@@ -1,4 +1,5 @@
 #include "candle_ros2/md_node.hpp"
+#include "candle_ros2/drive_state.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -18,9 +19,12 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
       gripperImpedanceKp(static_cast<float>(params.gripper_impedance_kp)),
       gripperImpedanceKd(static_cast<float>(params.gripper_impedance_kd)),
       gripperVelocityLimitRadS(static_cast<float>(params.gripper_velocity_limit_rad_s)),
+      gripperOpenVelocityLimitRadS(static_cast<float>(params.gripper_open_velocity_limit_rad_s)),
       gripperTorqueLimitNm(static_cast<float>(params.gripper_torque_limit_nm)),
       softCloseSlowTorqueLimitNm(static_cast<float>(params.soft_close_slow_torque_limit_nm)),
       closeConfig(params.close),
+      homeConfig(params.home),
+      homingRequired(params.homing_required),
       jointStatePublishPeriodMs(params.joint_state_publish_period_ms),
       healthPublishPeriodMs(params.health_publish_period_ms),
       mdCanResponseTimeout100us(params.md_can_response_timeout_100us),
@@ -34,9 +38,11 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     if (jointNamePrefix.empty())
         throw std::invalid_argument("joint_name_prefix must not be empty");
     if (!std::isfinite(gripperOpenPositionRad) || !std::isfinite(gripperClosedPositionRad) ||
+        gripperOpenPositionRad == gripperClosedPositionRad ||
         !std::isfinite(gripperImpedanceKp) || gripperImpedanceKp < 0.0f ||
         !std::isfinite(gripperImpedanceKd) || gripperImpedanceKd < 0.0f ||
         !std::isfinite(gripperVelocityLimitRadS) || gripperVelocityLimitRadS <= 0.0f ||
+        !std::isfinite(gripperOpenVelocityLimitRadS) || gripperOpenVelocityLimitRadS <= 0.0f ||
         !std::isfinite(gripperTorqueLimitNm) || gripperTorqueLimitNm <= 0.0f ||
         !std::isfinite(softCloseSlowTorqueLimitNm) || softCloseSlowTorqueLimitNm <= 0.0f ||
         jointStatePublishPeriodMs <= 0 ||
@@ -52,13 +58,22 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
             "invalid gripper, telemetry, communication-timeout, or health parameter");
 
     // Validate the same settings used by every per-drive close controller.
+    closeConfig.kp = gripperImpedanceKp;
+    closeConfig.kd = gripperImpedanceKd;
+    closeConfig.torqueLimit = std::min(gripperTorqueLimitNm, softCloseSlowTorqueLimitNm);
     ImpedanceClose(gripperOpenPositionRad, gripperClosedPositionRad,
                    gripperVelocityLimitRadS, closeConfig);
+    ImpedanceHome(0.0, -1.0, homeConfig, closeConfig);
+    if (homingRequired && (initDevicesZero || gripperOpenPositionRad != 0.0))
+        throw std::invalid_argument("homing requires open target zero and init_devices_zero=false");
+    if (!closeConfig.withinTravel(gripperOpenPositionRad) ||
+        !closeConfig.withinTravel(gripperClosedPositionRad))
+        throw std::invalid_argument("gripper targets must be within the absolute travel limits");
     if (gripperImpedanceKp <= 0.0f ||
         closeConfig.contactTorque >= std::min<double>(
             {gripperTorqueLimitNm, softCloseSlowTorqueLimitNm,
-             gripperImpedanceKp * closeConfig.lead}))
-        throw std::invalid_argument("close contact torque must be below the available bounded torque");
+             gripperImpedanceKp * std::min(closeConfig.lead, closeConfig.openLead)}))
+        throw std::invalid_argument("contact torque must be below the available bounded torque in both directions");
 
     rclcpp::QoS defaultQoS(10);
     defaultQoS.reliable();
@@ -97,6 +112,9 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     srvZero = this->create_service<candle_ros2::srv::Generic>(
         std::string(NODE_PREFIX) + "zero",
         std::bind(&MdNode::cbZero, this, std::placeholders::_1, std::placeholders::_2));
+    srvHome = this->create_service<candle_ros2::srv::Generic>(
+        std::string(NODE_PREFIX) + "home",
+        std::bind(&MdNode::cbHome, this, std::placeholders::_1, std::placeholders::_2));
     srvSetMode = this->create_service<candle_ros2::srv::SetMode>(
         std::string(NODE_PREFIX) + "set_mode",
         std::bind(&MdNode::cbSetMode, this, std::placeholders::_1, std::placeholders::_2));
@@ -141,12 +159,67 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
 
 MdNode::~MdNode()
 {
+    // The bus is still owned here. A normal exit must not leave a latched hold.
+    // A disconnected bus/process crash still requires the MD hardware watchdog.
+    m_softCloseJobs.clear();
+    m_homingJob.reset();
+    m_pendingDisables.clear();
+    // Request every stop before waiting for any one motor to finish braking.
+    for (auto& md : m_mds)
+    {
+        try
+        {
+            m_pendingDisables.try_emplace(md.m_canId, md);
+        }
+        catch (const std::exception& error)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Drive %d shutdown disable failed: %s",
+                         md.m_canId, error.what());
+        }
+    }
+    while (!m_pendingDisables.empty())
+    {
+        for (auto it = m_pendingDisables.begin(); it != m_pendingDisables.end();)
+        {
+            const auto id = it->first;
+            auto md = findMd(m_mds, id);
+            auto status = candle_ros2::DisableTransition::Status::Failed;
+            try { status = it->second.poll(*md); }
+            catch (const std::exception& error)
+            {
+                RCLCPP_ERROR(this->get_logger(), "Drive %d shutdown read failed: %s", id, error.what());
+            }
+            if (status == candle_ros2::DisableTransition::Status::Pending)
+            {
+                ++it;
+                continue;
+            }
+            if (status == candle_ros2::DisableTransition::Status::Disabled)
+                RCLCPP_INFO(this->get_logger(), "Drive %d disabled on shutdown", id);
+            else
+                RCLCPP_ERROR(this->get_logger(), "Drive %d shutdown disable unconfirmed", id);
+            it = m_pendingDisables.erase(it);
+        }
+        if (!m_pendingDisables.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     RCLCPP_INFO(this->get_logger(), "Candle ROS2 MD node finished.");
 }
 
 void MdNode::publishJointStates()
 {
+    tickDisableJobs();
     tickRecoveryJobs();
+    if (!m_homingJob)
+        for (auto& md : m_mds)
+            if (m_autoHomePending.contains(md.m_canId) &&
+                !m_recoveryContexts.contains(md.m_canId) &&
+                !m_pendingDisables.contains(md.m_canId))
+            {
+                m_autoHomePending.erase(md.m_canId); // One attempt; failed homing never retries itself.
+                startHoming(md);
+                break;
+            }
 
     sensor_msgs::msg::JointState msgJointStates;
 
@@ -180,7 +253,9 @@ void MdNode::publishJointStates()
         // error, which downstream consumers cannot tell from a real reading).
         if (md.readRegisters(md.m_mdRegisters.mainEncoderPosition,
                              md.m_mdRegisters.mainEncoderVelocity,
-                             md.m_mdRegisters.motorTorque) != mab::MD::Error_t::OK)
+                             md.m_mdRegisters.motorTorque,
+                             md.m_mdRegisters.state,
+                             md.m_mdRegisters.motionModeStatus) != mab::MD::Error_t::OK)
         {
             beginRecovery(md.m_canId);
             msgJointStates.position.push_back(nan);
@@ -211,9 +286,14 @@ void MdNode::publishJointStates()
             continue;
         }
 
-        tickSoftClose(md, *logicalPosition, md.m_mdRegisters.mainEncoderVelocity.value,
-                      md.m_mdRegisters.motorTorque.value);
-        msgJointStates.position.push_back(*logicalPosition);
+        if (isHoming(md.m_canId))
+            tickHoming(md, *logicalPosition, md.m_mdRegisters.mainEncoderVelocity.value,
+                       md.m_mdRegisters.motorTorque.value);
+        else
+            tickSoftClose(md, *logicalPosition, md.m_mdRegisters.mainEncoderVelocity.value,
+                          md.m_mdRegisters.motorTorque.value);
+        // Homing can change the reference on this tick; don't publish the old frame.
+        msgJointStates.position.push_back(tracker->second.continuousPosition());
         msgJointStates.velocity.push_back(md.m_mdRegisters.mainEncoderVelocity.value);
         msgJointStates.effort.push_back(md.m_mdRegisters.motorTorque.value);
     }
@@ -253,10 +333,17 @@ void MdNode::publishHealth()
     msg.responsive.reserve(m_mds.size());
     msg.error.reserve(m_mds.size());
     msg.active_errors.reserve(m_mds.size());
+    msg.motor_temperature_c.reserve(m_mds.size());
+    msg.mosfet_temperature_c.reserve(m_mds.size());
+    msg.motor_shutdown_temperature_c.reserve(m_mds.size());
 
     for (auto& md : m_mds)
     {
         msg.device_ids.push_back(md.m_canId);
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        msg.motor_temperature_c.push_back(nan);
+        msg.mosfet_temperature_c.push_back(nan);
+        msg.motor_shutdown_temperature_c.push_back(nan);
 
         const auto trackerIt = m_positionTrackers.find(md.m_canId);
         const bool positionLost =
@@ -271,7 +358,7 @@ void MdNode::publishHealth()
         const auto [quickStatus, statusErr] = md.getQuickStatus();
         if (statusErr != mab::MD::Error_t::OK)
         {
-            if (m_softCloseJobs.contains(md.m_canId))
+            if (m_softCloseJobs.contains(md.m_canId) || isHoming(md.m_canId))
                 beginRecovery(md.m_canId);
             msg.responsive.push_back(false);
             msg.error.push_back(true);
@@ -312,9 +399,35 @@ void MdNode::publishHealth()
             description += commandError->second;
             anyError = true;
         }
+        if (m_pendingDisables.contains(md.m_canId))
+        {
+            if (!description.empty())
+                description += "; ";
+            description += "hardware disable pending";
+            anyError = true;
+        }
 
-        // Detailed subsystem status is fetched only for categories flagged in the
-        // quick status, so a healthy drive costs a single CAN read per cycle.
+        // One read-only batch provides thermal telemetry; never change limits
+        // or clear faults as part of a health query.
+        mab::MDRegisters_S temperatures;
+        if (md.readRegisters(temperatures.motorTemperature, temperatures.mosfetTemperature,
+                             temperatures.motorShutdownTemp) == mab::MD::Error_t::OK &&
+            std::isfinite(temperatures.motorTemperature.value) &&
+            std::isfinite(temperatures.mosfetTemperature.value))
+        {
+            msg.motor_temperature_c.back() = temperatures.motorTemperature.value;
+            msg.mosfet_temperature_c.back() = temperatures.mosfetTemperature.value;
+            msg.motor_shutdown_temperature_c.back() = temperatures.motorShutdownTemp.value;
+        }
+        else
+        {
+            if (!description.empty())
+                description += "; ";
+            description += "temperature: invalid or unavailable";
+            anyError = true;
+        }
+
+        // Detailed subsystem status is fetched only for flagged categories.
         const auto collect = [&](Bits bit, const char* category, auto&& readDetailedStatus)
         {
             if (!quickStatus.at(bit).isSet())
@@ -351,8 +464,8 @@ void MdNode::publishHealth()
 
         if (anyError)
         {
-            if (m_softCloseJobs.contains(md.m_canId))
-                stopDrive(md, "close aborted: drive health error");
+            if (m_softCloseJobs.contains(md.m_canId) || isHoming(md.m_canId))
+                stopDrive(md, "gripper motion aborted: " + description);
             RCLCPP_WARN_THROTTLE(this->get_logger(),
                                  *this->get_clock(),
                                  5000,
@@ -361,6 +474,14 @@ void MdNode::publishHealth()
                                  description.c_str());
         }
 
+        // Reference readiness is reported as unhealthy, but is not a physical
+        // fault that should abort the homing which establishes that reference.
+        if (m_homingRequired.contains(md.m_canId))
+        {
+            if (!description.empty()) description += "; ";
+            description += isHoming(md.m_canId) ? "position: homing" : "position: homing required";
+            anyError = true;
+        }
         msg.responsive.push_back(true);
         msg.error.push_back(anyError);
         msg.active_errors.push_back(std::move(description));
@@ -442,7 +563,7 @@ void MdNode::cbPositionCmd(const candle_ros2::msg::PositionPidCmd& msg)
             continue;
         }
 
-        if (m_softCloseJobs.contains(msg.device_ids[i]))
+        if (isHoming(msg.device_ids[i]) || m_softCloseJobs.contains(msg.device_ids[i]) || m_pendingDisables.contains(msg.device_ids[i]))
         {
             RCLCPP_WARN(this->get_logger(), "Drive %d is closing/holding; configuration rejected",
                         msg.device_ids[i]);
@@ -509,7 +630,7 @@ void MdNode::cbVelocityCmd(const candle_ros2::msg::VelocityPidCmd& msg)
             continue;
         }
 
-        if (m_softCloseJobs.contains(msg.device_ids[i]))
+        if (isHoming(msg.device_ids[i]) || m_softCloseJobs.contains(msg.device_ids[i]) || m_pendingDisables.contains(msg.device_ids[i]))
         {
             RCLCPP_WARN(this->get_logger(), "Drive %d is closing/holding; configuration rejected",
                         msg.device_ids[i]);
@@ -557,7 +678,7 @@ void MdNode::cbImpedanceCmd(const candle_ros2::msg::ImpedanceCmd& msg)
             continue;
         }
 
-        if (m_softCloseJobs.contains(msg.device_ids[i]))
+        if (isHoming(msg.device_ids[i]) || m_softCloseJobs.contains(msg.device_ids[i]) || m_pendingDisables.contains(msg.device_ids[i]))
         {
             RCLCPP_WARN(this->get_logger(), "Drive %d is closing/holding; configuration rejected",
                         msg.device_ids[i]);
@@ -611,6 +732,7 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
                             positionRecoveryMaxDeltaRad,
                             static_cast<std::size_t>(positionRecoverySamples)));
         m_mds.push_back(std::move(md));
+        if (homingRequired) m_homingRequired.insert(id);
         rsp->success.push_back(true);
     }
     rsp->total_devices = static_cast<u16>(m_mds.size());
@@ -638,6 +760,9 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         if (md == m_mds.end())
             continue;
 
+        if (isHoming(md->m_canId) || m_homingRequired.contains(md->m_canId))
+            continue;
+
         // Reinitialization must not allow a previously scheduled soft-close
         // stage to command this drive again after it is enabled.
         m_softCloseJobs.erase(req->device_ids[i]);
@@ -646,7 +771,8 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
         // Disable first: MD motion mode resets on disable, and a previous
         // close/soft-close target may still be latched until overwritten in
         // the active motion mode.
-        if (!resetDriveErrorsIfNeeded(*md) || md->disable() != mab::MD::Error_t::OK)
+        if (m_pendingDisables.contains(req->device_ids[i]) ||
+            !resetDriveErrorsIfNeeded(*md) || !prepareDriveDisabled(*md))
         {
             RCLCPP_WARN(this->get_logger(),
                         "Init devices: failed to prepare drive %d for safe configuration",
@@ -693,8 +819,11 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
             continue;
         }
 
-        if (md->enable() != mab::MD::Error_t::OK)
+        if (!candle_ros2::enableDrive(*md, md->m_mdRegisters.motionModeCommand.value))
+        {
+            stopDrive(*md, "init enable/state verification failed; explicit enable required");
             continue;
+        }
 
         // Reassert hold after enable so a briefly restored stale target cannot
         // start a close motion.
@@ -705,7 +834,7 @@ void MdNode::cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::
             RCLCPP_WARN(this->get_logger(),
                         "Init devices: failed to reassert hold target for drive %d after enable",
                         req->device_ids[i]);
-            md->disable();
+            stopDrive(*md, "init hold failed; explicit enable required");
             continue;
         }
 
@@ -757,7 +886,7 @@ void MdNode::cbZero(const std::shared_ptr<candle_ros2::srv::Generic::Request> re
             RCLCPP_WARN(this->get_logger(),
                         "Failed to hold drive %d at zero after calibration; disabling it",
                         id);
-            md->disable();
+            stopDrive(*md, "zero hold failed; explicit enable required");
             rsp->success.push_back(false);
             continue;
         }
@@ -790,7 +919,7 @@ void MdNode::cbSetLimits(const std::shared_ptr<candle_ros2::srv::SetLimits::Requ
             continue;
         }
 
-        if (m_softCloseJobs.contains(req->device_ids[i]))
+        if (isHoming(req->device_ids[i]) || m_softCloseJobs.contains(req->device_ids[i]) || m_pendingDisables.contains(req->device_ids[i]))
         {
             rsp->success.push_back(false);
             continue;
@@ -830,8 +959,9 @@ bool MdNode::configureGripper(
 
     mab::MDRegisters_S limitRegs;
     limitRegs.profileVelocity = static_cast<float>(velocityLimit);
+    limitRegs.maxVelocity = std::max(gripperVelocityLimitRadS, gripperOpenVelocityLimitRadS);
     limitRegs.maxTorque       = static_cast<float>(torqueLimit);
-    if (md.writeRegisters(limitRegs.profileVelocity, limitRegs.maxTorque) != mab::MD::Error_t::OK)
+    if (md.writeRegisters(limitRegs.profileVelocity, limitRegs.maxVelocity, limitRegs.maxTorque) != mab::MD::Error_t::OK)
     {
         RCLCPP_WARN(this->get_logger(), "Failed to set limits for drive with ID: %d", md.m_canId);
         return false;
@@ -852,6 +982,35 @@ bool MdNode::setGripperTarget(mab::MD& md, double targetPos)
     }
 
     return writeRawTarget(md, tracker->second.logicalToRaw(targetPos));
+}
+
+bool MdNode::setGripperCommand(mab::MD& md, const ImpedanceClose::Command& command)
+{
+    const auto tracker = m_positionTrackers.find(md.m_canId);
+    if (tracker == m_positionTrackers.end() || !tracker->second.isTracking() ||
+        !std::isfinite(command.position) || !std::isfinite(command.torque) ||
+        !std::isfinite(command.kp) || !std::isfinite(command.kd) ||
+        command.kp < 0.0 || command.kd < 0.0 ||
+        std::abs(command.torque) > closeConfig.torqueLimit)
+    {
+        stopDrive(md, "invalid impedance command or position reference");
+        return false;
+    }
+    // One frame switches PD+I to pure torque without doubling holding effort.
+    mab::MDRegisters_S regs;
+    regs.motorImpPidKp = command.kp;
+    regs.motorImpPidKd = command.kd;
+    regs.targetPosition = tracker->second.logicalToRaw(command.position);
+    regs.targetVelocity = 0.0;
+    regs.targetTorque = command.torque;
+    if (md.writeRegisters(regs.motorImpPidKp, regs.motorImpPidKd,
+                          regs.targetPosition, regs.targetVelocity, regs.targetTorque) !=
+        mab::MD::Error_t::OK)
+    {
+        stopDrive(md, "impedance command write failed; explicit enable required");
+        return false;
+    }
+    return true;
 }
 
 bool MdNode::writeRawTarget(mab::MD& md, double rawTargetPos)
@@ -875,12 +1034,11 @@ bool MdNode::writeRawTarget(mab::MD& md, double rawTargetPos)
 
 bool MdNode::moveGripper(mab::MD& md, double targetPos)
 {
-    if (md.disable() != mab::MD::Error_t::OK)
+    if (!prepareDriveDisabled(md))
     {
         RCLCPP_WARN(this->get_logger(),
                     "Failed to disable drive with ID: %d before impedance move",
                     md.m_canId);
-        beginRecovery(md.m_canId);
         return false;
     }
 
@@ -891,13 +1049,13 @@ bool MdNode::moveGripper(mab::MD& md, double targetPos)
                           gripperTorqueLimitNm) ||
         md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
         !setGripperTarget(md, targetPos) ||
-        md.enable() != mab::MD::Error_t::OK ||
+        !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
         !setGripperTarget(md, targetPos))
     {
         RCLCPP_WARN(this->get_logger(),
                     "Failed to start impedance move for drive with ID: %d",
                     md.m_canId);
-        beginRecovery(md.m_canId);
+        stopDrive(md, "impedance move setup failed; explicit enable required");
         return false;
     }
 
@@ -984,6 +1142,11 @@ std::optional<double> MdNode::readLogicalPosition(mab::MD& md, bool triggerRecov
 
 void MdNode::beginRecovery(u16 id)
 {
+    if (homingRequired)
+    {
+        m_homingRequired.insert(id);
+        m_autoHomePending.insert(id);
+    }
     auto md = findMd(m_mds, id);
     if (md != m_mds.end())
         stopDrive(*md, "communication lost; explicit enable required after recovery");
@@ -1002,7 +1165,7 @@ bool MdNode::canAcceptPositionCommand(u16 id) const
     const auto tracker = m_positionTrackers.find(id);
     return tracker != m_positionTrackers.end() && tracker->second.isTracking() &&
            m_recoveryContexts.find(id) == m_recoveryContexts.end() &&
-           !m_motionInhibited.contains(id);
+           !m_motionInhibited.contains(id) && !m_homingRequired.contains(id) && !isHoming(id);
 }
 
 void MdNode::tickRecoveryJobs()
@@ -1016,7 +1179,7 @@ void MdNode::tickRecoveryJobs()
 
     for (auto& [id, context] : m_recoveryContexts)
     {
-        if (now < context.nextAttempt)
+        if (now < context.nextAttempt || m_pendingDisables.contains(id))
             continue;
 
         context.nextAttempt = now + std::chrono::milliseconds(positionRecoveryRetryMs);
@@ -1057,37 +1220,38 @@ void MdNode::tickRecoveryJobs()
         if (positionErr != mab::MD::Error_t::OK)
             continue;
 
-        if (tracker->second.state() == PositionTracker::State::Uninitialized)
+        if (homingRequired)
+        {
+            // A returning geared drive has no trustworthy multi-turn reference.
+            // Raw coordinates are only used for the bounded opening search.
+            if (!std::isfinite(rawPosition)) continue;
+            tracker->second.initialize(static_cast<double>(rawPosition));
+        }
+        else if (tracker->second.state() == PositionTracker::State::Uninitialized)
         {
             tracker->second.initialize(static_cast<double>(rawPosition));
-            recovered.push_back(id);
-            continue;
+        }
+        else if (!tracker->second.isTracking())
+        {
+            const auto result = tracker->second.observeRecovery(static_cast<double>(rawPosition));
+            if (result == PositionTracker::RecoveryResult::Rejected)
+            {
+                stopDrive(*md, "position recovery ambiguous; manual open calibration required");
+                RCLCPP_ERROR(this->get_logger(),
+                             "Drive %d recovery is ambiguous; manual open calibration is required", id);
+                faulted.push_back(id);
+                continue;
+            }
+            if (result == PositionTracker::RecoveryResult::Pending)
+            {
+                context.nextAttempt = now;
+                continue;
+            }
         }
 
-        const auto result = tracker->second.observeRecovery(static_cast<double>(rawPosition));
-        if (result == PositionTracker::RecoveryResult::Rejected)
-        {
-            md->disable();
-            RCLCPP_ERROR(this->get_logger(),
-                         "Drive %d recovery is ambiguous; manual open calibration is required",
-                         id);
-            faulted.push_back(id);
-            continue;
-        }
-        if (result == PositionTracker::RecoveryResult::Pending)
-        {
-            context.nextAttempt = now;
-            continue;
-        }
-
-        if (md->disable() == mab::MD::Error_t::OK)
+        if (prepareDriveDisabled(*md))
         {
             recovered.push_back(id);
-        }
-        else
-        {
-            tracker->second.markCommunicationLost();
-            context.errorsCleared = false;
         }
     }
 
@@ -1102,32 +1266,310 @@ void MdNode::stopDrive(mab::MD& md, const std::string& reason)
     // Latch before the bus write: a failed disable must also cancel future work.
     m_motionInhibited.insert(md.m_canId);
     m_softCloseJobs.erase(md.m_canId);
+    if (isHoming(md.m_canId)) finishHoming(false);
     m_commandErrors[md.m_canId] = reason;
-    if (md.disable() != mab::MD::Error_t::OK)
+    RCLCPP_WARN(get_logger(), "Drive %d stopped: %s", md.m_canId, reason.c_str());
+    // Repeated stop requests join the same transition, not restart its deadline.
+    m_pendingDisables.try_emplace(md.m_canId, md);
+}
+
+bool MdNode::prepareDriveDisabled(mab::MD& md)
+{
+    if (m_pendingDisables.contains(md.m_canId))
+        return false;
+    candle_ros2::DisableTransition stop(md);
+    // Keep the existing short setup fast path. If the motor needs longer to
+    // brake, finish asynchronously and require the caller to retry explicitly;
+    // never configure/re-enable it while quick-stop is still in progress.
+    const auto deadline = stop.started + std::chrono::milliseconds(10);
+    do
     {
-        RCLCPP_ERROR(this->get_logger(), "Drive %d disable unconfirmed: %s",
-                     md.m_canId, reason.c_str());
-        m_positionTrackers.at(md.m_canId).markCommunicationLost();
-        m_recoveryContexts.try_emplace(md.m_canId,
-            RecoveryContext{std::chrono::steady_clock::now(), false});
+        const auto status = stop.poll(md);
+        if (status == candle_ros2::DisableTransition::Status::Disabled)
+            return true;
+        if (status == candle_ros2::DisableTransition::Status::Failed)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    m_pendingDisables.emplace(md.m_canId, std::move(stop));
+    stopDrive(md, "configuration deferred until disabled; explicit enable required");
+    return false;
+}
+
+void MdNode::tickDisableJobs()
+{
+    using Status = candle_ros2::DisableTransition::Status;
+    for (auto& [id, stop] : m_pendingDisables)
+    {
+        if (stop.reported)
+            continue;
+        auto md = findMd(m_mds, id);
+        const auto status = stop.poll(*md);
+        if (status == Status::Pending)
+            continue;
+        stop.reported = true;
+        if (status == Status::Disabled)
+            RCLCPP_INFO(this->get_logger(), "Drive %d disable confirmed after %.1f ms", id,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - stop.started).count());
+        else
+        {
+            m_commandErrors[id] += "; hardware disable unconfirmed";
+            RCLCPP_ERROR(this->get_logger(), "Drive %d disable unconfirmed", id);
+            if (stop.communicationLost)
+            {
+                m_positionTrackers.at(id).markCommunicationLost();
+                m_recoveryContexts.try_emplace(id,
+                    RecoveryContext{std::chrono::steady_clock::now(), false});
+            }
+        }
     }
+    for (auto it = m_disableRequests.begin(); it != m_disableRequests.end();)
+    {
+        bool pending = false;
+        candle_ros2::srv::Generic::Response response;
+        for (auto id : it->ids)
+        {
+            const auto stop = m_pendingDisables.find(id);
+            pending |= stop != m_pendingDisables.end() && stop->second.status == Status::Pending;
+            response.success.push_back(stop != m_pendingDisables.end() &&
+                                       stop->second.status == Status::Disabled);
+        }
+        if (pending)
+        {
+            ++it;
+            continue;
+        }
+        try { srvDisable->send_response(*it->header, response); }
+        catch (const std::exception& error)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Disable response failed: %s", error.what());
+        }
+        it = m_disableRequests.erase(it);
+    }
+    // Retain completed results while another ID in a multi-drive request brakes.
+    std::erase_if(m_pendingDisables, [&](const auto& entry) {
+        return entry.second.status != Status::Pending &&
+            std::none_of(m_disableRequests.begin(), m_disableRequests.end(), [&](const auto& request) {
+                return std::find(request.ids.begin(), request.ids.end(), entry.first) != request.ids.end();
+            });
+    });
 }
 
 bool MdNode::cancelSoftClose(u16 id)
 {
-    if (!m_softCloseJobs.contains(id))
+    if (m_pendingDisables.contains(id) || isHoming(id))
+        return false;
+    const auto job = m_softCloseJobs.find(id);
+    if (job == m_softCloseJobs.end())
         return true;
-    m_softCloseJobs.erase(id);
+    const auto config = job->second.control.config;
+    m_softCloseJobs.erase(job);
     auto md = findMd(m_mds, id);
     if (md == m_mds.end())
         return false;
     const auto position = readLogicalPosition(*md);
-    if (!position.has_value() || !setGripperTarget(*md, *position))
+    // Clear integral/captured torque AND restore PD before any new command.
+    if (!position.has_value() ||
+        !setGripperCommand(*md, {*position, 0.0, config.kp, config.kd}))
     {
-        stopDrive(*md, "failed to cancel close; explicit enable required");
+        stopDrive(*md, "failed to cancel gripper motion; explicit enable required");
         return false;
     }
     return true;
+}
+
+bool MdNode::isHoming(u16 id) const
+{
+    return m_homingJob && m_homingJob->id == id;
+}
+
+void MdNode::cbHome(std::shared_ptr<rmw_request_id_t> header,
+                    std::shared_ptr<candle_ros2::srv::Generic::Request> req)
+{
+    // Deferred reply means success is a completed zero, never just an ACK.
+    if (req->device_ids.size() == 1)
+    {
+        auto md = findMd(m_mds, req->device_ids.front());
+        if (md != m_mds.end() && startHoming(*md, header)) return;
+    }
+    candle_ros2::srv::Generic::Response response;
+    response.success.assign(req->device_ids.size(), false);
+    srvHome->send_response(*header, response);
+}
+
+bool MdNode::startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header)
+{
+    const auto id = md.m_canId;
+    if (m_homingJob || m_pendingDisables.contains(id) || m_recoveryContexts.contains(id))
+        return false;
+    m_homingRequired.insert(id);
+    m_motionInhibited.insert(id);
+    m_softCloseJobs.erase(id);
+    if (!prepareDriveDisabled(md) || !resetDriveErrorsIfNeeded(md)) return false;
+
+    mab::MDRegisters_S r;
+    if (md.readRegisters(r.mainEncoderPosition, r.mainEncoderVelocity, r.motorTorque,
+                         r.motorTemperature, r.mosfetTemperature, r.motorShutdownTemp) != mab::MD::Error_t::OK ||
+        !std::isfinite(r.mainEncoderPosition.value) || !std::isfinite(r.mainEncoderVelocity.value) ||
+        !std::isfinite(r.motorTorque.value) ||
+        std::abs(r.motorTorque.value) > 0.1 ||
+        !std::isfinite(r.motorTemperature.value) || !std::isfinite(r.mosfetTemperature.value) ||
+        !std::isfinite(r.motorShutdownTemp.value) || r.motorShutdownTemp.value <= 0.0 ||
+        r.motorTemperature.value <= 0.0 || r.motorTemperature.value >= r.motorShutdownTemp.value ||
+        r.mosfetTemperature.value <= 0.0 || r.mosfetTemperature.value >= 90.0)
+    {
+        stopDrive(md, "homing preflight failed: unhealthy or loaded drive");
+        return false;
+    }
+    // An old absolute firmware position limit is invalid in the cold frame.
+    // Do not silently remove a configured safety limit.
+    if (md.readRegisters(r.positionLimitMin, r.positionLimitMax, r.canWatchdog) != mab::MD::Error_t::OK ||
+        !ImpedanceHome::unrestrictedPositionLimits(r.positionLimitMin.value, r.positionLimitMax.value) ||
+        r.canWatchdog.value == 0 || r.canWatchdog.value > 250)
+    {
+        stopDrive(md, "homing rejected: check firmware position limits and watchdog (1..250 ms required)");
+        return false;
+    }
+    const double raw = r.mainEncoderPosition.value;
+    m_positionTrackers.at(id).initialize(raw);
+    const double direction = gripperClosedPositionRad > gripperOpenPositionRad ? -1.0 : 1.0;
+    ImpedanceHome control(raw, direction, homeConfig, closeConfig);
+    // Read back the homing torque cap and ordinary firmware velocity protection.
+    // Opening torque with velocity damping, no position spring or absolute endpoint.
+    if (!configureGripper(md, 0.0, homeConfig.damping,
+                          gripperOpenVelocityLimitRadS, homeConfig.torque) ||
+        md.readRegisters(r.maxVelocity, r.maxTorque) != mab::MD::Error_t::OK ||
+        !std::isfinite(r.maxVelocity.value) || !std::isfinite(r.maxTorque.value) ||
+        std::abs(r.maxVelocity.value - std::max(gripperVelocityLimitRadS, gripperOpenVelocityLimitRadS)) > 1e-6 ||
+        std::abs(r.maxTorque.value - homeConfig.torque) > 1e-6 ||
+        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+        !setGripperCommand(md, control.command()) ||
+        !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
+        !setGripperCommand(md, control.command()))
+    {
+        stopDrive(md, "homing setup failed; reference remains invalid");
+        return false;
+    }
+    m_commandErrors.erase(id);
+    m_autoHomePending.erase(id);
+    m_homingJob.emplace(HomingJob{id, control, std::chrono::steady_clock::now(), std::move(header)});
+    RCLCPP_INFO(get_logger(), "Drive %d homing: raw %.5f rad, opening effort %.2f Nm, damping %.2f, cap %.2f Nm, max travel %.2f rad",
+                id, raw, homeConfig.seekTorque, homeConfig.damping, homeConfig.torque, homeConfig.maxTravel);
+    return true;
+}
+
+void MdNode::finishHoming(bool success)
+{
+    if (!m_homingJob) return;
+    auto header = m_homingJob->header;
+    const auto id = m_homingJob->id;
+    m_homingJob.reset();
+    if (success)
+    {
+        m_homingRequired.erase(id);
+        m_motionInhibited.erase(id);
+        m_commandErrors.erase(id);
+    }
+    if (header)
+    {
+        candle_ros2::srv::Generic::Response response;
+        response.success = {success};
+        try { srvHome->send_response(*header, response); }
+        catch (const std::exception& error)
+        {
+            RCLCPP_ERROR(get_logger(), "Homing response failed: %s", error.what());
+        }
+    }
+}
+
+void MdNode::tickHoming(mab::MD& md, double position, double velocity, double torque)
+{
+    auto& job = *m_homingJob;
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - job.lastUpdate).count();
+    job.lastUpdate = now;
+    if (job.control.state == ImpedanceHome::State::Releasing)
+    {
+        if (!candle_ros2::driveDisabled(md.m_mdRegisters.state.value))
+        {
+            stopDrive(md, "homing release is not disabled; reference remains invalid");
+            return;
+        }
+        const auto result = job.control.updateRelease(position, velocity, torque, dt);
+        if (result == ImpedanceHome::State::Failed)
+            stopDrive(md, "homing release settling/feedback timeout; reference remains invalid");
+        else if (result == ImpedanceHome::State::Ready)
+            completeHomingZero(md);
+        return;
+    }
+    if (!candle_ros2::driveEnabled(md.m_mdRegisters.state.value) ||
+        md.m_mdRegisters.motionModeStatus.value != mab::MdMode_E::IMPEDANCE)
+    {
+        if (homingRequired && candle_ros2::driveDisabled(md.m_mdRegisters.state.value) &&
+            md.m_mdRegisters.motionModeStatus.value == mab::MdMode_E::IDLE)
+            beginRecovery(md.m_canId);
+        else
+            stopDrive(md, "homing drive state/mode lost; reference remains invalid");
+        return;
+    }
+    const auto state = job.control.update(position, velocity, torque, dt);
+    if (state == ImpedanceHome::State::Failed)
+    {
+        RCLCPP_ERROR(get_logger(), "Drive %d homing failed at raw %.5f rad, velocity %.3f, torque %.3f, elapsed %.3f",
+                     md.m_canId, position, velocity, torque, job.control.elapsed);
+        stopDrive(md, "homing timeout/travel/torque/feedback guard; reference remains invalid");
+        return;
+    }
+    // Copy before any write: a failed command can cancel the job.
+    const auto command = job.control.command();
+    if (!setGripperCommand(md, command) || state != ImpedanceHome::State::Found) return;
+
+    RCLCPP_INFO(get_logger(), "Drive %d opening stop inferred at raw %.5f rad, torque %.3f Nm",
+                md.m_canId, position, torque);
+    // Never zero under an active spring or re-enable with a pre-zero target.
+    if (!prepareDriveDisabled(md))
+    {
+        stopDrive(md, "homing disable failed; reference remains invalid");
+        return;
+    }
+    m_homingJob->control.beginRelease();
+}
+
+void MdNode::completeHomingZero(mab::MD& md)
+{
+    // The unpowered jaw has now settled after release. This is
+    // the relaxed open reference; zeroing a loaded stop would bake in deflection.
+    if (md.zero() != mab::MD::Error_t::OK)
+    {
+        stopDrive(md, "homing zero failed; reference remains invalid");
+        return;
+    }
+    // runZero is acknowledged before the position register updates on this
+    // firmware. Poll the readback briefly while disabled; never reissue zero.
+    const auto zeroPosition = candle_ros2::readZeroPosition(md, closeConfig.tolerance);
+    if (!zeroPosition)
+    {
+        stopDrive(md, "homing zero readback failed; reference remains invalid");
+        return;
+    }
+    const double raw = *zeroPosition;
+    m_positionTrackers.at(md.m_canId).resetAtZero();
+    m_positionTrackers.at(md.m_canId).observe(raw);
+    if (!configureGripper(md, 0.0, 0.0, gripperOpenVelocityLimitRadS, closeConfig.torqueLimit) ||
+        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
+        !setGripperCommand(md, {raw, 0.0, 0.0, 0.0}) ||
+        !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
+        !setGripperCommand(md, {raw, 0.0, 0.0, 0.0}))
+    {
+        stopDrive(md, "homing release setup failed; reference remains invalid");
+        return;
+    }
+    ImpedanceClose release(raw, gripperOpenPositionRad, gripperOpenVelocityLimitRadS, closeConfig, true);
+    release.state = ImpedanceClose::State::TorqueHold;
+    m_softCloseJobs.insert_or_assign(md.m_canId, SoftCloseJob{release, std::chrono::steady_clock::now(), true});
+    finishHoming(true);
+    RCLCPP_INFO(get_logger(), "Drive %d homed to zero; released at 0 Nm; normal limits restored", md.m_canId);
 }
 
 double MdNode::normalizedSpeedToRadS(double normalizedSpeed)
@@ -1136,41 +1578,63 @@ double MdNode::normalizedSpeedToRadS(double normalizedSpeed)
            normalizedSpeed * (SOFT_CLOSE_MAX_SPEED_RAD_S - SOFT_CLOSE_MIN_SPEED_RAD_S);
 }
 
-bool MdNode::startImpedanceClose(mab::MD& md, double speed)
+bool MdNode::startImpedanceMotion(mab::MD& md, double speed, bool opening)
 {
-    if (!canAcceptPositionCommand(md.m_canId) || !cancelSoftClose(md.m_canId))
+    if (!canAcceptPositionCommand(md.m_canId))
         return false;
+    // Replace the old job directly: cancelSoftClose's zero-torque PD command
+    // would introduce a release between repeated close requests.
+    m_softCloseJobs.erase(md.m_canId);
     const auto position = readLogicalPosition(md);
     if (!position.has_value())
-        return false;
-    const double lower = std::min(gripperOpenPositionRad, gripperClosedPositionRad);
-    const double upper = std::max(gripperOpenPositionRad, gripperClosedPositionRad);
-    if (*position < lower - closeConfig.tolerance || *position > upper + closeConfig.tolerance)
     {
-        stopDrive(md, "close rejected: position outside calibrated travel");
+        stopDrive(md, "gripper motion position unavailable; explicit enable required");
+        return false;
+    }
+    if (!closeConfig.withinTravel(*position))
+    {
+        stopDrive(md, "gripper motion rejected: position outside calibrated travel");
         return false;
     }
 
     const double torqueLimit = std::min(gripperTorqueLimitNm, softCloseSlowTorqueLimitNm);
-    // Latch the measured hold position before enable; no closed-endpoint step.
     if (!resetDriveErrorsIfNeeded(md) ||
-        md.disable() != mab::MD::Error_t::OK ||
-        !configureGripper(md, gripperImpedanceKp, gripperImpedanceKd, speed, torqueLimit) ||
-        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-        !setGripperTarget(md, *position) ||
-        md.enable() != mab::MD::Error_t::OK ||
-        !setGripperTarget(md, *position))
+        md.readRegisters(md.m_mdRegisters.state, md.m_mdRegisters.motionModeStatus) !=
+            mab::MD::Error_t::OK)
     {
-        stopDrive(md, "impedance close setup failed; explicit enable required");
+        stopDrive(md, "impedance motion state unavailable; explicit enable required");
+        return false;
+    }
+    // Do not toggle a healthy, already-enabled impedance drive between every
+    // open/close command. Replace its old hold with the new controller's initial
+    // command. Other modes still require a confirmed disabled transition.
+    const bool alreadyReady = candle_ros2::driveEnabled(md.m_mdRegisters.state.value) &&
+                             md.m_mdRegisters.motionModeStatus.value == mab::MdMode_E::IMPEDANCE;
+    // Calibrated direction keeps the closing floor positive toward closure even
+    // when starting at/slightly beyond the target. Opening never gets the floor.
+    const double direction = (gripperClosedPositionRad > gripperOpenPositionRad ? 1.0 : -1.0) *
+                             (opening ? -1.0 : 1.0);
+    ImpedanceClose control(*position, opening ? gripperOpenPositionRad : gripperClosedPositionRad,
+                           speed, closeConfig, opening, direction);
+    const auto hold = control.command();
+    if ((!alreadyReady && (!prepareDriveDisabled(md) ||
+                          md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK)) ||
+        !setGripperCommand(md, hold) ||
+        !configureGripper(md, hold.kp, hold.kd, speed, torqueLimit) ||
+        (!alreadyReady && !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE)) ||
+        !setGripperCommand(md, hold))
+    {
+        stopDrive(md, "impedance motion setup failed; explicit enable required");
         return false;
     }
 
     m_softCloseJobs.insert_or_assign(md.m_canId, SoftCloseJob{
-        ImpedanceClose(*position, gripperClosedPositionRad, speed, closeConfig),
-        std::chrono::steady_clock::now()});
-    RCLCPP_INFO(this->get_logger(), "Drive %d closing in impedance: ramp %.3f rad/s, "
-                "lead %.4f rad, torque limit %.3f Nm", md.m_canId, speed,
-                closeConfig.lead, torqueLimit);
+        control, std::chrono::steady_clock::now(), opening});
+    RCLCPP_INFO(this->get_logger(), "Drive %d %s in impedance: ramp %.3f rad/s, "
+                "lead %.4f rad, torque limit %.3f Nm, Ki %.3f", md.m_canId,
+                opening ? "opening" : "closing", speed,
+                opening ? closeConfig.openLead : closeConfig.lead,
+                torqueLimit, opening ? 0.0 : closeConfig.ki);
     return true;
 }
 
@@ -1180,33 +1644,96 @@ void MdNode::tickSoftClose(mab::MD& md, double position, double velocity, double
     if (it == m_softCloseJobs.end())
         return;
     auto& job = it->second;
+    const bool opening = job.opening;
+    const char* operation = opening ? "open" : "close";
     const auto now = std::chrono::steady_clock::now();
     const double dt = std::chrono::duration<double>(now - job.lastUpdate).count();
     job.lastUpdate = now;
     const auto previous = job.control.state;
-    const double previousTarget = job.control.target;
-    const double lower = std::min(gripperOpenPositionRad, gripperClosedPositionRad);
-    const double upper = std::max(gripperOpenPositionRad, gripperClosedPositionRad);
-    if (position < lower - closeConfig.tolerance || position > upper + closeConfig.tolerance)
+    const auto previousCommand = job.control.command();
+    if (!closeConfig.withinTravel(position))
     {
-        stopDrive(md, "close failed: measured position outside calibrated travel");
+        stopDrive(md, std::string(operation) + " failed: measured position outside calibrated travel");
+        return;
+    }
+    // These registers came from the same fresh feedback frame as position and
+    // torque. Healthy quick-status flags alone do not mean PWM is enabled.
+    if (!candle_ros2::driveEnabled(md.m_mdRegisters.state.value) ||
+        md.m_mdRegisters.motionModeStatus.value != mab::MdMode_E::IMPEDANCE)
+    {
+        const std::string reason = std::string(operation) +
+            " failed: drive not enabled in impedance mode (state=" +
+            std::to_string(md.m_mdRegisters.state.value) + ", mode=" +
+            std::to_string(md.m_mdRegisters.motionModeStatus.value) +
+            "); explicit enable required";
+        RCLCPP_ERROR(this->get_logger(), "Drive %d %s", md.m_canId, reason.c_str());
+        if (homingRequired && candle_ros2::driveDisabled(md.m_mdRegisters.state.value) &&
+            md.m_mdRegisters.motionModeStatus.value == mab::MdMode_E::IDLE)
+            beginRecovery(md.m_canId); // A brief power loss may occur between telemetry ticks.
+        else
+            stopDrive(md, reason);
         return;
     }
     const auto state = job.control.update(position, velocity, torque, dt);
     if (state == ImpedanceClose::State::Failed)
     {
-        stopDrive(md, "close failed: timeout, stale or invalid feedback; explicit enable required");
+        RCLCPP_WARN(this->get_logger(),
+                    "Drive %d %s aborted at %.4f rad; target %.4f rad, torque %.3f Nm",
+                    md.m_canId, operation, position, job.control.target, torque);
+        stopDrive(md, std::string(operation) +
+                      " failed: stale/invalid feedback; "
+                      "explicit enable required");
         return;
     }
-    // writeRawTarget may erase this job on a communication failure.
-    const double target = job.control.target;
-    if (target != previousTarget && !setGripperTarget(md, target))
+    if (opening && state == ImpedanceClose::State::Contact)
+    {
+        // Opening resistance is an obstruction, not a successful grasp.
+        stopDrive(md, "open blocked: sustained resistance before endpoint; explicit enable required");
         return;
-    if (state != previous)
-        RCLCPP_INFO(this->get_logger(), "Drive %d close: %s at %.4f rad; holding target %.4f rad",
-                    md.m_canId,
-                    state == ImpedanceClose::State::Contact ? "contact inferred" : "closed endpoint",
-                    position, target);
+    }
+    // A failed write can erase the job: copy everything used afterwards.
+    const auto command = job.control.command();
+    const bool hasObject = job.control.hasObject;
+    const double desiredTorque = job.control.direction *
+        std::clamp(state == ImpedanceClose::State::Closed ? closeConfig.closedHoldTorque :
+                   closeConfig.holdTorque, std::min(closeConfig.closedHoldTorque, closeConfig.torqueLimit),
+                   closeConfig.torqueLimit);
+    if ((command.position != previousCommand.position ||
+         command.torque != previousCommand.torque ||
+         command.kp != previousCommand.kp || command.kd != previousCommand.kd) &&
+        !setGripperCommand(md, command))
+        return;
+    if (state == previous)
+        return;
+    if (state == ImpedanceClose::State::Closing)
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d close: recovering from measured position %.4f rad; "
+                    "old hold torque and integral cleared; closing command floor %.4f Nm",
+                    md.m_canId, position, std::min(closeConfig.closedHoldTorque, closeConfig.torqueLimit));
+    else if (state == ImpedanceClose::State::Contact && hasObject)
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d close: contact inferred at %.4f rad; torque ramp %.4f -> %.4f Nm",
+                    md.m_canId, position, command.torque,
+                    desiredTorque);
+    else if (opening && state == ImpedanceClose::State::TorqueHold)
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d open: timeout released at %.4f rad; commanded torque 0 Nm, "
+                    "PD disabled, endpoint unconfirmed", md.m_canId, position);
+    else if (state == ImpedanceClose::State::TorqueHold)
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d close: %s at %.4f rad; holding torque %.4f Nm",
+                    md.m_canId, hasObject ? "object torque hold" : "timeout torque hold",
+                    position, command.torque);
+    else if (!opening && state == ImpedanceClose::State::Closed)
+        RCLCPP_INFO(this->get_logger(),
+                    "Drive %d close: closed endpoint at %.4f rad; torque ramp %.4f -> %.4f Nm",
+                    md.m_canId, position, command.torque, desiredTorque);
+    else
+        RCLCPP_INFO(this->get_logger(), "Drive %d %s: %s at %.4f rad; holding target %.4f rad",
+                    md.m_canId, operation,
+                    state == ImpedanceClose::State::Contact ? "contact inferred" :
+                        (opening ? "open endpoint" : "closed endpoint"),
+                    position, command.position);
 }
 
 void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
@@ -1217,32 +1744,8 @@ void MdNode::cbOpenGripper(const std::shared_ptr<candle_ros2::srv::Generic::Requ
     for (auto id : req->device_ids)
     {
         auto md = findMd(m_mds, id);
-        if (md == m_mds.end())
-        {
-            RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", id);
-            rsp->success.push_back(false);
-            continue;
-        }
-
-        if (!cancelSoftClose(id))
-        {
-            rsp->success.push_back(false);
-            continue;
-        }
-        if (!canAcceptPositionCommand(id))
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "Drive %d position is invalid or recovering; open rejected",
-                        id);
-            rsp->success.push_back(false);
-            continue;
-        }
-        if (!resetDriveErrorsIfNeeded(*md))
-        {
-            rsp->success.push_back(false);
-            continue;
-        }
-        rsp->success.push_back(moveGripper(*md, gripperOpenPositionRad));
+        rsp->success.push_back(md != m_mds.end() &&
+                               startImpedanceMotion(*md, gripperOpenVelocityLimitRadS, true));
     }
 }
 
@@ -1253,7 +1756,7 @@ void MdNode::cbCloseGripper(const std::shared_ptr<candle_ros2::srv::Generic::Req
     {
         auto md = findMd(m_mds, id);
         rsp->success.push_back(md != m_mds.end() &&
-                               startImpedanceClose(*md, gripperVelocityLimitRadS));
+                               startImpedanceMotion(*md, gripperVelocityLimitRadS));
     }
 }
 
@@ -1273,7 +1776,7 @@ void MdNode::cbSoftCloseGripper(
     for (auto id : req->device_ids)
     {
         auto md = findMd(m_mds, id);
-        rsp->success.push_back(md != m_mds.end() && startImpedanceClose(*md, speed));
+        rsp->success.push_back(md != m_mds.end() && startImpedanceMotion(*md, speed));
     }
 }
 
@@ -1354,7 +1857,7 @@ void MdNode::cbConfigureGripper(
             RCLCPP_WARN(this->get_logger(), "Drive with ID: %d is not added!", req->device_ids[i]);
             continue;
         }
-        if (m_softCloseJobs.contains(req->device_ids[i]))
+        if (isHoming(req->device_ids[i]) || m_softCloseJobs.contains(req->device_ids[i]) || m_pendingDisables.contains(req->device_ids[i]))
             continue;
         rsp->success[i] = configureGripper(*md, kp, kd, velocityLimit, torqueLimit);
     }
@@ -1431,7 +1934,7 @@ void MdNode::cbEnable(const std::shared_ptr<candle_ros2::srv::Generic::Request> 
             continue;
         }
 
-        if (!cancelSoftClose(id) || m_recoveryContexts.contains(id))
+        if (!cancelSoftClose(id) || m_recoveryContexts.contains(id) || m_homingRequired.contains(id))
         {
             rsp->success.push_back(false);
             continue;
@@ -1452,36 +1955,17 @@ void MdNode::cbEnable(const std::shared_ptr<candle_ros2::srv::Generic::Request> 
     return;
 }
 
-void MdNode::cbDisable(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
-                       std::shared_ptr<candle_ros2::srv::Generic::Response>      rsp)
+void MdNode::cbDisable(std::shared_ptr<rmw_request_id_t> header,
+                       std::shared_ptr<candle_ros2::srv::Generic::Request> req)
 {
-    rsp->success.reserve(req->device_ids.size());
-
     for (auto id : req->device_ids)
     {
+        m_autoHomePending.erase(id); // Explicit stop cancels an automatic restart.
         auto md = findMd(m_mds, id);
-        if (md == m_mds.end())
-        {
-            rsp->success.push_back(false);
-            continue;
-        }
-
-        m_motionInhibited.insert(id);
-        m_softCloseJobs.erase(id);
-        m_commandErrors[id] = "disabled by request; explicit enable required";
-        if (md->disable() == mab::MD::Error_t::OK)
-        {
-            rsp->success.push_back(true);
-        }
-        else
-        {
-            m_positionTrackers.at(id).markCommunicationLost();
-            m_recoveryContexts.try_emplace(id,
-                RecoveryContext{std::chrono::steady_clock::now(), false});
-            rsp->success.push_back(false);
-        }
+        if (md != m_mds.end())
+            stopDrive(*md, "disabled by request; explicit enable required");
     }
-    return;
+    m_disableRequests.push_back({std::move(header), req->device_ids});
 }
 
 std::vector<mab::MD>::iterator MdNode::findMd(std::vector<mab::MD>& mds, u16 id)

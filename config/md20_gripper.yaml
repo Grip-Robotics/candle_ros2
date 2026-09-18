@@ -1,0 +1,49 @@
+# Unobstructed speed tuning on MD20 gripper 111, 2026-09-16.
+# Shared controller settings: validate other grippers/loads before reuse.
+# No motor is added/enabled or zeroed by loading this file.
+candle_config:
+  ros__parameters:
+    launch_md_node: true
+    launch_pds_node: false
+    gripper_open_position_rad: 0.0
+    gripper_closed_position_rad: 0.75
+    gripper_travel_min_rad: -0.05
+    gripper_travel_max_rad: 0.75
+    gripper_impedance_kp: 30.0
+    gripper_impedance_kd: 0.2
+    gripper_impedance_ki: 5.0
+    gripper_velocity_limit_rad_s: 2.0
+    gripper_open_velocity_limit_rad_s: 10.0
+    close_target_lead_rad: 0.04
+    open_target_lead_rad: 0.14
+    gripper_torque_limit_nm: 2.0
+    soft_close_slow_torque_limit_nm: 2.0
+    gripper_hold_torque_nm: 2.0
+    gripper_closed_hold_torque_nm: 0.25
+    gripper_hold_torque_ramp_nm_s: 2.0
+    close_object_margin_rad: 0.01
+    soft_close_closed_tol_rad: 0.005
+    close_contact_torque_nm: 0.35
+    close_contact_velocity_rad_s: 0.03
+    close_contact_duration_s: 0.15
+    close_timeout_s: 2.0
+    open_timeout_s: 0.5
+    close_feedback_timeout_s: 0.25
+    joint_state_publish_period_ms: 10
+    health_publish_period_ms: 200
+    md_can_response_timeout_100us: 100
+    md_host_timeout_ms: 20
+    encoder_wrap_period_rad: 0.62831853
+    position_recovery_max_delta_rad: 0.25
+    position_recovery_samples: 3
+    position_recovery_retry_ms: 25
+    init_devices_zero: false
+    # Requires a clear opening path; re-home rather than restore a saved frame.
+    homing_required: true
+    # Opening torque with damping; no position spring or absolute endpoint.
+    homing_torque_nm: 1.0
+    homing_damping_nm_s_rad: 0.5
+    homing_torque_limit_nm: 2.0
+    homing_max_travel_rad: 0.85
+    homing_contact_duration_s: 0.25
+    homing_timeout_s: 2.0

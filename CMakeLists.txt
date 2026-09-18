@@ -90,13 +90,17 @@ install(TARGETS
   candle_container
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/test_grippers.sh
+  scripts/record_gripper_cycles.py
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME gripper_recorder_self_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/record_gripper_cycles.py --self-test)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(position_tracker_test test/position_tracker_test.cpp)
   target_include_directories(position_tracker_test BEFORE PRIVATE
@@ -104,6 +108,10 @@ if(BUILD_TESTING)
     include)
   ament_add_gtest(impedance_close_test test/impedance_close_test.cpp)
   target_include_directories(impedance_close_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(drive_state_test test/drive_state_test.cpp)
+  target_include_directories(drive_state_test BEFORE PRIVATE
     CANdle-SDK/commons/googletest/googletest/include
     include)
 endif()
