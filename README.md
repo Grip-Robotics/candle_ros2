@@ -10,23 +10,80 @@ Both `md/close_gripper` and `md/soft_close_gripper` now close in IMPEDANCE
 mode from the first movement. There is no pre-close stage, gap estimate,
 position-profile dependency, or timed fast-to-slow switch.
 
-`md/open_gripper` uses the same bounded target ramp with a separate opening
-speed and target-lead parameters and no integral. Both directions start the target at measured position,
-retain the target-lead limit, and keep torque, settling/obstruction, travel,
-and feedback checks. If opening does not settle by its 0.5-second deadline,
-it releases to 0 Nm with Kp/Kd and integral cleared, without disabling the motor.
-Ramp settings limit target progression, not measured motor
-speed; the target-lead bound can further slow progression.
+`md/open_gripper` uses a position-target ramp toward the known open endpoint
+(0 rad in the MD20 profile). The target starts at measured position, advances
+at 10 rad/s, and stays at most 0.14 rad ahead of measured position in the opening
+direction. Opening uses Kp=30 and Kd=0.2, no integral, and a 2 Nm total torque
+cap. These are the MD20 profile settings; the ramp limits target progression,
+not measured motor speed, and the lead bound can slow that progression.
+Normal opening never searches for a mechanical stop, uses the homing effort,
+changes calibration, or zeros the encoder.
 
-Each motion starts with a target at the measured position. Each fresh feedback
+A settled known endpoint releases commanded torque, Kp and Kd to zero. The
+independent `open_timeout_s` deadline (0.5 s) also releases all effort, but
+reports the endpoint as unconfirmed. Both outcomes remain enabled and passive
+through rebound or manual displacement until a new explicit command. Endpoint
+confirmation uses position and low-speed dwell, with no minimum measured
+opening effort. Sustained resistance before the endpoint remains an obstruction
+failure; stale/invalid feedback and hardware faults still stop the drive.
+Homing alone uses effort-qualified stop searches and disabled unloaded releases.
+
+`gripper_travel_limits_enabled` controls the software absolute position guards.
+It defaults to `true`; the MD20 profile sets it to `false`. When disabled, normal
+opening, closing, holding, passive rebound and direct position commands do not
+reject finite positions outside the learned/configured travel range. Calibration
+still learns both stops and supplies the normal closed target. Opening and closing target
+ramps, lead limits, homing consistency, torque/thermal/watchdog checks, position
+reference validity and finite/float-representability checks remain active. Normal
+opening retains its passive-release deadline; homing retains its search/release
+deadlines. Numeric travel bounds remain available in diagnostics,
+which also report `travel_limits_enabled`; homing reports this flag as `false`.
+The parameter is loaded at startup; changing it requires restarting the node
+and completing the usual calibration/readiness sequence.
+
+The same normal-opening controller is used after homing and with a valid
+manually established reference when homing is not required. The MD20 profile
+still requires complete homing before accepting ordinary motion.
+
+The 2026-10-01 restoration follows the normal-opening ramp in published baseline
+`8665938ab5e5ccba3d0f94b70b4790526eab6d30`. It additionally releases PD after a
+confirmed open endpoint; the baseline retained a position hold there. Historical
+bench results below do not validate this restoration; physical revalidation is
+pending.
+
+Opening, closing, initialization and homing set and verify the firmware
+`maxVelocity` ceiling at **1500 rad/s**, independently of the target ramps.
+This separates the firmware trip from the target ramp. The MD20/GRIP profiles
+retain a 0.04 rad closing lead and a 0.14 rad normal-opening lead, including
+after learned calibration.
+MAB documents no disabled value for this register; 1500 rad/s is its
+[documented maximum](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/MD/config_calibration.html#limits-section),
+not a commanded or guaranteed motor speed. The ROS driver does not save to flash.
+Torque, thermal, watchdog and feedback guards still apply; software travel guards
+apply when `gripper_travel_limits_enabled=true`.
+Homing uses damped torque searches in both directions, with no position lead.
+
+**Firmware v2.5.4 commissioning:** runtime register readback alone is insufficient.
+Drive 345 still tripped near 10 rad/s with `maxVelocity=1500` read back; saving
+that ceiling and rebooting removed the trip with the same driver and motion
+settings. This is consistent with a boot-loaded internal limit. Provision the
+saved ceiling once with the normal driver stopped and the drive disabled:
+load its saved configuration by rebooting, back it up with `candletool md --id ID
+config download /absolute/path/backup.cfg`, write `maxVelocity` to `1500`, then
+save and verify after reboot. Saving itself restarts this firmware; wait for
+communication to return. Compare configuration readbacks to ensure only the
+velocity ceiling changed. Re-home afterward because reboot invalidates the
+position reference. Do not save a running session's temporary homing gains or
+motion targets. See [the six-drive validation](docs/validation/2026-09-18-velocity-ceiling.md).
+
+Each closing motion starts with a target at the measured position. Each fresh feedback
 sample advances it toward the requested endpoint at the configured
-target ramp speed, bounded to `close_target_lead_rad` (closing) or
-`open_target_lead_rad` (opening) ahead of the measured
+target ramp speed, bounded to `close_target_lead_rad` ahead of the measured
 finger. The MD runs its own impedance PD controller with zero velocity
 feedforward. Closing adds host-side integral torque (`gripper_impedance_ki`,
 Nm/(rad*s)) using this bounded target error, not the remaining full sweep.
-The MD torque cap applies to the total PD + integral output. Opening uses PD
-only. Integral increments are limited to one nominal control period and
+The MD torque cap applies to the total PD + integral output. Normal opening
+uses PD only, with no integral. Integral increments are limited to one nominal control period and
 `Ki * lead` Nm/s; conditional anti-windup prevents integration farther into
 the torque cap or closing floor. Setting Ki to zero disables integration.
 
@@ -41,7 +98,7 @@ by more than the endpoint tolerance, native PD + I is restored without the
 floor. A positive net-torque minimum cannot brake an unloaded jaw; applying it
 unconditionally caused an overspeed/travel excursion on 111. The floor and
 its anti-windup return when the jaw is back inside that envelope. This is not
-a certified hard velocity limit. Opening keeps its original PD braking. Native PD acts between
+a certified hard velocity limit. Normal opening retains PD braking. Native PD acts between
 host samples, so this is not a guarantee about instantaneous measured torque
 or jaw force. Revalidate physical motion after changing this setting.
 The floor applies from closing startup through recovery (except braking) and
@@ -64,9 +121,9 @@ does not establish object presence. After entering this near-closed margin,
 object inference stays blocked until reopening farther than
 `close_object_margin_rad + close_target_lead_rad` from the closed endpoint.
 This hysteresis prevents small fingertip rebounds from repeatedly restarting
-object torque buildup and the closing deadline. Opening keeps its existing consecutive
-low-velocity/position-progress checks; sustained opening resistance disables
-the drive as an obstruction, not a successful grasp.
+object torque buildup and the closing deadline. Normal opening instead uses
+consecutive low measured and position-derived velocity for endpoint or
+obstruction detection; a known open endpoint does not require measured effort.
 
 Once object contact is inferred, the driver clears the integral and switches
 MD Kp/Kd to zero together with a feedforward command equal to the current
@@ -75,7 +132,8 @@ measured closing torque, bounded by the closing floor and torque caps. It then r
 between the closing floor and both configured torque caps. This is total torque, not 2 Nm added to PD.
 The ramp can finish after the 2-second closing deadline if contact was
 confirmed before it. Ki affects approach/reacquisition, not final object
-holding strength. Opening clears torque feedforward and restores PD.
+holding strength. Opening replaces the closing hold with its measured-position
+initial PD command and bounded target ramp.
 
 At a settled closed endpoint, `gripper_closed_hold_torque_nm` supplies a small
 closing bias (0.25 Nm total) for thin foils and deformable fingertips. It also
@@ -85,7 +143,7 @@ speed for `close_contact_duration_s`. The driver clears PD and I and commands
 the bias/cap directly, without a zero-torque step or a ramp from below the
 floor. Opening never applies this bias. Calibrated travel
 sets its direction even when starting at or slightly beyond the endpoint.
-Bias does not authorize travel beyond the configured travel guard.
+When enabled, the configured travel guard also applies during this bias.
 
 If neither an object nor a settled closed endpoint is confirmed within 2
 seconds, capture the latest closing-direction torque, bounded by the closing
@@ -119,8 +177,8 @@ Recovery can temporarily reduce grip and will try to close again if the
 object is removed. Keep fingers out and support the object against falling.
 Slow object loss can resemble compression; position/torque inference alone
 cannot reliably distinguish them. Torque caps and the endpoint guard still apply.
-Invalid/stale feedback, hardware faults and calibrated-travel violations
-still disable. Neither sensorless contact inference nor these guards are
+Invalid/stale feedback and hardware faults still disable. Calibrated-travel
+violations disable when software travel enforcement is enabled. Neither sensorless contact inference nor these guards are
 safety-rated, and motor torque is not calibrated jaw force.
 
 Friction or a jam can resemble an object; tiny objects inside the endpoint
@@ -133,25 +191,25 @@ torque must be lower than both torque caps and `kp * lead`.
 Control reuses each drive's batched position/velocity/torque feedback. The
 default timer is 50 ms. Delayed ticks advance the target by at most one
 nominal period; they do not catch up with a large setpoint jump. Gaps above
-`close_feedback_timeout_s`, invalid feedback, calibrated-travel violations,
-hardware faults and sustained opening obstruction abort the job and request drive disable. Only healthy
+`close_feedback_timeout_s`, invalid feedback, enabled calibrated-travel violations,
+hardware faults and sustained opening obstruction abort the job and request
+drive disable. Homing search/release deadline violations also fail. Only healthy
 feedback can enter object, closed-bias or deadline torque hold; faults never do. Fault/disable/new
 commands discard integral and captured-torque state.
 
-An opening deadline with healthy feedback instead sets feedforward torque,
-Kp and Kd to zero in one write and leaves the motor enabled. It remains passive
-through rebound or manual movement until a new explicit command; it does not
-retry or claim that the open endpoint was reached. Travel, feedback and hardware
-fault monitoring continue. A timeout is not proof of friction, so the log reports
-the measured position and an unconfirmed endpoint. The supervised cycle recorder
-accepts this release as a completed operation but separately records endpoint
-confirmation and verifies near-zero measured torque before the final disable.
+Normal opening releases torque, Kp and Kd together on a confirmed endpoint or
+its 0.5 s deadline, without disabling the motor. An opening timeout is not an
+endpoint confirmation or proof of friction. The passive state remains monitored
+for feedback, hardware faults and any enabled travel guards; it never retries
+opening after rebound. Applications should verify low measured torque with
+fresh feedback when unloaded release matters.
 
 Contact and endpoint holds remain monitored until replaced or disabled.
-A ready, enabled impedance drive is not disabled/re-enabled between open/close
-requests: the old command is replaced directly with the next controller's
-measured-position initial command (closing floor, or opening PD), without a
-zero-torque cancellation between repeated close requests. Init/enable and
+Repeated closing requests replace the old command directly with a controller
+starting at measured position, without a zero-torque cancellation. Normal
+opening also replaces an already-enabled impedance command directly; other
+states first require confirmed disable for setup. Normal passive release does
+not toggle enable. Init/enable and
 necessary mode changes confirm the actual MD
 `state`/`motionModeStatus` readback; an SDK acknowledgement alone is insufficient.
 Enable transitions are polled for up to 10 ms (individual transfers retain their
@@ -170,7 +228,8 @@ their bounded confirmations. Neither the braking setting nor hardware watchdog
 is changed. The
 [MD state machine](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/MD/state_machine.html)
 uses CiA402 state bits. Active jobs check enabled/impedance state in every batched
-feedback frame, including torque holds and passive opening releases. Unexpected
+feedback frame, including torque holds and the enabled passive state after opening.
+Homing releases instead require confirmed disabled state. Unexpected
 disable/mode loss aborts and logs both registers rather than reaching a misleading
 zero-torque closing timeout. An explicit enable/init is then required.
 
@@ -178,10 +237,12 @@ A setup failure never falls back to enabling a stale target. Configuration
 writes that could change gains or torque limits are rejected while moving
 or holding; cancel the operation first.
 
-Explicit disable cancels the job even if the hardware write fails. Bus
-recovery cannot restart motion. After a fault or disable, explicit
-`md/enable` or successful `md/init_devices` is required; enable establishes
-a hold at the measured position. Keep the MD hardware communication watchdog
+Explicit disable and fault stops cancel jobs and latch against automatic homing,
+even if the hardware write fails or communication is lost again later. An
+explicit home, enable or init is required to clear that latch; enable/init still
+require a valid reference, and enable establishes a hold at measured position.
+Communication recovery may schedule homing only when no such stop is latched.
+Keep the MD hardware communication watchdog
 enabled: software cannot confirm a disable across a disconnected bus.
 
 Explicit disable, fault stops and successful recovery now confirm the disabled
@@ -192,14 +253,25 @@ process termination and a disconnected bus still require the hardware watchdog.
 
 Open/close services return per-drive **command startup acknowledgments**, not final
 grasp results. Logs report `contact inferred` with the torque ramp,
-`object torque hold`, `closed endpoint`, `open endpoint`, `timeout torque hold`,
-`open: timeout released` (endpoint unconfirmed),
+`object torque hold`, `closed endpoint`, `open: open endpoint reached`,
+`timeout torque hold`, `open: timeout released` (endpoint unconfirmed),
 or `recovering from measured position`. A torque-hold event is a controller
 state, not proof that an object is securely retained.
-Abort reasons are latched in `md/health` until successful enable/init.
+Abort reasons are latched in `md/health` until explicit successful home/enable/init.
 Applications must not treat service acceptance as proof of a successful pick.
 
 ## Build and run
+
+This branch pins the audited CANdle-SDK transport changes as a submodule. Its
+source history is published on `vendor/candle-sdk-transport-20261001` in this
+same GitHub repository; that branch contains the SDK tree, not the ROS package.
+The parent commit pins the exact SDK revision, so no patch files are needed.
+After cloning, or when updating an existing checkout from the upstream SDK URL:
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
 
 ```bash
 colcon build --packages-select candle_ros2
@@ -210,6 +282,22 @@ ros2 launch candle_ros2 md_node_launch.py
 PDS-only and combined launches remain `pds_node_launch.py` and
 `both_launch.py`.
 
+To build this checkout, including uncommitted changes, into the sibling GRIP
+workspace's driver image:
+
+```bash
+cd ../grip
+CANDLE_ROS2_SOURCE=../candle_ros2 docker compose \
+  -f compose.yaml -f compose.local-candle.yaml build grip-candle-driver
+```
+
+The source must include initialized CANdle-SDK submodules. This builds
+`grip-candle-gripper:local` without changing GRIP's published dependency pin or
+starting hardware. The image records source hashes in
+`/usr/local/share/grip/candle-local-source.sha256`; `GRIP_CANDLE_LOCAL_IMAGE`
+selects a different tag. Starting it requires the same Compose override and
+robot-selection environment and physically homes the selected grippers.
+
 The node accepts `bus:=USB|SPI`, `data_rate:=1M|2M|5M|8M`,
 `usb_serial:=SERIAL` (empty selects the first available adapter), and
 `default_qos:=Reliable|BestEffort`. The MD launch exposes the settings below.
@@ -219,7 +307,7 @@ The node accepts `bus:=USB|SPI`, `data_rate:=1M|2M|5M|8M`,
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `gripper_open_position_rad` | 0.0 | Calibrated open endpoint |
-| `gripper_closed_position_rad` | 0.75 | Shared commanded closed endpoint; validate travel for each gripper; reverse direction is supported |
+| `gripper_closed_position_rad` | 0.75 | Closing direction and fallback closed target; successful homing replaces the target with each drive's measured loaded closed stop; reverse direction is supported |
 | `gripper_impedance_kp` / `gripper_impedance_kd` | 12.5 / 0.05 | MD impedance spring and damping gains |
 | `gripper_impedance_ki` | 2.0 | Host integral gain in Nm/(rad*s), closing only; zero disables it |
 | `gripper_hold_torque_nm` | 2.0 | Desired inferred-object torque, clipped to both torque caps |
@@ -227,18 +315,24 @@ The node accepts `bus:=USB|SPI`, `data_rate:=1M|2M|5M|8M`,
 | `gripper_hold_torque_ramp_nm_s` | 2.0 | Maximum object-hold torque slew, Nm/s; closing floor applies immediately and settled endpoint selects the closed bias directly |
 | `close_object_margin_rad` | 0.01 | Exclude near-closed contact from object inference; must be at least endpoint tolerance |
 | `gripper_velocity_limit_rad_s` | 1.5 | Closing target ramp speed/cap in rad/s |
-| `gripper_open_velocity_limit_rad_s` | 10.0 | Independent opening target ramp speed in rad/s; no integral; still lead-limited |
+| `gripper_open_velocity_limit_rad_s` | 10.0 | Normal-opening target ramp toward the known open endpoint; independent of the firmware velocity ceiling |
 | `gripper_torque_limit_nm` | 2.0 | Normal motor torque cap |
 | `soft_close_slow_torque_limit_nm` | 2.0 | Open/close/hold total torque cap, bounded by the normal cap |
 | `close_target_lead_rad` | 0.04 | Maximum closing target lead; also displacement that starts hold reacquisition |
-| `open_target_lead_rad` | closing lead | Maximum opening target lead; explicitly set to tune independently; omitted preserves the previous shared lead |
-| `soft_close_closed_tol_rad` | 0.005 | Open/closed endpoint tolerance |
-| `gripper_travel_min_rad` / `gripper_travel_max_rad` | -0.05 / 0.75 | Absolute position guards at motion start and throughout open/close/hold; targets must lie inside; independent of targets and settling tolerance |
-| `close_contact_torque_nm` | 0.35 | Minimum directional torque for closing contact or opening obstruction |
-| `close_contact_velocity_rad_s` | 0.03 | Object-window average velocity/range threshold; instantaneous/position-derived threshold for opening and endpoint settling |
+| `open_target_lead_rad` | closing lead | Maximum normal-opening target lead ahead of measured position; MD20 profile uses 0.14 rad |
+| `soft_close_closed_tol_rad` | 0.005 | Normal open/closed endpoint tolerance, zero-command readback and local homing settling range |
+| `gripper_travel_limits_enabled` | true | Enforce software absolute travel guards for measured positions and targets; MD20 profile sets false; finite/reference checks and calibrated closed targets remain active |
+| `gripper_travel_min_rad` / `gripper_travel_max_rad` | -0.05 / 0.80 | Fallback normal-controller guards; calibration learns the closed bound plus margin and extends the open bound only if needed to contain the measured powered stop plus tolerance |
+| `homing_travel_margin_rad` | 0.5 | Nonnegative extra normal travel beyond each drive's learned closed stop; applied after calibration |
+| `homing_torque_nm` / `homing_damping_nm_s_rad` | 1.0 / 0.5 | Homing-only search effort and damping; stop dwell needs measured directional effort at least half this torque |
+| `homing_torque_limit_nm` | 2.0 | Total search torque cap, including damping |
+| `homing_contact_duration_s` | 0.25 | Powered-stop and unloaded-release position dwell |
+| `homing_timeout_s` | 2.0 | Deadline for each powered homing search; each disabled homing release has its own fixed 3 s deadline |
+| `close_contact_torque_nm` | 0.35 | Minimum directional torque for closing contact or normal-opening obstruction |
+| `close_contact_velocity_rad_s` | 0.03 | Object-window average velocity/range threshold; instantaneous/position-derived threshold for normal opening and closed-endpoint settling |
 | `close_contact_duration_s` | 0.15 | Consecutive contact or settled-endpoint evidence required |
 | `close_timeout_s` | 2.0 | No-object closing/reacquisition torque-capture deadline |
-| `open_timeout_s` | 0.5 | Independent opening zero-torque release deadline |
+| `open_timeout_s` | 0.5 | Normal-opening passive-release deadline, including after calibration; timeout leaves the endpoint unconfirmed |
 | `close_feedback_timeout_s` | 0.25 | Maximum interval between valid control samples |
 | `joint_state_publish_period_ms` | 50 | Batched feedback and close control period |
 | `health_publish_period_ms` | 200 | Diagnostic status period |
@@ -262,8 +356,10 @@ Legacy launch parameters `soft_close_fast_torque_limit_nm`,
 `config/md20_gripper.yaml` preserves the measured MD20 tuning separately from
 the generic launch defaults. It selects closing/opening ramps of 2/10 rad/s
 and target leads of 0.04/0.14 rad, with Kp 30, Kd 0.2, closing Ki 5 and a
-100 Hz control period. The 2 Nm cap/object hold, 0.25 Nm closed-bias setting,
-0.0/0.75 rad targets, -0.05/0.75 rad travel guards and existing zeros are unchanged.
+100 Hz control period. The 2 Nm cap/object hold and 0.25 Nm closed-bias setting
+are unchanged. The profile retains 0.0/0.75 rad configured targets and
+-0.05/0.80 rad fallback guards. Successful homing now learns each drive's
+closed target and replaces its closed-side guard as described below.
 The closing lead still also controls integral slew and hold-recovery displacement;
 the opening lead does not change those closing behaviors.
 The September 17 closing-command floor uses the same 0.25 Nm setting, but
@@ -419,8 +515,9 @@ as object contact; the measured manual endpoints alone do not guarantee the
 
 ## Three-drive example
 
-With the MD20 profile, clear the opening paths, add the drives, and home them
-one at a time before normal initialization. Homing replies only after completion:
+With the MD20 profile, empty the jaws, clear the opening and closing paths,
+add the drives, and home them one at a time before normal initialization.
+Homing replies only after the full open-close-open calibration completes:
 
 ```bash
 ros2 service call /md/add_mds candle_ros2/srv/AddDevices "{device_ids: [113, 447, 111]}"
@@ -453,9 +550,9 @@ ros2 service call /md/open_gripper candle_ros2/srv/Generic "{device_ids: [111]}"
 ros2 service call /md/disable candle_ros2/srv/Generic "{device_ids: [111, 113, 447]}"
 ```
 
-Opening ramps to the configured open target at its independent speed, using
-PD only, its own target lead, and the same torque cap and travel/feedback checks. An opening
-timeout releases torque and PD to zero without disabling or claiming an open endpoint.
+After homing, normal opening ramps toward the known open endpoint with PD only.
+A settled endpoint releases all effort; a healthy 0.5 s timeout also releases,
+but reports the endpoint as unconfirmed. Neither outcome changes calibration.
 After disable, explicitly enable before sending another movement:
 
 ```bash
@@ -478,6 +575,13 @@ missing thermistor; it must not be treated as a valid thermal-test reading.
 These fields extend the ROS message: rebuild consumers against the new type.
 Health reporting does not change temperature limits or clear hardware faults.
 
+`md/zero` first disables and verifies the drive, writes zero, and checks fresh
+encoder readback before resetting the software reference. It invalidates any
+learned travel calibration and leaves the drive disabled. A successful response
+confirms zeroing only; explicit homing is required again for a calibrated gripper.
+An acknowledgement or readback failure leaves the reference faulted and motion
+inhibited. Zeroing does not establish the physical mechanical reference by itself.
+
 Normal powered encoder readings already include accumulated turns. The driver
 preserves their calibration offset, including across delayed samples.
 With `homing_required=false`, the legacy position recovery heuristic uses `encoder_wrap_period_rad`
@@ -491,54 +595,104 @@ uncertain, calibrate at the mechanical open stop before enabling.
 
 ### Mechanical-stop homing (MD20 profile)
 
-`homing_required=true` blocks normal motion until `/md/home` succeeds. GRIP calls
+`homing_required=true` blocks normal motion until `/md/home` succeeds. The
+existing service performs the complete open-close-open calibration; there is no
+separate calibration service. Its deferred success response is sent only after
+all three searches, releases, and final reference verification complete. GRIP calls
 it sequentially on every launch. The service accepts exactly one ID; concurrent
 searches and configuration changes during a search are rejected. On a returning
 drive after communication/power loss, the driver schedules one homing attempt,
 one drive at a time in discovery order. It never resumes a previous grasp.
-An explicit disable cancels pending automatic homing. A search failure leaves
-the reference invalid and requires an explicit retry, not an endless retry loop.
+An explicit disable or fault stop cancels pending automatic homing and keeps it
+blocked across subsequent communication losses. A search failure leaves the
+reference invalid and requires an explicit retry, not an endless retry loop.
 
-Homing uses **1 Nm opening effort with damping and a 2 Nm cap**, then releases and
-zeros only after unloaded settling:
+Homing requires **empty jaws and unobstructed opening and closing paths**.
+An explicit home also requires `gripper_open_position_rad=0.0` and
+`init_devices_zero=false`, so later initialization cannot replace the learned reference.
+Every search uses 1 Nm in its search direction, Kp=0, Kd=0.5 Nm/(rad/s), zero target
+velocity, and a 2 Nm cap. There is no position spring, integral, or stop at a
+previous target. The sequence is:
 
-1. Apply 1 Nm in the opening direction (-1 Nm on these grippers), Kp=0 and
-   Kd=0.5 Nm/(rad/s) with zero target velocity. Damping softens the approach;
-   at rest the full 1 Nm presses against the opening stop. There is no position
-   spring, integral, absolute endpoint, or stop at the old zero.
-2. Require a position range <=0.005 rad for 0.25 s. Movement resets the dwell;
-   measured torque does not have to reach the cap.
-3. Clear PD/torque and disable, then allow rebound without a distance limit.
-4. Require a fresh 0.25 s position window <=0.005 rad with torque magnitude <=0.1 Nm.
-5. Zero while disabled, verify the new reference, restore normal limits and release at 0 Nm.
+1. Search toward the open stop (-1 Nm on these grippers). Require a position
+   range <=0.005 rad and measured directional torque >=0.5 Nm for 0.25 s.
+   Movement or effort below half the requested seek torque resets the dwell;
+   stationary idle feedback cannot establish a stop. Clear PD/torque and
+   disable, allow rebound, then require a fresh 0.25 s position window <=0.005 rad
+   with torque magnitude <=0.1 Nm. Set and verify the open zero while disabled.
+2. Search toward the closed stop with the same effort and settling checks.
+   Record this drive's loaded closed endpoint in the new open frame, then clear
+   PD/torque, disable, and wait for unloaded settling. Rebound does not replace
+   the recorded loaded endpoint.
+3. Search toward the open stop again and record its powered position in the
+   established zero frame (`openPosition`). Clear PD/torque, disable, and wait for
+   unloaded settling. Accept a settled offset from the original open zero without
+   re-zeroing; retain and report the measured position. Restore normal limits and
+   enter the normal released-ready state at 0 Nm after settling completes.
+
+Successful homing uses that drive's learned loaded endpoint as its normal closed
+target. For positive-direction closure, its normal maximum position is
+`learned_closed_endpoint + homing_travel_margin_rad`. Its minimum is
+`min(configured_minimum, learned_powered_open - endpoint_tolerance)` to contain
+the measured loaded stop. For negative-direction closure, the minimum
+becomes `learned_closed_endpoint - homing_travel_margin_rad` and the maximum is
+`max(configured_maximum, learned_powered_open + endpoint_tolerance)`. The default
+closed-side margin is **0.5 rad**; the open-side allowance is only the unchanged
+endpoint tolerance. Homing has no preset position or travel bounds;
+these normal-motion bounds are applied after complete calibration only when
+`gripper_travel_limits_enabled=true`.
+Calibration is held per drive in memory and is invalidated by zeroing, reference
+loss, or starting another home. A partial or failed home never installs it.
 
 `homing_torque_nm=1.0`, `homing_damping_nm_s_rad=0.5`, `homing_torque_limit_nm=2.0`,
-`homing_contact_duration_s=0.25`, `homing_timeout_s=2.0` (separate search/release
-deadlines), and `homing_max_travel_rad=0.85` (powered search only).
-The firmware cap bounds the combined feedforward/damping demand. Normal opening
-still targets 0.00 rad with its own 10 rad/s ramp and 0.5 s timeout;
-closing keeps its 2 s deadline. Neither normal deadline controls homing.
+`homing_contact_duration_s=0.25` and `homing_timeout_s=2.0` configure the stop
+dwell and each powered-search deadline. Each disabled release has a separate
+3 s deadline (`ImpedanceHome::Config::releaseTimeout`, not a ROS parameter).
+Searches and disabled releases have no preset position or travel bound, allowing
+the sequence to measure the actual stops. Service callers must allow **three
+search deadlines plus three release deadlines, plus setup and communication
+time** per drive: 15 s plus overhead with the defaults. GRIP allows at least
+30 s per home service call. Startup callers using the former single-search
+budget must increase it.
+The firmware cap bounds the combined feedforward/damping demand during homing.
+These search, effort-dwell and disabled-release rules apply only to calibration.
+Normal opening targets the known open position with its independent 10 rad/s
+PD ramp, 0.14 rad lead and 0.5 s passive-release deadline. It never reuses a stop
+search or changes the learned calibration. Closing keeps its separate 2 s
+torque-capture deadline. Software travel guards apply to normal motion only
+when `gripper_travel_limits_enabled=true`; the MD20 profile keeps them disabled.
 
 There is no measured-speed homing abort or velocity-based settling criterion.
-The ordinary firmware velocity limit remains active (10 rad/s in MD20/GRIP).
-The firmware torque cap and ordinary velocity limit are read back before enable.
-Excess powered-search travel, reverse travel, stale/nonfinite feedback or
+The firmware velocity ceiling is 1500 rad/s, independently of the normal-motion
+target ramps. The torque cap and velocity ceiling are read back before enable.
+Reverse travel, stale/nonfinite feedback or
 unhealthy hardware still aborts. Measured torque above the cap plus 0.1 Nm also
 aborts; a configured cap is not a guarantee that reported torque cannot overshoot.
 A nonzero hardware watchdog of at most 250 ms is required. Existing restrictive
 firmware position limits are rejected rather than silently removed.
 
-Timeout or reaching the search bound is never success. Nothing is saved to flash.
-The former `homing_velocity_limit_rad_s`, `homing_release_max_travel_rad`,
+A homing timeout is never success. The learned guards are
+software checks; firmware position limits and flash contents are unchanged.
+The former `homing_max_travel_rad`, `homing_velocity_limit_rad_s`, `homing_release_max_travel_rad`,
 `homing_ramp_speed_rad_s`, `homing_target_lead_rad` and `homing_contact_torque_nm`
 parameters are removed.
 
-**Startup/power restoration can move the grippers: keep opening paths clear.**
-Sensorless homing assumes a repeatable mechanical stop and cannot distinguish
-it from a jam. The torque settings are control limits, not guaranteed
-collision-force bounds. Ordinary opening stays at its separate 10 rad/s setting.
+**Startup/power restoration can open, close, and reopen the grippers: keep
+the jaws empty and both paths clear.** Sensorless homing assumes repeatable
+mechanical stops. A closed-stop search can mistake an object or jam for the
+mechanical endpoint; a successful sensorless sequence does not prove the closing
+path was unobstructed. The torque settings are control limits, not guaranteed
+collision-force bounds. Homing torque searches have no commanded velocity ramp;
+normal opening has the separate target ramp described above.
 
 ## Tests
+
+Core tests cover effort-qualified homing, independent loaded stop calibration,
+homing search/release deadlines and accepted released offsets. Normal-opening
+regressions cover the independent ramp and lead, endpoint and timeout passive
+release, unchanged calibration, obstruction and invalid/stale feedback. Command-safety tests cover persistent disable recovery
+gates and invalid register values. These are offline checks; they do not establish
+physical endpoint repeatability or grip retention.
 
 Hardware-free control and position regression tests:
 
@@ -624,6 +778,102 @@ sequence for 111, 113, and 447. It requires confirmation, preserves zeros by
 default, and exercises motors individually. Use `--zero` only at a verified
 open reference. Its service acknowledgments alone do not verify a grasp;
 inspect feedback and outcomes during commissioning.
+
+## Fault diagnostics
+
+The driver emits `CANDLE_DIAG { ... }` JSON records through its existing ROS
+logger. Preserve the container/ROS logs to retain them; no separate recorder,
+topic, register write, error clearing, or automatic recovery is introduced.
+`schema` is currently `1`. `drive_id`, ROS nanoseconds, and monotonic nanoseconds
+identify the drive and time. `fault_sequence` is scoped to one node process.
+
+- `drive_fault` captures bounded memory **before** the existing stop request
+  erases the controller job or disables the drive. Logging occurs in the next
+  health callback, with separate capture and emission times. A normal node
+  shutdown also flushes pending faults after its existing disable sequence,
+  without any additional diagnostic register reads. Explicit `/disable`
+  requests do not create or rate-limit a fault record. `at_stop` is the
+  latest feedback sample, including its validity and age, raw/logical position,
+  velocity, torque, state/mode, last attempted impedance command and write
+  result, gains, command timestamp, learned travel, torque/feedback/time limits,
+  and measured feedback interval. Impedance command target velocity is zero;
+  the independent firmware/profile velocity limits appear in register records.
+  The sample's controller fields describe the state before that feedback was
+  processed; `controller_state_at_capture`, `phase_at_capture`, and the
+  elapsed/settled fields at capture describe the resulting fault state.
+- `fault_history` records the preceding 64 samples at **at most 20 Hz**, in
+  chronological chunks of eight. The exact most recent tick is retained in
+  `at_stop` even when it fell between history samples. Match chunks by drive,
+  sequence and `offset`. Repeated fault captures are limited to one per drive
+  per second and one pending record; `suppressed_faults` reports coalesced calls.
+- `register_snapshot` reads one of six groups listed below. Communication
+  status is read **even when quick status is zero**;
+  `communication_can_watchdog_warning` decodes communication bit 30.
+  `miscStatus` (`0x813`) is never queried: a disabled-drive single-register
+  probe timed out on the deployed firmware. Its JSON value is `null`, with
+  `misc_status_queried: false`.
+- `diagnostic_polling_disabled` reports the first optional read failure. The
+  entire node permanently stops optional diagnostic polling until restart;
+  cached feedback history and fault logging continue. There are no retries,
+  including post-fault refreshes.
+
+| Group | Registers | MD request bytes | Full USB OUT bytes |
+|---|---|---:|---:|
+| `status_core` | Quick, main/aux encoder, calibration, bridge status | 30 | 35 |
+| `status_protection` | Hardware, communication, motion, homing status | 26 | 31 |
+| `command` | State, mode, CAN watchdog, Kp, Kd, max torque | 31 | 36 |
+| `targets` | Position/velocity/torque targets, max velocity, profile velocity | 32 | 37 |
+| `limits_supply` | Position min/max, DC bus voltage | 20 | 25 |
+| `thermal` | Motor/MOSFET temperature, motor shutdown temperature | 17 | 22 |
+
+MD sizes include the two-byte MD header and each register address. USB sizes
+also include CANdle's five-byte synchronous request envelope. These exact
+six groups completed 54 disabled-drive reads across all six deployed drives
+on 2026-09-30, with a maximum observed duration below 1 ms. This is a read-only
+compatibility check, not proof of timing under motion.
+
+Every register group has its own start/end timestamps, duration, `read_ok` and
+`read_error`. Use `read_ok` as the success flag: the SDK enum encodes `OK` as
+`1`, not zero. Failed reads have `values: null`; non-finite numbers are JSON
+`null`. Groups are separate transactions, **not an atomic drive snapshot**.
+Fault records embed the previously cached groups with their original times;
+calculate their age instead of treating them as measurements at the fault.
+Priority follow-up groups carry the fault sequence and
+`after_fault_stop_request: true`: they show registers after a disable was
+requested, potentially after its mode/command changes, not the pre-stop state.
+`disable_pending` distinguishes an outstanding disable transition.
+
+Diagnostics reuse existing control feedback without additional reads. Extra
+register traffic is limited globally to **one read-only batch of at most
+32 MD bytes / 37 full USB OUT bytes per health callback, no more often than
+every 200 ms**. Six groups rotate through the drives (nominally 7.2 seconds
+per complete sweep for six drives at 200 ms); pending faults take priority.
+No optional reads occur while any drive is homing or any disable transition
+is pending. When homing is required, the complete initial calibration of all
+known drives must finish before polling starts, including the gaps between
+sequential homings. This startup readiness remains latched after a later
+fault so post-stop registers can be inspected once disable completes.
+`homing_required=false` bypasses only the initial-calibration requirement.
+
+Reads use local register objects, never overwrite the control cache, and run
+in the existing mutually exclusive callback group. A read failure opens the
+optional-polling circuit permanently for that node process and makes no new
+control or health decision. In-memory fault logging runs even when polling
+is gated or disabled. The first diagnostic read after a fault occurs only
+after the existing stop path and every pending disable have completed.
+
+Integer state codes follow the controller enums:
+
+| Field | Values |
+|---|---|
+| `operation` | 0 idle/no supervised job; 1 homing; 2 reserved (retired calibrated-open controller, historical traces only); 3 close; 4 normal open |
+| Homing `phase` | 0 opening; 1 closing; 2 reopening; 3 ready; 4 failed |
+| Homing `control_state` | 0 searching; 1 found; 2 releasing; 3 ready; 4 failed |
+| Close/normal-open `phase` and `control_state` | 0 approaching (enum `Closing`); 1 contact; 2 endpoint reached (enum `Closed`); 3 torque hold; 4 failed. For normal opening, states 2 and 3 both release all effort; state 3 leaves the endpoint unconfirmed. |
+
+`-1` denotes an unavailable phase/state. These diagnostics establish software
+commands and measured drive behavior; they do not establish physical jaw gap,
+object retention, or the internal firmware cause of a fault.
 
 ## MAB documentation
 

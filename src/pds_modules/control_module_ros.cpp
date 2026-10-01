@@ -30,12 +30,13 @@ void ControlModuleRos::publishStatus()
 
     msg.header.stamp = m_parentNode->get_clock()->now();
 
-    m_controlModule->getBusVoltage(msg.bus_voltage);
-    m_controlModule->getBatteryVoltageLevels(msg.battery_voltage_level_1,
-                                             msg.battery_voltage_level_2);
-    m_controlModule->getBrakeResistorTriggerVoltage(msg.brake_trigger_voltage);
-    m_controlModule->getTemperature(msg.temperature);
-    m_controlModule->getTemperatureLimit(msg.temperature_limit);
+    if (m_controlModule->getBusVoltage(msg.bus_voltage) != mab::PdsModule::error_E::OK ||
+        m_controlModule->getBatteryVoltageLevels(msg.battery_voltage_level_1,
+                  msg.battery_voltage_level_2) != mab::PdsModule::error_E::OK ||
+        m_controlModule->getBrakeResistorTriggerVoltage(msg.brake_trigger_voltage) != mab::PdsModule::error_E::OK ||
+        m_controlModule->getTemperature(msg.temperature) != mab::PdsModule::error_E::OK ||
+        m_controlModule->getTemperatureLimit(msg.temperature_limit) != mab::PdsModule::error_E::OK)
+        return;
 
     pubData->publish(msg);
 }

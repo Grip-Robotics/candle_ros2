@@ -16,7 +16,8 @@ struct ImpedanceClose
         double openLead = 0.04;         // rad: independent opening target error
         double tolerance = 0.005;       // rad: settled endpoint
         double travelMin = -0.05;      // rad: absolute guards, independent of targets
-        double travelMax = 0.75;
+        double travelMax = 0.80;
+        bool travelLimitsEnabled = true; // Normal-operation absolute position guards.
         double contactTorque = 0.35;   // Nm, signed in the commanded direction
         double contactVelocity = 0.03; // rad/s
         double contactDuration = 0.15; // s of consecutive contact/endpoint evidence
@@ -35,7 +36,8 @@ struct ImpedanceClose
 
         bool withinTravel(double position) const
         {
-            return std::isfinite(position) && position >= travelMin && position <= travelMax;
+            return std::isfinite(position) &&
+                   (!travelLimitsEnabled || (position >= travelMin && position <= travelMax));
         }
     };
 
@@ -91,7 +93,7 @@ struct ImpedanceClose
 
     Command command() const
     {
-        if (state == State::Failed)
+        if (state == State::Failed || (opening && state == State::Closed))
             return {target, 0.0, 0.0, 0.0};
         if (state == State::TorqueHold ||
             (!opening && (state == State::Contact || state == State::Closed)))
@@ -114,9 +116,10 @@ struct ImpedanceClose
         if (!std::isfinite(position) || !std::isfinite(velocity) || !std::isfinite(torque) ||
             !std::isfinite(dt) || dt <= 0.0 || dt > config.feedbackTimeout)
             return fail();
-        // Opening timeout is a passive release, not a hold to reacquire after rebound.
+        // Reaching the known open endpoint or timing out releases all effort.
+        // Neither outcome starts another stop search after elastic rebound.
         // Keep the job alive so feedback and the node's travel/fault guards still run.
-        if (opening && state == State::TorqueHold)
+        if (opening && (state == State::TorqueHold || state == State::Closed))
             return state;
 
         const double step = std::min(dt, config.maxStep);

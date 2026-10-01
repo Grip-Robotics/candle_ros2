@@ -81,7 +81,8 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("soft_close_profile_deceleration_rad_s2", 100.0);
     node->declare_parameter<double>("soft_close_closed_tol_rad", 0.005);
     node->declare_parameter<double>("gripper_travel_min_rad", -0.05);
-    node->declare_parameter<double>("gripper_travel_max_rad", 0.75);
+    node->declare_parameter<double>("gripper_travel_max_rad", 0.80);
+    node->declare_parameter<bool>("gripper_travel_limits_enabled", true);
     node->declare_parameter<int>("soft_close_fast_duration_ms", 300);
     node->declare_parameter<double>("close_target_lead_rad", 0.04);
     node->declare_parameter<double>("open_target_lead_rad",
@@ -105,7 +106,7 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("homing_torque_nm", 1.0);
     node->declare_parameter<double>("homing_damping_nm_s_rad", 0.5);
     node->declare_parameter<double>("homing_torque_limit_nm", 2.0);
-    node->declare_parameter<double>("homing_max_travel_rad", 0.85);
+    node->declare_parameter<double>("homing_travel_margin_rad", 0.5);
     node->declare_parameter<double>("homing_contact_duration_s", 0.25);
     node->declare_parameter<double>("homing_timeout_s", 2.0);
 
@@ -139,6 +140,7 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.close.tolerance = node->get_parameter("soft_close_closed_tol_rad").as_double();
     params.close.travelMin = node->get_parameter("gripper_travel_min_rad").as_double();
     params.close.travelMax = node->get_parameter("gripper_travel_max_rad").as_double();
+    params.close.travelLimitsEnabled = node->get_parameter("gripper_travel_limits_enabled").as_bool();
     params.close.contactTorque = node->get_parameter("close_contact_torque_nm").as_double();
     params.close.contactVelocity = node->get_parameter("close_contact_velocity_rad_s").as_double();
     params.close.contactDuration = node->get_parameter("close_contact_duration_s").as_double();
@@ -167,7 +169,8 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.home.seekTorque = node->get_parameter("homing_torque_nm").as_double();
     params.home.damping = node->get_parameter("homing_damping_nm_s_rad").as_double();
     params.home.torque = node->get_parameter("homing_torque_limit_nm").as_double();
-    params.home.maxTravel = node->get_parameter("homing_max_travel_rad").as_double();
+    params.homing_travel_margin_rad =
+        node->get_parameter("homing_travel_margin_rad").as_double();
     params.home.contactDuration = node->get_parameter("homing_contact_duration_s").as_double();
     params.home.timeout = node->get_parameter("homing_timeout_s").as_double();
     return params;

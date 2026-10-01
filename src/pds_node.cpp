@@ -35,6 +35,18 @@ void PdsNode::cbAddPds(const std::shared_ptr<candle_ros2::srv::AddDevices::Reque
 
     for (auto id : req->device_ids)
     {
+        if (id == 0)
+        {
+            RCLCPP_WARN(get_logger(), "Invalid PDS CAN ID rejected: %u", id);
+            rsp->success.push_back(false);
+            continue;
+        }
+        if (std::any_of(m_pdsList.begin(), m_pdsList.end(),
+                        [id](const auto& existing) { return existing.pds->getCanId() == id; }))
+        {
+            rsp->success.push_back(true);
+            continue;
+        }
         pdsInstance_S instance = pdsInstance_S{};
 
         instance.pds = std::make_unique<mab::Pds>(id, m_candle.get());
@@ -73,6 +85,7 @@ void PdsNode::cbAddPds(const std::shared_ptr<candle_ros2::srv::AddDevices::Reque
             continue;
         }
 
+        bool setupComplete = true;
         for (int i = 0; i < 6; i++)
         {
             mab::moduleType_E type = pdsModules.*(sockets[i]);
@@ -88,7 +101,15 @@ void PdsNode::cbAddPds(const std::shared_ptr<candle_ros2::srv::AddDevices::Reque
                                NODE_PREFIX,
                                PUB_TIMER_MS))
                     instance.modules.push_back(std::move(mod));
+                else
+                    setupComplete = false;
             }
+        }
+        if (!setupComplete)
+        {
+            RCLCPP_ERROR(get_logger(), "Failed to setup a module for PDS id %u", id);
+            rsp->success.push_back(false);
+            continue;
         }
 
         m_pdsList.emplace_back(std::move(instance));

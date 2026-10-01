@@ -3,7 +3,7 @@
 #include "candle_ros2/impedance_close.hpp"
 #include <limits>
 
-// Relative, opening-only search. A stop is only inferred: an obstruction can
+// Directional stop search without a preset travel range. A stop is only inferred: an obstruction can
 // look identical. The caller must provide a clear path and a repeatable stop.
 struct ImpedanceHome
 {
@@ -12,9 +12,9 @@ struct ImpedanceHome
         double seekTorque = 1.0; // Opening effort at rest; damping softens arrival at the stop.
         double damping = 0.5;    // Nm/(rad/s), runs in the MD impedance loop, Kp=0.
         double torque = 2.0;
-        double maxTravel = 0.85;
         double contactDuration = 0.25;
         double timeout = 2.0;
+        double releaseTimeout = 3.0; // Passive rebound can outlast the powered search.
     };
     enum class State { Searching, Found, Releasing, Ready, Failed };
     Config config;
@@ -35,13 +35,14 @@ struct ImpedanceHome
         : config(home), motion(settings), start(position), direction(openingDirection),
           previousPosition(position), settledMin(position), settledMax(position)
     {
-        for (double v : {home.seekTorque, home.damping, home.torque, home.maxTravel, home.contactDuration,
-                         home.timeout, motion.tolerance, motion.maxStep,
+        for (double v : {home.seekTorque, home.damping, home.torque, home.contactDuration,
+                         home.timeout, home.releaseTimeout, motion.tolerance, motion.maxStep,
                          motion.feedbackTimeout, motion.torqueLimit})
             if (!std::isfinite(v) || v <= 0.0)
                 throw std::invalid_argument("homing settings must be finite and positive");
         if (!std::isfinite(position) || std::abs(direction) != 1.0 ||
-            home.contactDuration >= home.timeout || home.seekTorque > home.torque ||
+            home.contactDuration >= home.timeout || home.contactDuration >= home.releaseTimeout ||
+            home.seekTorque > home.torque ||
             motion.maxStep > motion.feedbackTimeout || home.torque > motion.torqueLimit)
             throw std::invalid_argument("invalid homing torque/gain/timing bounds");
     }
@@ -52,11 +53,16 @@ struct ImpedanceHome
             return state;
         const double travel = direction * (position - start);
         if (!fresh(position, velocity, torque, dt) ||
-            travel > config.maxTravel || travel < -motion.tolerance ||
+            !std::isfinite(travel) || travel < -motion.tolerance ||
             std::abs(torque) > config.torque + 0.1)
             return state = State::Failed;
         previousPosition = position;
-        if (settled(position, dt)) state = State::Found;
+        // Stationary feedback alone is also produced by an unpowered drive.
+        // Require measured effort in the search direction for the entire dwell;
+        // half the requested effort tolerates control ripple without accepting
+        // the millinewton-metre idle readings seen from a disabled output.
+        if (settled(position, dt, direction * torque >= 0.5 * config.seekTorque))
+            state = State::Found;
         return state;
     }
 
@@ -81,6 +87,8 @@ struct ImpedanceHome
         if (!fresh(position, velocity, torque, dt))
             return state = State::Failed;
         previousPosition = position;
+        // Passive rebound need only settle unloaded; its absolute offset from
+        // the first open zero is telemetry, not a readiness condition.
         if (settled(position, dt, std::abs(torque) <= .1)) state = State::Ready;
         return state;
     }
@@ -90,7 +98,8 @@ struct ImpedanceHome
     {
         elapsed += dt;
         return std::isfinite(position) && std::isfinite(velocity) && std::isfinite(torque) &&
-               std::isfinite(dt) && dt > 0.0 && dt <= motion.feedbackTimeout && elapsed < config.timeout;
+               std::isfinite(dt) && dt > 0.0 && dt <= motion.feedbackTimeout &&
+               elapsed < (state == State::Releasing ? config.releaseTimeout : config.timeout);
     }
 
     bool settled(double position, double dt, bool unloaded = true)
