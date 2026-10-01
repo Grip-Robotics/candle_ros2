@@ -32,7 +32,7 @@ namespace mab
             case LIBUSB_ERROR_INVALID_PARAM:
                 return "Invalid parameter.";
             case LIBUSB_ERROR_IO:
-                return "Success (no error)";
+                return "USB input/output error";
             case LIBUSB_ERROR_NO_DEVICE:
                 return NO_DRIVER_EXTENDED_HELPER_MESSAGE;
             case LIBUSB_ERROR_NO_MEM:
@@ -155,8 +155,12 @@ namespace mab
             m_log.error(message.c_str());
             throw std::runtime_error(message);
         }
-        return static_cast<libusb_error>(
-            libusb_bulk_transfer(m_devHandle, m_outEndpointAddress, data, length, NULL, timeout));
+        int actualLen = 0;
+        const auto error = static_cast<libusb_error>(
+            libusb_bulk_transfer(m_devHandle, m_outEndpointAddress, data, length, &actualLen, timeout));
+        if (error == LIBUSB_SUCCESS && (actualLen < 0 || static_cast<size_t>(actualLen) != length))
+            return LIBUSB_ERROR_IO;
+        return error;
     }
     libusb_error LibusbDevice::receive(u8* data, const size_t length, const u32 timeout)
     {
@@ -167,6 +171,8 @@ namespace mab
             m_log.error(message.c_str());
             throw std::runtime_error(message);
         }
+        if (length > m_rxBuffer.size())
+            return LIBUSB_ERROR_OVERFLOW;
         if (length == 0)
             m_log.warn("Requesting emtpy receive!");
         std::memset(data, 0, length);
@@ -186,9 +192,12 @@ namespace mab
             m_log.warn("Received length of %d does not match expected length of %d bytes",
                        actualLen,
                        length);
+        if (err != LIBUSB_SUCCESS)
+            return err;
+        if (actualLen < 0 || static_cast<size_t>(actualLen) < length)
+            return LIBUSB_ERROR_IO;
         std::memcpy(data, m_rxBuffer.data(), length);
-
-        return err;
+        return LIBUSB_SUCCESS;
     }
 
     libusb_error LibusbDevice::unclogInput()

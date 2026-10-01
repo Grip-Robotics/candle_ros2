@@ -101,7 +101,7 @@ namespace mab
             m_log.error("Reset failed!");
             return result;
         }
-        if (resetCmd.at(1) != 0x1)
+        if (resetCmd.size() < 2 || resetCmd[1] != 0x1)
         {
             m_log.error("Reset failed!");
             return candleTypes::Error_t::UNKNOWN_ERROR;
@@ -184,6 +184,9 @@ namespace mab
                                              size_t           responseLength,
                                              const u32        timeoutMs) const
     {
+        // A synchronous request and the asynchronous packed-frame worker share
+        // one bus. Keep each write/read transaction together.
+        std::unique_lock busLock(m_busTransferMux);
         if (data == nullptr)
         {
             m_log.error("Data vector broken!");
@@ -256,15 +259,20 @@ namespace mab
                         64 /*TODO: this is legacy Candle stuff*/ + 2 /*response header size*/,
                         timeoutMs + 1);
 
-        if (buffer.at(1) != 0x01)
+        // Error responses may contain stale or incomplete bytes. Never interpret
+        // them as a successful device acknowledgement.
+        if (communicationStatus != candleTypes::Error_t::OK)
+            return {{}, communicationStatus};
+        if (buffer.size() < 2)
+            return {{}, candleTypes::Error_t::DATA_EMPTY};
+        if (buffer[1] != 0x01)
         {
             m_log.error("CAN frame did not reach target device with id: %d!", canId);
             return std::pair<std::vector<u8>, candleTypes::Error_t>(
                 dataToSend, candleTypes::Error_t::CAN_DEVICE_NOT_RESPONDING);
         }
 
-        if (buffer.size() > 3)
-            buffer.erase(buffer.begin(), buffer.begin() + 2 /*response header size*/);
+        buffer.erase(buffer.begin(), buffer.begin() + 2 /*response header size*/);
 
         auto response = buffer;
 

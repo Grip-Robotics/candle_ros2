@@ -92,8 +92,18 @@ namespace mab
 
         std::unordered_map<u64, std::vector<u8>> m_packedFrames = {
             std::make_pair<u64, std::vector<u8>>(0, {CANdleFrame::DTO_PARSE_ID, 0x1, 0x0})};
-        std::unordered_map<u64, std::array<std::vector<u8>, FRAME_BUFFER_SIZE>> m_responseBuffer;
-        std::unordered_map<u64, std::condition_variable>                        m_notifiers;
+        struct PendingBatch
+        {
+            std::array<canId_t, FRAME_BUFFER_SIZE> targetIds{};
+            std::array<std::pair<std::vector<u8>, Error_t>, FRAME_BUFFER_SIZE> results{};
+            std::condition_variable ready;
+            size_t readers = 0;
+            size_t count = 0;
+            bool received = false;
+        };
+        // Waiters retain the batch so timeout cleanup cannot destroy a condition
+        // variable while another thread is still waiting on it.
+        std::unordered_map<u64, std::shared_ptr<PendingBatch>> m_pendingBatches;
 
         std::mutex m_mutex;
         // std::condition_variable   m_cv;

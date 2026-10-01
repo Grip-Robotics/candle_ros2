@@ -134,6 +134,7 @@ namespace mab
         const size_t m_maxCANFrameSize     = 64;
 
         mutable std::mutex                         m_cfSyncMux;
+        mutable std::mutex                         m_busTransferMux;
         std::shared_ptr<std::function<void(void)>> m_cfsync;
         CANdleFrameAdapter                         m_cfAdapter;
         std::jthread                               m_cfTransferThread;

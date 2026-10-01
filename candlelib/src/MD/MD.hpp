@@ -330,9 +330,6 @@ namespace mab
                 return Error_t::REQUEST_INVALID;
             }
 
-            // clear all the values for the incoming data from the MD
-            std::apply([&](auto&&... reg) { ((reg.clear()), ...); }, regs);
-
             // Add protocol read header [0x41, 0x00]
             std::vector<u8> frame;
             frame.push_back((u8)MdFrameId_E::READ_REGISTER);
@@ -348,18 +345,8 @@ namespace mab
                 m_log.error("Error while reading register!");
                 return Error_t::TRANSFER_FAILED;
             }
-            // TODO: for some reason MD sends first byte as 0x0, investigate
-            //  if (readRegResult.first.at(0) == 0x41)
-            //  {
-            //      readRegResult.first.erase(
-            //          readRegResult.first.begin(),
-            //          readRegResult.first.begin() + 2);  // delete response header
-            //  }
-            //  else
-            //  {
-            //      m_log.error("Error while parsing response!");
-            //      return std::pair(regs, Error_t::TRANSFER_FAILED);
-            //  }
+            if (!validReadResponse(readRegResult.first, regs))
+                return Error_t::TRANSFER_FAILED;
             // delete response header
             readRegResult.first.erase(readRegResult.first.begin(), readRegResult.first.begin() + 2);
             bool deserializeFailed = deserializeMDRegisters(readRegResult.first, regs);
@@ -397,6 +384,8 @@ namespace mab
         inline std::future<Error_t> readRegistersAsync(std::tuple<MDRegisterEntry_S<T>&...> regs)
         {
             m_log.debug("Submitting register read frame...");
+            if (m_candle == nullptr || !readableRegisters(regs))
+                return std::async(std::launch::deferred, [] { return Error_t::REQUEST_INVALID; });
 
             // Add protocol read header [0x41, 0x00]
             std::vector<u8> frame;
@@ -418,7 +407,7 @@ namespace mab
                 {
                     auto readRegResult = readRegResultFuture.get();
                     if (readRegResult.second != CANdleFrameAdapter::Error_t::OK ||
-                        readRegResult.first.size() < 3)
+                        !validReadResponse(readRegResult.first, regs))
                     {
                         return Error_t::TRANSFER_FAILED;
                     }
@@ -492,9 +481,9 @@ namespace mab
             frame.insert(frame.end(), payload.begin(), payload.end());
             auto readRegResult = transferCanFrame(frame, DEFAULT_RESPONSE_SIZE);
 
-            MdFrameId_E frameId = (MdFrameId_E)readRegResult.first.at(0);
-            if (frameId == MdFrameId_E::RESPONSE_LEGACY || frameId == MdFrameId_E::WRITE_REGISTER)
-                return Error_t::OK;  // TODO: Possible do smth with received data?
+            if (readRegResult.second == candleTypes::Error_t::OK &&
+                validWriteResponse(readRegResult.first))
+                return Error_t::OK;
             else
             {
                 m_log.error("Error in the register write response!");
@@ -519,6 +508,8 @@ namespace mab
         inline std::future<Error_t> writeRegistersAsync(std::tuple<MDRegisterEntry_S<T>&...>& regs)
         {
             m_log.debug("Submitting frame transfer request...");
+            if (m_candle == nullptr || !writableRegisters(regs))
+                return std::async(std::launch::deferred, [] { return Error_t::REQUEST_INVALID; });
 
             std::vector<u8> frame;
             frame.push_back((u8)MdFrameId_E::WRITE_REGISTER_LEGACY);
@@ -533,7 +524,8 @@ namespace mab
                        writeRegResultFuture) -> Error_t
                 {
                     auto result = writeRegResultFuture.get();
-                    if (result.second == CANdleFrameAdapter::Error_t::OK)
+                    if (result.second == CANdleFrameAdapter::Error_t::OK &&
+                        validWriteResponse(result.first))
                         return Error_t::OK;
                     else
                         return Error_t::TRANSFER_FAILED;
@@ -572,6 +564,55 @@ namespace mab
 
       private:
         Candle* const m_candle;
+
+        static bool validWriteResponse(const std::vector<u8>& response)
+        {
+            // Both supported MD protocols include a two-byte response header.
+            // The remaining legacy response contains telemetry, not an ACK flag.
+            return response.size() >= 2 &&
+                   (response[0] == static_cast<u8>(MdFrameId_E::RESPONSE_LEGACY) ||
+                    response[0] == static_cast<u8>(MdFrameId_E::WRITE_REGISTER));
+        }
+
+        template <class... T>
+        static bool readableRegisters(const std::tuple<MDRegisterEntry_S<T>&...>& regs)
+        {
+            return std::apply([](const auto&... reg)
+                { return ((reg.m_accessLevel != RegisterAccessLevel_E::WO) && ...); }, regs);
+        }
+
+        template <class... T>
+        static bool writableRegisters(const std::tuple<MDRegisterEntry_S<T>&...>& regs)
+        {
+            return std::apply([](const auto&... reg)
+                { return ((reg.m_accessLevel != RegisterAccessLevel_E::RO) && ...); }, regs);
+        }
+
+        template <class... T>
+        static bool validReadResponse(const std::vector<u8>& response,
+                                      const std::tuple<MDRegisterEntry_S<T>&...>& regs)
+        {
+            // Older MD firmware returns 0 instead of READ_REGISTER in byte 0.
+            if (response.size() < 2 ||
+                (response[0] != 0 && response[0] != static_cast<u8>(MdFrameId_E::READ_REGISTER)))
+                return false;
+            size_t offset = 2;
+            bool valid = true;
+            const auto validate = [&](const auto& reg)
+            {
+                if (!valid || response.size() - offset < reg.getSerializedSize())
+                {
+                    valid = false;
+                    return;
+                }
+                const u16 address = static_cast<u16>(response[offset]) |
+                                    (static_cast<u16>(response[offset + 1]) << 8);
+                valid = address == reg.m_regAddress;
+                offset += reg.getSerializedSize();
+            };
+            std::apply([&](const auto&... reg) { (validate(reg), ...); }, regs);
+            return valid;
+        }
 
         inline const Candle* getCandle() const
         {

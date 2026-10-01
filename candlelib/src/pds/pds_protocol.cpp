@@ -124,43 +124,46 @@ namespace mab
 
     PdsMessage::error_E PropertyGetMessage::parseResponse(u8* p_response, size_t responseLength)
     {
-        u8*           initialPointer             = p_response;
         msgResponse_E responseStatusCode         = msgResponse_E::OK;
         size_t        numberOfReceivedProperties = 0;
 
+        m_receivedProperties.clear();
         if (p_response == nullptr)
             return error_E::UNKNOWN_ERROR;
+        if (responseLength < 1)
+            return error_E::INVALID_RESPONSE_LENGTH;
 
         responseStatusCode = static_cast<msgResponse_E>(*p_response++);
         if (responseStatusCode != msgResponse_E::OK)
             return error_E::RESPONSE_STATUS_ERROR;
 
-        // Remove all previously parsed properties. It allows to reuse previously defined message to
-        // be used multiple times
-        m_receivedProperties.clear();
-
+        if (responseLength < 2)
+            return error_E::INVALID_RESPONSE_LENGTH;
         numberOfReceivedProperties = static_cast<size_t>(*p_response++);
         if (numberOfReceivedProperties != m_properties.size())
             return error_E::INVALID_PROPERTIES_NUMBER;
 
+        size_t bytesLeft = responseLength - 2;
+        decltype(m_receivedProperties) received;
         for (uint8_t i = 0; i < numberOfReceivedProperties; i++)
         {
             propertyId_E    type           = m_properties[i];
             size_t          propertySize   = getPropertySize(type);
             u32             rawValue       = 0;
-            propertyError_E propertyStatus = static_cast<propertyError_E>(*p_response++);
-            size_t          bytesLeft      = responseLength - (p_response - initialPointer);
-            if (bytesLeft < propertySize)
+            if (propertySize > sizeof(rawValue) || bytesLeft < 1 + propertySize)
             {
                 m_log.error("Not enough bytes left in response buffer to read property value");
                 return error_E::INVALID_RESPONSE_LENGTH;
             }
+            propertyError_E propertyStatus = static_cast<propertyError_E>(*p_response++);
+            if (propertyStatus != propertyError_E::OK)
+                return error_E::RESPONSE_STATUS_ERROR;
             memcpy(&rawValue, p_response, propertySize);
-            if (propertyStatus == propertyError_E::OK)
-                m_receivedProperties.push_back(std::make_pair(type, rawValue));
+            received.push_back(std::make_pair(type, rawValue));
             p_response += propertySize;
+            bytesLeft -= 1 + propertySize;
         }
-
+        m_receivedProperties = std::move(received);
         return error_E::OK;
     }
 

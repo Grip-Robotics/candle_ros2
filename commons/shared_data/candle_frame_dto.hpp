@@ -64,28 +64,31 @@ namespace mab
 
         inline void serialize(void* buffer) const
         {
-            *(decltype(frameDTO.canId)*)buffer          = frameDTO.canId;
+            std::memcpy(buffer, &frameDTO.canId, sizeof(frameDTO.canId));
             buffer                                      = (u8*)buffer + sizeof(frameDTO.canId);
-            *(decltype(frameDTO.timeout)*)buffer        = frameDTO.timeout;
+            std::memcpy(buffer, &frameDTO.timeout, sizeof(frameDTO.timeout));
             buffer                                      = (u8*)buffer + sizeof(frameDTO.timeout);
-            *(decltype(frameDTO.length)*)buffer         = frameDTO.length;
+            std::memcpy(buffer, &frameDTO.length, sizeof(frameDTO.length));
             buffer                                      = (u8*)buffer + sizeof(frameDTO.length);
-            *(decltype(frameDTO.sequenceNumber)*)buffer = frameDTO.sequenceNumber;
+            std::memcpy(buffer, &frameDTO.sequenceNumber, sizeof(frameDTO.sequenceNumber));
             buffer = (u8*)buffer + sizeof(frameDTO.sequenceNumber);
             std::memcpy(buffer, frameDTO.data, frameDTO.length);
         }
         inline void deserialize(const void* buffer)
         {
             clear();
-            frameDTO.canId          = *(decltype(frameDTO.canId)*)buffer;
+            std::memcpy(&frameDTO.canId, buffer, sizeof(frameDTO.canId));
             buffer                  = (u8*)buffer + sizeof(frameDTO.canId);
-            frameDTO.timeout        = *(decltype(frameDTO.timeout)*)buffer;
+            std::memcpy(&frameDTO.timeout, buffer, sizeof(frameDTO.timeout));
             buffer                  = (u8*)buffer + sizeof(frameDTO.timeout);
-            frameDTO.length         = *(decltype(frameDTO.length)*)buffer;
+            std::memcpy(&frameDTO.length, buffer, sizeof(frameDTO.length));
             buffer                  = (u8*)buffer + sizeof(frameDTO.length);
-            frameDTO.sequenceNumber = *(decltype(frameDTO.sequenceNumber)*)buffer;
+            std::memcpy(&frameDTO.sequenceNumber, buffer, sizeof(frameDTO.sequenceNumber));
             buffer                  = (u8*)buffer + sizeof(frameDTO.sequenceNumber);
-            std::memcpy(frameDTO.data, buffer, frameDTO.length);
+            // Preserve the invalid length for isValid(), but never copy beyond
+            // the fixed CAN payload before the caller can validate it.
+            if (frameDTO.length <= sizeof(frameDTO.data))
+                std::memcpy(frameDTO.data, buffer, frameDTO.length);
         }
         inline Error_t addData(const void* data, decltype(frameDTO.length) size)
         {
