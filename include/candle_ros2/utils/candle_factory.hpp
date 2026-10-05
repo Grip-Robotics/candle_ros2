@@ -92,6 +92,7 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     node->declare_parameter<double>("close_contact_duration_s", 0.15);
     node->declare_parameter<double>("close_timeout_s", 2.0);
     node->declare_parameter<double>("open_timeout_s", 0.5);
+    node->declare_parameter<double>("open_obstruction_tolerance_rad", 0.017453292519943295);
     node->declare_parameter<double>("close_feedback_timeout_s", 0.25);
     node->declare_parameter<int>("joint_state_publish_period_ms", 50);
     node->declare_parameter<int>("health_publish_period_ms", 200);
@@ -146,6 +147,7 @@ inline candleParams_S readParams(const rclcpp::Node::SharedPtr& node)
     params.close.contactDuration = node->get_parameter("close_contact_duration_s").as_double();
     params.close.timeout = node->get_parameter("close_timeout_s").as_double();
     params.close.openTimeout = node->get_parameter("open_timeout_s").as_double();
+    params.close.openObstructionTolerance = node->get_parameter("open_obstruction_tolerance_rad").as_double();
     params.close.feedbackTimeout = node->get_parameter("close_feedback_timeout_s").as_double();
     params.close.maxStep = node->get_parameter("joint_state_publish_period_ms").as_int() / 1000.0;
     params.joint_state_publish_period_ms =

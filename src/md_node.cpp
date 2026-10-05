@@ -1,5 +1,7 @@
 #include "candle_ros2/md_node.hpp"
 #include "candle_ros2/drive_state.hpp"
+#include "candle_ros2/startup_reboot.hpp"
+#include <unordered_set>
 
 #include <algorithm>
 #include <chrono>
@@ -115,6 +117,9 @@ MdNode::MdNode(const rclcpp::NodeOptions&   options,
     srvInitDevices = this->create_service<candle_ros2::srv::InitDevices>(
         std::string(NODE_PREFIX) + "init_devices",
         std::bind(&MdNode::cbInitDevices, this, std::placeholders::_1, std::placeholders::_2));
+    srvStartupReboot = this->create_service<candle_ros2::srv::Generic>(
+        std::string(NODE_PREFIX) + "startup_reboot",
+        std::bind(&MdNode::cbStartupReboot, this, std::placeholders::_1, std::placeholders::_2));
     srvZero = this->create_service<candle_ros2::srv::Generic>(
         std::string(NODE_PREFIX) + "zero",
         std::bind(&MdNode::cbZero, this, std::placeholders::_1, std::placeholders::_2));
@@ -748,6 +753,76 @@ void MdNode::cbImpedanceCmd(const candle_ros2::msg::ImpedanceCmd& msg)
         }
     }
     return;
+}
+
+void MdNode::cbStartupReboot(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
+                            std::shared_ptr<candle_ros2::srv::Generic::Response> rsp)
+{
+    rsp->success.assign(req->device_ids.size(), false);
+    // Blocking boot waits are permitted only before there are controlled drives.
+    // This node uses a single-threaded executor, so no other callback can add one
+    // during the reboot. Never expose reboot as an in-motion recovery operation.
+    if (!m_mds.empty() || m_startupRebootAttempted || req->device_ids.empty()) return;
+    std::unordered_set<u16> unique;
+    for (auto id : req->device_ids)
+        if (!candle_ros2::validDeviceId(id) || !unique.insert(id).second) return;
+    m_startupRebootAttempted = true;
+    const auto sleep = [](auto duration) { std::this_thread::sleep_for(duration); };
+    std::vector<mab::MD> drives;
+    for (auto id : req->device_ids)
+    {
+        drives.emplace_back(id, m_candle.get());
+        drives.back().m_timeout = static_cast<u32>(mdCanResponseTimeout100us);
+    }
+    bool prepared = true;
+    // Stop all selected drives before waiting on any reboot. Try every selected
+    // drive even if another cannot be reached; do not reset any on failed preflight.
+    for (auto& md : drives)
+    {
+        auto& r = md.m_mdRegisters;
+        const auto logRegister = [&](auto& reg, const char* name) {
+            if (md.readRegister(reg) == mab::MD::Error_t::OK)
+                RCLCPP_INFO(get_logger(), "Drive %d before startup reboot: %s=%u",
+                            md.m_canId, name, static_cast<unsigned>(reg.value));
+            else RCLCPP_WARN(get_logger(), "Drive %d before startup reboot: %s unreadable", md.m_canId, name);
+        };
+        logRegister(r.state, "state"); logRegister(r.quickStatus, "quick_status");
+        logRegister(r.hardwareStatus, "hardware_status");
+        logRegister(r.communicationStatus, "communication_status");
+        logRegister(r.motionStatus, "motion_status");
+        logRegister(r.bridgeStatus, "bridge_status");
+        if (!candle_ros2::prepareStartupReboot(md, sleep))
+        {
+            prepared = false;
+            RCLCPP_ERROR(get_logger(), "Drive %d startup reboot preflight failed", md.m_canId);
+        }
+    }
+    if (!prepared) return;
+    for (size_t i = 0; i < drives.size(); ++i)
+    {
+        RCLCPP_INFO(get_logger(), "Rebooting drive %d before homing", drives[i].m_canId);
+        if (!candle_ros2::rebootStartupDrive(drives[i], sleep))
+        {
+            RCLCPP_ERROR(get_logger(), "Drive %d startup reboot failed verification; homing blocked", drives[i].m_canId);
+            // Even an unexpected powered post-boot state must receive a stop.
+            // These temporary drives are not covered by the node's destructor.
+            for (auto& drive : drives)
+            {
+                candle_ros2::DisableTransition stop(drive);
+                auto status = stop.poll(drive);
+                while (status == candle_ros2::DisableTransition::Status::Pending)
+                {
+                    sleep(std::chrono::milliseconds(10));
+                    status = stop.poll(drive);
+                }
+                if (status != candle_ros2::DisableTransition::Status::Disabled)
+                    RCLCPP_ERROR(get_logger(), "Drive %d disable after failed startup reboot unconfirmed", drive.m_canId);
+            }
+            return;
+        }
+        rsp->success[i] = true;
+        RCLCPP_INFO(get_logger(), "Drive %d reboot verified: disabled, idle, no quick fault, zero target torque, watchdog valid", drives[i].m_canId);
+    }
 }
 
 void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request> req,
@@ -1953,7 +2028,7 @@ void MdNode::tickSoftClose(mab::MD& md, double position, double velocity, double
                     position, command.torque);
     else if (opening && state == ImpedanceClose::State::Closed)
         RCLCPP_INFO(this->get_logger(),
-                    "Drive %d open: open endpoint reached at %.5f rad; "
+                    "Drive %d open: resistance within allowed endpoint band at %.5f rad; "
                     "commanded torque 0 Nm, PD disabled, calibration unchanged", md.m_canId, position);
     else if (!opening && state == ImpedanceClose::State::Closed)
         RCLCPP_INFO(this->get_logger(),

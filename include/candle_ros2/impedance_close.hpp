@@ -14,6 +14,7 @@ struct ImpedanceClose
     {
         double lead = 0.04;             // rad: maximum closing target error
         double openLead = 0.04;         // rad: independent opening target error
+        double openObstructionTolerance = 0.017453292519943295; // 1 degree: release near open stop
         double tolerance = 0.005;       // rad: closing endpoint (not normal opening)
         double travelMin = -0.05;      // rad: absolute guards, independent of targets
         double travelMax = 0.80;
@@ -78,7 +79,8 @@ struct ImpedanceClose
                              config.holdTorque, config.holdTorqueRate, config.objectMargin, speed})
             if (!std::isfinite(value) || value <= 0.0)
                 throw std::invalid_argument("impedance close settings must be finite and positive");
-        for (double value : {config.kp, config.kd, config.ki, config.closedHoldTorque})
+        for (double value : {config.kp, config.kd, config.ki, config.closedHoldTorque,
+                             config.openObstructionTolerance})
             if (!std::isfinite(value) || value < 0.0)
                 throw std::invalid_argument("impedance gains and closed bias must be finite and non-negative");
         if (!std::isfinite(position) || !std::isfinite(closed) ||
@@ -215,6 +217,13 @@ struct ImpedanceClose
             {
                 if (!opening)
                     return beginHold(position, torque, true);
+                if (std::abs(position - closed) <= config.openObstructionTolerance)
+                {
+                    // Resistance near the calibrated open target is an allowed
+                    // endpoint. Release all effort; never hold against the stop.
+                    beginHold(position, 0.0, false);
+                    return state = State::Closed;
+                }
                 state = State::Contact; // opening obstruction; the node disables
             }
             else

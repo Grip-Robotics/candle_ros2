@@ -213,3 +213,70 @@ TEST(DriveStateTest, DisableTimeoutFaultAndTransferFailureNeverConfirm)
     EXPECT_TRUE(unwritten.communicationLost);
     EXPECT_EQ(md.reads, 0u);
 }
+
+#include "candle_ros2/startup_reboot.hpp"
+namespace {
+struct RebootDrive {
+    enum class Error_t { OK, Failed };
+    struct Register { unsigned value=0; };
+    struct { Register state{8}, motionModeStatus, quickStatus{1}, targetTorque, canWatchdog{100}; } m_mdRegisters;
+    unsigned resets=0, disables=0;
+    bool readFails=false, resetFails=false, staysFaulted=false, disableFails=false, remainsEnabled=false;
+    unsigned bootReadFailures=0;
+    Error_t readRegister(Register&) {
+        if (readFails) return Error_t::Failed;
+        if (resets && bootReadFailures) { --bootReadFailures; return Error_t::Failed; }
+        return Error_t::OK;
+    }
+    Error_t disable() {
+        ++disables;
+        if (disableFails) return Error_t::Failed;
+        if (!remainsEnabled) m_mdRegisters.state.value=64;
+        return Error_t::OK;
+    }
+    Error_t reset() {
+        ++resets;
+        if (!staysFaulted) { m_mdRegisters.state.value=64; m_mdRegisters.quickStatus.value=0; }
+        return resetFails?Error_t::Failed:Error_t::OK;
+    }
+};
+const auto noWait=[](auto) {};
+}
+TEST(StartupReboot, FaultEightRebootsOnceAndVerifiesDisabled) {
+    RebootDrive md;
+    EXPECT_TRUE(candle_ros2::prepareStartupReboot(md,noWait));
+    EXPECT_TRUE(candle_ros2::rebootStartupDrive(md,noWait));
+    EXPECT_EQ(md.disables,0u); EXPECT_EQ(md.resets,1u);
+}
+TEST(StartupReboot, EnabledDriveMustBeStoppedBeforeReset) {
+    RebootDrive md; md.m_mdRegisters.state.value=39;
+    EXPECT_FALSE(candle_ros2::rebootStartupDrive(md,noWait)); EXPECT_EQ(md.resets,0u);
+    EXPECT_TRUE(candle_ros2::prepareStartupReboot(md,noWait)); EXPECT_EQ(md.disables,1u);
+    EXPECT_TRUE(candle_ros2::rebootStartupDrive(md,noWait));
+}
+TEST(StartupReboot, FailedStopOrUnreadableStatePreventsReset) {
+    RebootDrive md;md.readFails=true;
+    EXPECT_FALSE(candle_ros2::prepareStartupReboot(md,noWait));
+    EXPECT_FALSE(candle_ros2::rebootStartupDrive(md,noWait)); EXPECT_EQ(md.resets,0u);
+    md.readFails=false;md.m_mdRegisters.state.value=39;md.remainsEnabled=true;
+    EXPECT_FALSE(candle_ros2::prepareStartupReboot(md,noWait)); EXPECT_EQ(md.resets,0u);
+}
+TEST(StartupReboot, PersistentFaultAndLostAcknowledgementNeverSucceedOrRepeatReset) {
+    for (bool fault : {true,false}) {
+        RebootDrive md;md.staysFaulted=fault;md.resetFails=!fault;
+        EXPECT_FALSE(candle_ros2::rebootStartupDrive(md,noWait)); EXPECT_EQ(md.resets,1u);
+    }
+}
+TEST(StartupReboot, BootDelayIsBoundedAndRequiresValidModeTorqueAndWatchdog) {
+    RebootDrive md;md.bootReadFailures=2;
+    EXPECT_TRUE(candle_ros2::rebootStartupDrive(md,noWait));
+    for (int failure=0;failure<5;++failure) {
+        RebootDrive bad;
+        if (failure==0) bad.m_mdRegisters.targetTorque.value=1;
+        if (failure==1) bad.m_mdRegisters.motionModeStatus.value=4;
+        if (failure==2) bad.m_mdRegisters.canWatchdog.value=0;
+        if (failure==3) bad.m_mdRegisters.canWatchdog.value=500;
+        if (failure==4) bad.bootReadFailures=100;
+        EXPECT_FALSE(candle_ros2::rebootStartupDrive(bad,noWait)); EXPECT_EQ(bad.resets,1u);
+    }
+}
