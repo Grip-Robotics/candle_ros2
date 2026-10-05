@@ -101,7 +101,7 @@ namespace mab
             m_log.error("Reset failed!");
             return result;
         }
-        if (resetCmd.size() < 2 || resetCmd[1] != 0x1)
+        if (resetCmd.size() < 2 || resetCmd[0] != 9 || resetCmd[1] != 0x1)
         {
             m_log.error("Reset failed!");
             return candleTypes::Error_t::UNKNOWN_ERROR;
@@ -112,7 +112,8 @@ namespace mab
     {
         auto buffer       = datarateCommandFrame(m_canDatarate, m_useRegularCanFrames);
         auto dataResponse = busTransfer(&buffer, 6);
-        if (dataResponse != candleTypes::Error_t::OK || buffer.size() < 6)
+        if (dataResponse != candleTypes::Error_t::OK || buffer.size() < 6 ||
+            buffer[0] != 2 || buffer[1] != 1 || buffer[5] == 0)
         {
             return std::nullopt;
         }
@@ -265,7 +266,7 @@ namespace mab
             return {{}, communicationStatus};
         if (buffer.size() < 2)
             return {{}, candleTypes::Error_t::DATA_EMPTY};
-        if (buffer[1] != 0x01)
+        if (buffer[0] != 4 || buffer[1] != 0x01)
         {
             m_log.error("CAN frame did not reach target device with id: %d!", canId);
             return std::pair<std::vector<u8>, candleTypes::Error_t>(
@@ -293,6 +294,9 @@ namespace mab
         const candleTypes::Error_t connectionStatus = busTransfer(&testConnectionFrame, 6);
         if (connectionStatus != candleTypes::Error_t::OK)
             return connectionStatus;
+        if (testConnectionFrame.size() < 6 || testConnectionFrame[0] != 2 ||
+            testConnectionFrame[1] != 1 || testConnectionFrame[5] == 0)
+            return candleTypes::Error_t::UNKNOWN_ERROR;
         return candleTypes::Error_t::OK;
     }
 
