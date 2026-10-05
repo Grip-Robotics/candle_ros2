@@ -14,7 +14,7 @@ struct ImpedanceClose
     {
         double lead = 0.04;             // rad: maximum closing target error
         double openLead = 0.04;         // rad: independent opening target error
-        double tolerance = 0.005;       // rad: settled endpoint
+        double tolerance = 0.005;       // rad: closing endpoint (not normal opening)
         double travelMin = -0.05;      // rad: absolute guards, independent of targets
         double travelMax = 0.80;
         bool travelLimitsEnabled = true; // Normal-operation absolute position guards.
@@ -116,8 +116,8 @@ struct ImpedanceClose
         if (!std::isfinite(position) || !std::isfinite(velocity) || !std::isfinite(torque) ||
             !std::isfinite(dt) || dt <= 0.0 || dt > config.feedbackTimeout)
             return fail();
-        // Reaching the known open endpoint or timing out releases all effort.
-        // Neither outcome starts another stop search after elastic rebound.
+        // Normal opening releases at its deadline, without position acceptance.
+        // It never starts another stop search after elastic rebound.
         // Keep the job alive so feedback and the node's travel/fault guards still run.
         if (opening && (state == State::TorqueHold || state == State::Closed))
             return state;
@@ -139,7 +139,7 @@ struct ImpedanceClose
         }
         const bool stopped = std::abs(velocity) <= config.contactVelocity &&
                              positionSpeed <= config.contactVelocity;
-        endpointTime = std::abs(closed - position) <= config.tolerance && stopped
+        endpointTime = !opening && std::abs(closed - position) <= config.tolerance && stopped
                            ? endpointTime + step : 0.0;
         // Also detect settling after an unconfirmed timeout torque capture.
         // A thin foil cannot be distinguished from empty closure here.
@@ -199,14 +199,17 @@ struct ImpedanceClose
         if (state == State::Closing)
         {
             // Check the previously applied target, not the next ramp step.
+            // Opening jam detection depends on sustained resistance and lack
+            // of motion, not proximity to the position target. Closing keeps
+            // its endpoint tolerance and object-contact rules.
             const bool contact = direction * torque >= config.contactTorque &&
-                                 direction * (target - position) > config.tolerance;
+                                 (opening || direction * (target - position) > config.tolerance);
             if (opening)
                 contactTime = contact && stopped ? contactTime + step : 0.0;
             else
                 updateContactEvidence(position, lastPosition, velocity, step,
                     contact && (opening || !nearClosed));
-            if (endpointTime >= config.contactDuration)
+            if (!opening && endpointTime >= config.contactDuration)
                 state = State::Closed;
             else if (contactTime >= config.contactDuration)
             {

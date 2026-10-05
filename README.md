@@ -19,13 +19,14 @@ not measured motor speed, and the lead bound can slow that progression.
 Normal opening never searches for a mechanical stop, uses the homing effort,
 changes calibration, or zeros the encoder.
 
-A settled known endpoint releases commanded torque, Kp and Kd to zero. The
-independent `open_timeout_s` deadline (0.5 s) also releases all effort, but
-reports the endpoint as unconfirmed. Both outcomes remain enabled and passive
-through rebound or manual displacement until a new explicit command. Endpoint
-confirmation uses position and low-speed dwell, with no minimum measured
-opening effort. Sustained resistance before the endpoint remains an obstruction
-failure; stale/invalid feedback and hardware faults still stop the drive.
+Normal opening has no position-acceptance tolerance or settled-endpoint success.
+The independent `open_timeout_s` deadline (0.5 s) releases commanded torque,
+Kp and Kd to zero regardless of final position. This remains a bounded opening
+attempt, not confirmation of a fully open jaw. Release stays passive through
+rebound or manual displacement until a new explicit command. Sustained opening
+resistance with insufficient motion still causes an obstruction stop, including
+near zero; stale/invalid feedback and hardware faults still stop the drive.
+Closing endpoint recognition and calibration tolerances are unchanged.
 Homing alone uses effort-qualified stop searches and disabled unloaded releases.
 
 `gripper_travel_limits_enabled` controls the software absolute position guards.
@@ -123,7 +124,7 @@ object inference stays blocked until reopening farther than
 This hysteresis prevents small fingertip rebounds from repeatedly restarting
 object torque buildup and the closing deadline. Normal opening instead uses
 consecutive low measured and position-derived velocity for endpoint or
-obstruction detection; a known open endpoint does not require measured effort.
+obstruction detection; normal opening has no settled-endpoint acceptance.
 
 Once object contact is inferred, the driver clears the integral and switches
 MD Kp/Kd to zero together with a feedforward command equal to the current
@@ -197,7 +198,7 @@ drive disable. Homing search/release deadline violations also fail. Only healthy
 feedback can enter object, closed-bias or deadline torque hold; faults never do. Fault/disable/new
 commands discard integral and captured-torque state.
 
-Normal opening releases torque, Kp and Kd together on a confirmed endpoint or
+Normal opening releases torque, Kp and Kd together at
 its 0.5 s deadline, without disabling the motor. An opening timeout is not an
 endpoint confirmation or proof of friction. The passive state remains monitored
 for feedback, hardware faults and any enabled travel guards; it never retries
@@ -253,7 +254,7 @@ process termination and a disconnected bus still require the hardware watchdog.
 
 Open/close services return per-drive **command startup acknowledgments**, not final
 grasp results. Logs report `contact inferred` with the torque ramp,
-`object torque hold`, `closed endpoint`, `open: open endpoint reached`,
+`object torque hold`, `closed endpoint`,
 `timeout torque hold`, `open: timeout released` (endpoint unconfirmed),
 or `recovering from measured position`. A torque-hold event is a controller
 state, not proof that an object is securely retained.
@@ -320,7 +321,7 @@ The node accepts `bus:=USB|SPI`, `data_rate:=1M|2M|5M|8M`,
 | `soft_close_slow_torque_limit_nm` | 2.0 | Open/close/hold total torque cap, bounded by the normal cap |
 | `close_target_lead_rad` | 0.04 | Maximum closing target lead; also displacement that starts hold reacquisition |
 | `open_target_lead_rad` | closing lead | Maximum normal-opening target lead ahead of measured position; MD20 profile uses 0.14 rad |
-| `soft_close_closed_tol_rad` | 0.005 | Normal open/closed endpoint tolerance, zero-command readback and local homing settling range |
+| `soft_close_closed_tol_rad` | 0.005 | Closing endpoint tolerance, zero-command readback and local homing settling range; not normal-opening acceptance |
 | `gripper_travel_limits_enabled` | true | Enforce software absolute travel guards for measured positions and targets; MD20 profile sets false; finite/reference checks and calibrated closed targets remain active |
 | `gripper_travel_min_rad` / `gripper_travel_max_rad` | -0.05 / 0.80 | Fallback normal-controller guards; calibration learns the closed bound plus margin and extends the open bound only if needed to contain the measured powered stop plus tolerance |
 | `homing_travel_margin_rad` | 0.5 | Nonnegative extra normal travel beyond each drive's learned closed stop; applied after calibration |
@@ -689,7 +690,7 @@ normal opening has the separate target ramp described above.
 
 Core tests cover effort-qualified homing, independent loaded stop calibration,
 homing search/release deadlines and accepted released offsets. Normal-opening
-regressions cover the independent ramp and lead, endpoint and timeout passive
+regressions cover the independent ramp and lead, position-independent deadline
 release, unchanged calibration, obstruction and invalid/stale feedback. Command-safety tests cover persistent disable recovery
 gates and invalid register values. These are offline checks; they do not establish
 physical endpoint repeatability or grip retention.

@@ -853,16 +853,16 @@ TEST_F(MdNodeCallbacks, UncalibratedOpeningIsRejectedWithoutStartingHoming)
     EXPECT_EQ(bus->writes, 0u);
 }
 
-TEST_F(MdNodeCallbacks, AlreadyOpenCompletesWithoutSearchOrDisableEnableCycle)
+TEST_F(MdNodeCallbacks, AlreadyOpenReleasesAtDeadlineWithoutSearchOrDisableEnableCycle)
 {
     bus->set(bus->schema.state, static_cast<u16>(39));
     bus->set(bus->schema.motionModeStatus, static_cast<u8>(mab::MdMode_E::IMPEDANCE));
     bus->set(bus->schema.mainEncoderPosition, 0.0f);
     ASSERT_TRUE(MdNodeTestAccess::open(*node)->success[0]);
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 55; ++i)
         MdNodeTestAccess::tickMotion(*node, 0.0);
     ASSERT_TRUE(MdNodeTestAccess::opening(*node));
-    ASSERT_EQ(MdNodeTestAccess::motionControl(*node).state, ImpedanceClose::State::Closed);
+    ASSERT_EQ(MdNodeTestAccess::motionControl(*node).state, ImpedanceClose::State::TorqueHold);
     EXPECT_FALSE(MdNodeTestAccess::homing(*node));
     EXPECT_FALSE(MdNodeTestAccess::inhibited(*node));
     EXPECT_EQ(MdNodeTestAccess::reference(*node), PositionTracker::State::Tracking);
@@ -877,7 +877,7 @@ TEST_F(MdNodeCallbacks, AlreadyOpenCompletesWithoutSearchOrDisableEnableCycle)
     const auto reads = bus->reads;
     MdNodeTestAccess::expireMotionVerification(*node);
     MdNodeTestAccess::tickMotion(*node, .06, .2);
-    EXPECT_EQ(MdNodeTestAccess::motionControl(*node).state, ImpedanceClose::State::Closed);
+    EXPECT_EQ(MdNodeTestAccess::motionControl(*node).state, ImpedanceClose::State::TorqueHold);
     EXPECT_EQ(bus->reads, reads); // Passive release has no command-verification loop.
     EXPECT_FLOAT_EQ(bus->get(bus->schema.motorImpPidKp), 0.0f);
     EXPECT_FLOAT_EQ(bus->get(bus->schema.motorImpPidKd), 0.0f);
@@ -930,27 +930,27 @@ TEST_F(MdNodeCallbacks, OpeningRebootInvalidatesReferenceEvenWhenCommandVerifica
     EXPECT_EQ(bus->zeroWrites, 0u);
 }
 
-TEST_F(MdNodeCallbacks, OpeningDiagnosticsCaptureEndpointDwellInsteadOfObstructionDwell)
+TEST_F(MdNodeCallbacks, OpeningDiagnosticsCaptureObstructionDwellWithoutEndpointAcceptance)
 {
     bus->set(bus->schema.state, static_cast<u16>(39));
     bus->set(bus->schema.motionModeStatus, static_cast<u8>(mab::MdMode_E::IMPEDANCE));
-    bus->set(bus->schema.mainEncoderPosition, 0.0f);
+    bus->set(bus->schema.mainEncoderPosition, .02f);
     ASSERT_TRUE(MdNodeTestAccess::open(*node)->success[0]);
     for (int i = 0; i < 10; ++i)
-        MdNodeTestAccess::tickMotion(*node, 0.0);
+        MdNodeTestAccess::tickMotion(*node, .02, 0.0, -.4);
     const auto& control = MdNodeTestAccess::motionControl(*node);
-    const auto endpointDwell = control.endpointTime;
-    EXPECT_GT(endpointDwell, .09);
-    EXPECT_DOUBLE_EQ(control.contactTime, 0.0);
+    const auto obstructionDwell = control.contactTime;
+    EXPECT_GT(obstructionDwell, .09);
+    EXPECT_DOUBLE_EQ(control.endpointTime, 0.0);
 
     // Fault capture must preserve this evidence before erasing the active job.
     MdNodeTestAccess::recordAndStop(*node);
     const auto& history = MdNodeTestAccess::diagnosticHistory(*node);
     EXPECT_EQ(history.latest.operation, 4);
-    EXPECT_DOUBLE_EQ(history.latest.settled, endpointDwell);
+    EXPECT_DOUBLE_EQ(history.latest.settled, obstructionDwell);
     ASSERT_TRUE(history.pending.has_value());
-    EXPECT_DOUBLE_EQ(history.pending->atStop.settled, endpointDwell);
-    EXPECT_DOUBLE_EQ(history.pending->settledAtCapture, endpointDwell);
+    EXPECT_DOUBLE_EQ(history.pending->atStop.settled, obstructionDwell);
+    EXPECT_DOUBLE_EQ(history.pending->settledAtCapture, obstructionDwell);
 }
 
 TEST_F(MdNodeCallbacks, OpeningStillStopsOnStaleFeedbackWithoutRehoming)

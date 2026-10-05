@@ -321,7 +321,8 @@ TEST(ImpedanceCloseTest, OpeningRampsAtItsOwnSpeedWithLeadBoundAndNoIntegral)
                 EXPECT_DOUBLE_EQ(motion.command().kd, 0);
                 continue;
             }
-            ASSERT_EQ(motion.state, ImpedanceClose::State::Closed);
+            ASSERT_EQ(motion.state, ImpedanceClose::State::TorqueHold);
+            EXPECT_GE(motion.elapsed, config.openTimeout);
             EXPECT_NEAR(motion.target, 0.0, 1e-12);
             EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
             EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
@@ -334,7 +335,7 @@ TEST(ImpedanceCloseTest, OpeningRampsAtItsOwnSpeedWithLeadBoundAndNoIntegral)
         }
 }
 
-TEST(ImpedanceCloseTest, AlreadyOpenSettlesWithoutSearchTorqueOrClosingFloor)
+TEST(ImpedanceCloseTest, AlreadyOpenReleasesAtDeadlineWithoutSearchTorqueOrClosingFloor)
 {
     auto config = ImpedanceClose::Config{};
     config.openLead = .14;
@@ -345,18 +346,18 @@ TEST(ImpedanceCloseTest, AlreadyOpenSettlesWithoutSearchTorqueOrClosingFloor)
     for (double direction : {-1.0, 1.0})
         for (double position : {0.0, direction * .002, -direction * .002})
         {
-            // The known open endpoint can be reached without contact torque.
+            // Position near zero does not finish opening before the deadline.
             // Reopening an already-open jaw must never start a -1 Nm stop search.
             ImpedanceClose opening(position, 0.0, 10.0, config, true, -direction);
-            for (int i = 0; i < 16; ++i)
+            for (int i = 0; i < 50; ++i)
             {
                 opening.update(position, 0.0, 0.0, .01);
                 EXPECT_DOUBLE_EQ(opening.command().torque, 0.0);
                 EXPECT_DOUBLE_EQ(opening.integralTorque, 0.0);
                 EXPECT_FALSE(opening.hasObject);
             }
-            ASSERT_EQ(opening.state, ImpedanceClose::State::Closed);
-            EXPECT_LT(opening.elapsed, config.openTimeout);
+            ASSERT_EQ(opening.state, ImpedanceClose::State::TorqueHold);
+            EXPECT_GE(opening.elapsed, config.openTimeout);
             EXPECT_DOUBLE_EQ(opening.command().kp, 0.0);
             EXPECT_DOUBLE_EQ(opening.command().kd, 0.0);
 
@@ -364,7 +365,7 @@ TEST(ImpedanceCloseTest, AlreadyOpenSettlesWithoutSearchTorqueOrClosingFloor)
             for (int i = 0; i < 60; ++i)
             {
                 EXPECT_EQ(opening.update(direction * .06, direction * .2, 0.0, .01),
-                          ImpedanceClose::State::Closed);
+                          ImpedanceClose::State::TorqueHold);
                 EXPECT_DOUBLE_EQ(opening.command().torque, 0.0);
                 EXPECT_DOUBLE_EQ(opening.command().kp, 0.0);
                 EXPECT_DOUBLE_EQ(opening.command().kd, 0.0);
@@ -1270,4 +1271,44 @@ TEST(ImpedanceCloseTest, DisabledTravelLimitsStillRequireFinitePositions)
     EXPECT_DOUBLE_EQ(close.closed, .75);
     EXPECT_DOUBLE_EQ(close.config.lead, .04);
     EXPECT_EQ(close.update(NAN, 0, 0, .01), ImpedanceClose::State::Failed);
+}
+
+TEST(ImpedanceCloseTest, NormalOpeningDeadlineDoesNotDependOnEndpointTolerance)
+{
+    for (double tolerance : {.001, .005, .02})
+        for (double position : {0.0, .002, .013, .04})
+        {
+            auto config = ImpedanceClose::Config{};
+            config.tolerance = tolerance;
+            config.objectMargin = .03;
+            ImpedanceClose motion(position, 0.0, 10.0, config, true, -1.0);
+            for (int i = 0; i < 49; ++i)
+                EXPECT_EQ(motion.update(position, 0.0, 0.0, .01),
+                          ImpedanceClose::State::Closing);
+            EXPECT_EQ(motion.update(position, 0.0, 0.0, .01),
+                      ImpedanceClose::State::TorqueHold);
+            EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kd, 0.0);
+            EXPECT_FALSE(motion.hasObject);
+        }
+}
+
+TEST(ImpedanceCloseTest, OpeningRetainsResistanceStopIncludingRecordedDrive113Values)
+{
+    // October 5: drive 113 stopped near 0.01285 rad, 0.0221 rad/s,
+    // with -0.382 Nm opening torque. Removing position acceptance must
+    // not conceal that sustained-resistance event or exempt points near zero.
+    for (double position : {.01285, .002})
+        for (double direction : {-1.0, 1.0})
+        {
+            ImpedanceClose motion(direction * position, 0.0, 10.0, {}, true, -direction);
+            motion.update(direction * position, 0.0, 0.0, .01);
+            for (int i = 0; i < 16; ++i)
+                motion.update(direction * position, direction * .0221,
+                              -direction * .382, .01);
+            EXPECT_EQ(motion.state, ImpedanceClose::State::Contact);
+            EXPECT_LT(motion.elapsed, motion.config.openTimeout);
+            EXPECT_FALSE(motion.hasObject);
+        }
 }

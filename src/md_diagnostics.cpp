@@ -48,7 +48,7 @@ void MdNode::recordDiagnosticFeedback(mab::MD& md, bool valid, double logicalPos
         sample.operation = closing->second.opening ? 4 : 3;
         sample.phase = sample.controlState = static_cast<int>(c.state);
         sample.elapsed = c.elapsed;
-        sample.settled = c.opening ? c.endpointTime : c.contactTime;
+        sample.settled = c.contactTime;
         sample.timeout = c.opening ? c.config.openTimeout : c.config.timeout;
     }
     if (home)
@@ -88,7 +88,7 @@ void MdNode::captureDiagnosticFault(mab::MD& md, const std::string& reason)
         const auto& c = closing->second.control;
         fault.phaseAtCapture = fault.stateAtCapture = static_cast<int>(c.state);
         fault.elapsedAtCapture = c.elapsed;
-        fault.settledAtCapture = c.opening ? c.endpointTime : c.contactTime;
+        fault.settledAtCapture = c.contactTime;
     }
     if (home)
     {
