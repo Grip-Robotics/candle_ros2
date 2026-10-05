@@ -35,6 +35,7 @@ class RegisterBus final : public mab::I_CommunicationInterface
         set(schema.canID, static_cast<u32>(113));
         set(schema.motionModeStatus, static_cast<u8>(0));
         set(schema.mainEncoderPosition, 0.25f);
+        set(schema.canWatchdog, static_cast<u16>(100));
     }
     template<class T>
     void set(const mab::MDRegisterEntry_S<T>& reg, T value)
@@ -220,6 +221,19 @@ class MdNodeTestAccess
         node.cbOpenGripper(request, response);
         return response;
     }
+    static void stageHomingCommand(MdNode& node)
+    {
+        node.homeConfig.torque = 1.5; // Deliberately different from normal closing.
+        diagnosticHoming(node, true);
+        auto& md = node.m_mds.front();
+        const auto command = node.m_homingJob->sequence.control.command();
+        node.configureGripper(md, command.kp, command.kd, 2.0, node.homeConfig.torque);
+        node.setGripperCommand(md, command);
+        node.m_homingJob->lastVerification -= std::chrono::milliseconds(101);
+    }
+    static void tickHoming(MdNode& node)
+    { node.tickHoming(node.m_mds.front(), .25, 0.0, 0.0); }
+    static bool close(MdNode& node) { return node.startImpedanceMotion(node.m_mds.front(), 2.0, false); }
     static const auto& motionControl(const MdNode& node)
     { return node.m_softCloseJobs.at(113).control; }
     static const auto& calibration(const MdNode& node)
@@ -428,7 +442,7 @@ TEST_F(MdNodeCallbacks, DiagnosticsReadWatchdogWarningEvenWhenQuickStatusIsClean
     EXPECT_NE(command.find("\"can_watchdog_ms\":100"), std::string::npos);
     for (int group = 3; group < 6; ++group) MdNodeTestAccess::diagnosticRegisters(*node, group);
     EXPECT_EQ(bus->reads, 6u);
-    EXPECT_EQ(bus->readRequestSizes, (std::vector<size_t>{35, 31, 36, 37, 25, 22}));
+    EXPECT_EQ(bus->readRequestSizes, (std::vector<size_t>{35, 31, 36, 37, 37, 22}));
     for (const auto fullRequestSize : bus->readRequestSizes) EXPECT_LE(fullRequestSize, 37u);
     EXPECT_EQ(bus->writes, 0u);
     EXPECT_TRUE(MdNodeTestAccess::acceptsMotion(*node));
@@ -479,35 +493,37 @@ TEST_F(MdNodeCallbacks, DiagnosticReadsWaitForAllSixInitialCalibrations)
     EXPECT_EQ(bus->reads, 2u);
 }
 
-TEST_F(MdNodeCallbacks, DiagnosticReadsSkipAnyHomingAndPendingDisableIncludingFaultRefresh)
+TEST_F(MdNodeCallbacks, DiagnosticsPollActiveHomingButSkipPendingDisable)
 {
     MdNodeTestAccess::diagnostics(*node); // Establish the startup latch.
     const auto reads = bus->reads;
     MdNodeTestAccess::diagnosticHoming(*node, true);
     MdNodeTestAccess::expireDiagnosticPeriod(*node);
     MdNodeTestAccess::diagnostics(*node);
-    EXPECT_EQ(bus->reads, reads);
+    EXPECT_EQ(bus->reads, reads + 1);
     MdNodeTestAccess::diagnosticHoming(*node, false);
     MdNodeTestAccess::recordAndStop(*node);
     MdNodeTestAccess::diagnostics(*node); // Flushes memory but must not poll during disable.
-    EXPECT_EQ(bus->reads, reads);
+    EXPECT_EQ(bus->reads, reads + 1);
     EXPECT_EQ(MdNodeTestAccess::diagnosticHistory(*node).refreshGroup, 0);
     MdNodeTestAccess::clearDiagnosticDisables(*node);
+    MdNodeTestAccess::expireDiagnosticPeriod(*node);
     MdNodeTestAccess::diagnostics(*node);
-    EXPECT_EQ(bus->reads, reads + 1);
+    EXPECT_EQ(bus->reads, reads + 2);
     EXPECT_EQ(MdNodeTestAccess::diagnosticHistory(*node).refreshGroup, 1);
 }
 
-TEST_F(MdNodeCallbacks, DiagnosticStartupCanBypassOptionalHomingButNeverActiveHoming)
+TEST_F(MdNodeCallbacks, DiagnosticStartupPollsOnlyActiveHomingBeforeStartupReady)
 {
     MdNodeTestAccess::clearDiagnosticCalibration(*node);
     MdNodeTestAccess::bypassDiagnosticHoming(*node);
     MdNodeTestAccess::diagnosticHoming(*node, true);
     MdNodeTestAccess::diagnostics(*node);
-    EXPECT_EQ(bus->reads, 0u);
-    MdNodeTestAccess::diagnosticHoming(*node, false);
-    MdNodeTestAccess::diagnostics(*node);
     EXPECT_EQ(bus->reads, 1u);
+    MdNodeTestAccess::diagnosticHoming(*node, false);
+    MdNodeTestAccess::expireDiagnosticPeriod(*node);
+    MdNodeTestAccess::diagnostics(*node);
+    EXPECT_EQ(bus->reads, 2u);
     EXPECT_TRUE(MdNodeTestAccess::diagnosticStartupReady(*node));
 }
 
@@ -896,7 +912,7 @@ TEST_F(MdNodeCallbacks, AlreadyOpenReleasesAtDeadlineWithoutSearchOrDisableEnabl
     MdNodeTestAccess::expireMotionVerification(*node);
     MdNodeTestAccess::tickMotion(*node, .06, .2);
     EXPECT_EQ(MdNodeTestAccess::motionControl(*node).state, ImpedanceClose::State::TorqueHold);
-    EXPECT_EQ(bus->reads, reads); // Passive release has no command-verification loop.
+    EXPECT_EQ(bus->reads, reads + 3); // Passive release is verified without applying force.
     EXPECT_FLOAT_EQ(bus->get(bus->schema.motorImpPidKp), 0.0f);
     EXPECT_FLOAT_EQ(bus->get(bus->schema.motorImpPidKd), 0.0f);
     EXPECT_FLOAT_EQ(bus->get(bus->schema.targetTorque), 0.0f);
@@ -1007,4 +1023,64 @@ TEST_F(MdNodeCallbacks, StartupRebootClearsFaultBeforeRegistrationAndCannotRepea
     EXPECT_EQ(bus->zeroWrites, 0u);
     EXPECT_FALSE(MdNodeTestAccess::startupReboot(*node, {113})->success[0]);
     EXPECT_EQ(bus->resets, 1u);
+}
+
+TEST_F(MdNodeCallbacks, ClosingStopsWhenFirmwareTorqueCapIsLost)
+{
+    bus->set(bus->schema.state, static_cast<u16>(39));
+    bus->set(bus->schema.motionModeStatus, static_cast<u8>(mab::MdMode_E::IMPEDANCE));
+    ASSERT_TRUE(MdNodeTestAccess::close(*node));
+    bus->set(bus->schema.maxTorque, 0.0f);
+    MdNodeTestAccess::expireMotionVerification(*node);
+    MdNodeTestAccess::tickMotion(*node, .25);
+    EXPECT_TRUE(MdNodeTestAccess::inhibited(*node));
+    EXPECT_FALSE(MdNodeTestAccess::holding(*node));
+    EXPECT_EQ(bus->state(), 64u);
+}
+
+TEST_F(MdNodeCallbacks, ClosingRejectsInvalidWatchdogAtCommandAcceptance)
+{
+    bus->set(bus->schema.state, static_cast<u16>(39));
+    bus->set(bus->schema.motionModeStatus, static_cast<u8>(mab::MdMode_E::IMPEDANCE));
+    bus->set(bus->schema.canWatchdog, static_cast<u16>(0));
+    EXPECT_FALSE(MdNodeTestAccess::close(*node));
+    EXPECT_TRUE(MdNodeTestAccess::inhibited(*node));
+    EXPECT_EQ(bus->state(), 64u);
+}
+
+TEST_F(MdNodeCallbacks, HomingVerifiesItsOwnTorqueCapAndStopsOverwrittenCommand)
+{
+    bus->set(bus->schema.state, static_cast<u16>(39));
+    bus->set(bus->schema.motionModeStatus, static_cast<u8>(mab::MdMode_E::IMPEDANCE));
+    MdNodeTestAccess::setFeedbackState(*node, 39);
+    MdNodeTestAccess::setFeedbackMode(*node, mab::MdMode_E::IMPEDANCE);
+    MdNodeTestAccess::stageHomingCommand(*node);
+    MdNodeTestAccess::tickHoming(*node);
+    ASSERT_TRUE(MdNodeTestAccess::homing(*node));
+    MdNodeTestAccess::stageHomingCommand(*node);
+    bus->set(bus->schema.targetTorque, 0.0f);
+    MdNodeTestAccess::tickHoming(*node);
+    EXPECT_FALSE(MdNodeTestAccess::homing(*node));
+    EXPECT_TRUE(MdNodeTestAccess::inhibited(*node));
+    EXPECT_EQ(bus->state(), 64u);
+}
+
+TEST_F(MdNodeCallbacks, HomingDiagnosticsUseBoundedReadsAndSkipRelease)
+{
+    MdNodeTestAccess::diagnosticHoming(*node, true);
+    for (int group = 0; group < 6; ++group)
+    {
+        MdNodeTestAccess::expireDiagnosticPeriod(*node);
+        MdNodeTestAccess::diagnostics(*node);
+        ASSERT_EQ(bus->reads, static_cast<size_t>(group + 1));
+        MdNodeTestAccess::diagnostics(*node);
+        ASSERT_EQ(bus->reads, static_cast<size_t>(group + 1));
+    }
+    for (auto size : bus->readRequestSizes) EXPECT_LE(size, 37u);
+    EXPECT_EQ(bus->writes, 0u);
+    MdNodeTestAccess::beginHomingReleaseDisable(*node);
+    MdNodeTestAccess::clearDiagnosticDisables(*node);
+    MdNodeTestAccess::expireDiagnosticPeriod(*node);
+    MdNodeTestAccess::diagnostics(*node);
+    EXPECT_EQ(bus->reads, 6u);
 }

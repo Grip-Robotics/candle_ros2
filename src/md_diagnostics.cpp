@@ -188,12 +188,14 @@ std::string MdNode::readDiagnosticRegisters(mab::MD& md, int group, uint64_t fau
     else if (group == 4)
     {
         j.string("group", "limits_supply");
-        error = md.readRegisters(r.positionLimitMin, r.positionLimitMax, r.dcBusVoltage);
+        error = md.readRegisters(r.positionLimitMin, r.positionLimitMax, r.dcBusVoltage, r.motorIMax, r.motorKt);
         if (error == mab::MD::Error_t::OK)
         {
             values.number("position_limit_min_rad", r.positionLimitMin.value);
             values.number("position_limit_max_rad", r.positionLimitMax.value);
             values.number("dc_bus_voltage_v", r.dcBusVoltage.value);
+            values.number("motor_current_limit_a", r.motorIMax.value);
+            values.number("motor_torque_constant_nm_a", r.motorKt.value);
         }
     }
     else
@@ -285,11 +287,27 @@ void MdNode::flushDiagnosticFaults()
 void MdNode::publishDiagnostics()
 {
     flushDiagnosticFaults();
-    if (m_mds.empty() || m_diagnosticPollingDisabled || m_homingJob || !m_pendingDisables.empty()) return;
+    if (m_mds.empty() || m_diagnosticPollingDisabled || !m_pendingDisables.empty()) return;
+    if (m_homingJob)
+    {
+        // One bounded read per 200ms, for the active search only. Previously
+        // startup faults had no command/limit/protection snapshots at all.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_lastDiagnosticRead < std::chrono::milliseconds(200)) return;
+        if (m_homingJob->sequence.control.state != ImpedanceHome::State::Searching) return;
+        m_lastDiagnosticRead = now;
+        auto md = findMd(m_mds, m_homingJob->id);
+        if (md == m_mds.end()) return;
+        const auto group = m_homingJob->diagnosticGroup++ % candle_ros2::DriveDiagnosticHistory::registerGroupCount;
+        auto record = readDiagnosticRegisters(*md, group, 0);
+        m_diagnostics[md->m_canId].registers[group] = record;
+        RCLCPP_INFO(get_logger(), "CANDLE_DIAG %s", record.c_str());
+        return;
+    }
     if (!m_diagnosticStartupReady)
     {
-        // Keep every optional read out of the complete sequential startup
-        // calibration, including quiet gaps between the individual drives.
+        // Keep optional background reads out of quiet inter-drive startup
+        // gaps. The active homing search is sampled separately above.
         if (homingRequired && (!m_homingRequired.empty() ||
             std::any_of(m_mds.begin(), m_mds.end(), [&](const auto& md) {
                 return !m_gripperCalibrations.contains(md.m_canId);
