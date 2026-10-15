@@ -602,9 +602,17 @@ uncertain, calibrate at the mechanical open stop before enabling.
 `homing_required=true` blocks normal motion until `/md/home` succeeds. The
 existing service performs the complete open-close-open calibration; there is no
 separate calibration service. Its deferred success response is sent only after
-all three searches, releases, and final reference verification complete. GRIP calls
-it sequentially on every launch. The service accepts exactly one ID; concurrent
-searches and configuration changes during a search are rejected. On a returning
+all three searches, releases, and final reference verification complete for every
+requested ID. GRIP sends all selected IDs in one request on every launch. Each
+motor has its own search/settling state and learned endpoints. Phase barriers
+keep faster motors disabled until all motors have settled, then start closing or
+reopening together. CAN transactions remain serialized in the existing executor;
+physical movement overlaps. All drives pass preflight and configuration while
+disabled before any is enabled. A failed member or explicit disable aborts the
+whole group, invalidates its calibrations and disables every member; the response
+contains `false` for every requested ID. A successful group returns all `true`.
+Empty, duplicate, unknown-ID and concurrent requests are rejected before motion.
+Configuration changes during a search are rejected. On a returning
 drive after communication/power loss, the driver schedules one homing attempt,
 one drive at a time in discovery order. It never resumes a previous grasp.
 An explicit disable or fault stop cancels pending automatic homing and keeps it
