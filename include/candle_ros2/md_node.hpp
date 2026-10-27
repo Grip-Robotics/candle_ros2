@@ -69,6 +69,8 @@ class MdNode : public rclcpp::Node
         GripperHoming sequence;
         std::chrono::steady_clock::time_point lastUpdate;
         std::shared_ptr<rmw_request_id_t> header; // Null for automatic power recovery.
+        std::chrono::steady_clock::time_point lastVerification = std::chrono::steady_clock::now();
+        unsigned diagnosticGroup = 0;
     };
     std::optional<HomingJob> m_homingJob; // One complete open/close/reopen sequence at a time.
     std::unordered_map<u16, GripperHoming::Calibration> m_gripperCalibrations;
@@ -113,6 +115,7 @@ class MdNode : public rclcpp::Node
     bool m_diagnosticStartupReady = false;
     bool m_diagnosticPollingDisabled = false;
     std::chrono::steady_clock::time_point m_lastDiagnosticRead{};
+    std::chrono::steady_clock::time_point m_lastCommandVerification{};
 
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
@@ -229,7 +232,7 @@ class MdNode : public rclcpp::Node
         mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
     bool setGripperCommand(mab::MD& md, const ImpedanceClose::Command& command);
-    bool verifyGripperCommand(mab::MD& md, const ImpedanceClose::Command& command);
+    bool verifyGripperCommand(mab::MD& md, const ImpedanceClose::Command& command, double expectedTorqueLimit = -1.0);
     bool writeRawTarget(mab::MD& md, double rawTargetPos);
     bool moveGripper(mab::MD& md, double targetPos);
     bool resetDriveErrorsIfNeeded(mab::MD& md);
