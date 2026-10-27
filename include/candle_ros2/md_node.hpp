@@ -68,11 +68,18 @@ class MdNode : public rclcpp::Node
         u16 id;
         GripperHoming sequence;
         std::chrono::steady_clock::time_point lastUpdate;
-        std::shared_ptr<rmw_request_id_t> header; // Null for automatic power recovery.
+        bool waitingForGroup = false; // Disabled and settled at the phase barrier.
         std::chrono::steady_clock::time_point lastVerification = std::chrono::steady_clock::now();
         unsigned diagnosticGroup = 0;
     };
-    std::optional<HomingJob> m_homingJob; // One complete open/close/reopen sequence at a time.
+    std::unordered_map<u16, HomingJob> m_homingJobs;
+    struct HomingGroup
+    {
+        std::vector<u16> ids;
+        std::shared_ptr<rmw_request_id_t> header; // Null for automatic power recovery.
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    };
+    std::optional<HomingGroup> m_homingGroup;
     std::unordered_map<u16, GripperHoming::Calibration> m_gripperCalibrations;
     std::unordered_set<u16> m_homingRequired;
     candle_ros2::RecoveryHomingPolicy m_autoHoming;
@@ -182,6 +189,10 @@ class MdNode : public rclcpp::Node
     void tickRecoveryJobs();
     bool isHoming(u16 id) const;
     bool startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header = nullptr);
+    bool startHomingGroup(const std::vector<u16>& ids, std::shared_ptr<rmw_request_id_t> header = nullptr);
+    bool prepareHoming(mab::MD& md);
+    bool prepareHomingSearch(mab::MD& md);
+    void tickHomingGroup();
     void tickHoming(mab::MD& md, double position, double velocity, double torque);
     void finishHoming(bool success);
     void completeHomingZero(mab::MD& md);

@@ -173,7 +173,8 @@ MdNode::~MdNode()
     // The bus is still owned here. A normal exit must not leave a latched hold.
     // A disconnected bus/process crash still requires the MD hardware watchdog.
     m_softCloseJobs.clear();
-    m_homingJob.reset();
+    m_homingJobs.clear();
+    m_homingGroup.reset();
     m_pendingDisables.clear();
     // Request every stop before waiting for any one motor to finish braking.
     for (auto& md : m_mds)
@@ -223,7 +224,7 @@ void MdNode::publishJointStates()
 {
     tickDisableJobs();
     tickRecoveryJobs();
-    if (!m_homingJob)
+    if (!m_homingGroup)
         for (auto& md : m_mds)
             if (m_autoHoming.pending(md.m_canId) &&
                 !m_recoveryContexts.contains(md.m_canId) &&
@@ -318,6 +319,12 @@ void MdNode::publishJointStates()
         msgJointStates.velocity.push_back(md.m_mdRegisters.mainEncoderVelocity.value);
         msgJointStates.effort.push_back(md.m_mdRegisters.motorTorque.value);
     }
+    tickHomingGroup();
+    // Group barriers can zero several trackers after the feedback loop above.
+    // Never publish samples in the old frame after changing the reference.
+    for (size_t i = 0; i < m_mds.size(); ++i)
+        if (std::isfinite(msgJointStates.position[i]))
+            msgJointStates.position[i] = m_positionTrackers.at(m_mds[i].m_canId).continuousPosition();
     this->pubJointState->publish(msgJointStates);
     return;
 }
@@ -1489,7 +1496,8 @@ void MdNode::stopDrive(mab::MD& md, const std::string& reason, bool recovering, 
     // Latch before the bus write: a failed disable must also cancel future work.
     m_motionInhibited.insert(md.m_canId);
     m_softCloseJobs.erase(md.m_canId);
-    if (isHoming(md.m_canId)) finishHoming(false);
+    if (m_homingGroup && std::find(m_homingGroup->ids.begin(), m_homingGroup->ids.end(), md.m_canId) != m_homingGroup->ids.end())
+        finishHoming(false);
     m_commandErrors[md.m_canId] = reason;
     RCLCPP_WARN(get_logger(), "Drive %d stopped: %s", md.m_canId, reason.c_str());
     // Repeated stop requests join the same transition, not restart its deadline.
@@ -1522,6 +1530,7 @@ bool MdNode::prepareDriveDisabled(mab::MD& md)
 void MdNode::tickDisableJobs()
 {
     using Status = candle_ros2::DisableTransition::Status;
+    bool homingFailed = false;
     for (auto& [id, stop] : m_pendingDisables)
     {
         if (stop.reported)
@@ -1540,7 +1549,7 @@ void MdNode::tickDisableJobs()
             m_commandErrors[id] += "; hardware disable unconfirmed";
             m_autoHoming.disable(id);
             m_motionInhibited.insert(id);
-            if (isHoming(id)) finishHoming(false);
+            if (isHoming(id)) homingFailed = true;
             RCLCPP_ERROR(this->get_logger(), "Drive %d disable unconfirmed", id);
             if (stop.communicationLost)
             {
@@ -1554,6 +1563,8 @@ void MdNode::tickDisableJobs()
             }
         }
     }
+    // Aborting the group can insert other pending disables; do it after iteration.
+    if (homingFailed) finishHoming(false);
     for (auto it = m_disableRequests.begin(); it != m_disableRequests.end();)
     {
         bool pending = false;
@@ -1611,7 +1622,7 @@ bool MdNode::cancelSoftClose(u16 id)
 
 bool MdNode::isHoming(u16 id) const
 {
-    return m_homingJob && m_homingJob->id == id;
+    return m_homingJobs.contains(id);
 }
 
 bool MdNode::withinCalibratedTravel(u16 id, double position) const
@@ -1624,12 +1635,8 @@ bool MdNode::withinCalibratedTravel(u16 id, double position) const
 void MdNode::cbHome(std::shared_ptr<rmw_request_id_t> header,
                     std::shared_ptr<candle_ros2::srv::Generic::Request> req)
 {
-    // Deferred reply means both stops are calibrated and the jaw is open again.
-    if (req->device_ids.size() == 1)
-    {
-        auto md = findMd(m_mds, req->device_ids.front());
-        if (md != m_mds.end() && startHoming(*md, header)) return;
-    }
+    // Reply only after the entire group has calibrated and reopened, or aborted.
+    if (startHomingGroup(req->device_ids, header)) return;
     candle_ros2::srv::Generic::Response response;
     response.success.assign(req->device_ids.size(), false);
     srvHome->send_response(*header, response);
@@ -1637,9 +1644,40 @@ void MdNode::cbHome(std::shared_ptr<rmw_request_id_t> header,
 
 bool MdNode::startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header)
 {
+    return startHomingGroup({md.m_canId}, std::move(header));
+}
+
+bool MdNode::startHomingGroup(const std::vector<u16>& ids, std::shared_ptr<rmw_request_id_t> header)
+{
+    if (ids.empty() || m_homingGroup || !m_homingJobs.empty()) return false;
+    std::unordered_set<u16> unique;
+    for (auto id : ids)
+        if (!unique.insert(id).second || findMd(m_mds, id) == m_mds.end() ||
+            m_pendingDisables.contains(id) || m_recoveryContexts.contains(id)) return false;
+
+    m_homingGroup.emplace(HomingGroup{ids, std::move(header)});
+    // Invalidate every member before setup. No drive is enabled until all
+    // preflights and configuration writes have passed with the group disabled.
+    for (auto id : ids)
+    {
+        m_gripperCalibrations.erase(id);
+        m_homingRequired.insert(id);
+        m_motionInhibited.insert(id);
+        m_softCloseJobs.erase(id);
+    }
+    for (auto id : ids)
+        if (!prepareHoming(*findMd(m_mds, id))) { finishHoming(false); return true; }
+    for (auto id : ids)
+        if (!prepareHomingSearch(*findMd(m_mds, id))) { finishHoming(false); return true; }
+    RCLCPP_INFO(get_logger(), "Homing group: opening %zu drives together", ids.size());
+    for (auto id : ids)
+        if (!enableHomingSearch(*findMd(m_mds, id))) { finishHoming(false); return true; }
+    return true;
+}
+
+bool MdNode::prepareHoming(mab::MD& md)
+{
     const auto id = md.m_canId;
-    if (m_homingJob || m_pendingDisables.contains(id) || m_recoveryContexts.contains(id))
-        return false;
     if (gripperOpenPositionRad != 0.0 || initDevicesZero)
     {
         RCLCPP_WARN(get_logger(), "Homing requires open target zero and init_devices_zero=false");
@@ -1676,26 +1714,9 @@ bool MdNode::startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header)
     m_positionTrackers.at(id).initialize(raw);
     const double direction = gripperClosedPositionRad > gripperOpenPositionRad ? -1.0 : 1.0;
     GripperHoming sequence(raw, direction, homeConfig, closeConfig, homingTravelMarginRad);
-    // Read back the homing torque cap and the independent firmware ceiling.
-    // Opening torque with velocity damping, no position spring or absolute endpoint.
-    if (!configureGripper(md, 0.0, homeConfig.damping,
-                          gripperOpenVelocityLimitRadS, homeConfig.torque) ||
-        md.readRegisters(r.maxVelocity, r.maxTorque) != mab::MD::Error_t::OK ||
-        !std::isfinite(r.maxVelocity.value) || !std::isfinite(r.maxTorque.value) ||
-        std::abs(r.maxVelocity.value - candle_ros2::gripperFirmwareVelocityCeilingRadS) > 1e-6 ||
-        std::abs(r.maxTorque.value - homeConfig.torque) > 1e-6 ||
-        md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-        !setGripperCommand(md, sequence.control.command()) ||
-        !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
-        !setGripperCommand(md, sequence.control.command()) ||
-        !verifyGripperCommand(md, sequence.control.command(), homeConfig.torque))
-    {
-        stopDrive(md, "homing setup failed; reference remains invalid");
-        return false;
-    }
     m_commandErrors.erase(id);
     m_autoHoming.activate(id);
-    m_homingJob.emplace(HomingJob{id, sequence, std::chrono::steady_clock::now(), std::move(header)});
+    m_homingJobs.emplace(id, HomingJob{id, sequence, std::chrono::steady_clock::now()});
     RCLCPP_INFO(get_logger(), "Drive %d homing: raw %.5f rad, opening effort %.2f Nm, damping %.2f, cap %.2f Nm, no preset travel bounds, firmware velocity ceiling %.3f rad/s",
                 id, raw, homeConfig.seekTorque, homeConfig.damping, homeConfig.torque,
                 static_cast<double>(candle_ros2::gripperFirmwareVelocityCeilingRadS));
@@ -1704,27 +1725,34 @@ bool MdNode::startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header)
 
 void MdNode::finishHoming(bool success)
 {
-    if (!m_homingJob) return;
-    auto header = m_homingJob->header;
-    const auto id = m_homingJob->id;
-    m_homingJob.reset();
-    if (success)
+    if (!m_homingGroup) return;
+    const auto group = std::move(*m_homingGroup);
+    // Clear before stopping members: stopDrive must not recursively abort us.
+    m_homingGroup.reset();
+    m_homingJobs.clear();
+    for (auto id : group.ids)
     {
-        m_homingRequired.erase(id);
-        m_motionInhibited.erase(id);
-        m_commandErrors.erase(id);
+        if (success)
+        {
+            m_homingRequired.erase(id);
+            m_motionInhibited.erase(id);
+            m_commandErrors.erase(id);
+        }
+        else
+        {
+            m_gripperCalibrations.erase(id);
+            m_homingRequired.insert(id);
+            stopDrive(*findMd(m_mds, id), "homing group aborted; explicit retry required");
+        }
     }
-    else
-    {
-        m_gripperCalibrations.erase(id);
-        m_homingRequired.insert(id);
-        m_motionInhibited.insert(id);
-    }
-    if (header)
+    RCLCPP_INFO(get_logger(), "Homing group %s: %zu drives, %.3f s",
+        success ? "complete" : "failed", group.ids.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - group.started).count());
+    if (group.header)
     {
         candle_ros2::srv::Generic::Response response;
-        response.success = {success};
-        try { srvHome->send_response(*header, response); }
+        response.success.assign(group.ids.size(), success);
+        try { srvHome->send_response(*group.header, response); }
         catch (const std::exception& error)
         {
             RCLCPP_ERROR(get_logger(), "Homing response failed: %s", error.what());
@@ -1732,12 +1760,79 @@ void MdNode::finishHoming(bool success)
     }
 }
 
+void MdNode::tickHomingGroup()
+{
+    if (!m_homingGroup) return;
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - m_homingGroup->started).count() >
+        3 * (homeConfig.timeout + homeConfig.releaseTimeout) + 5.0)
+    {
+        finishHoming(false);
+        return;
+    }
+    if (m_homingJobs.size() != m_homingGroup->ids.size() ||
+        std::any_of(m_homingJobs.begin(), m_homingJobs.end(), [](const auto& entry) {
+            return !entry.second.waitingForGroup ||
+                entry.second.sequence.control.state != ImpedanceHome::State::Ready;
+        })) return;
+    const auto ids = m_homingGroup->ids; // A failed hardware operation can erase the group.
+    const auto phase = m_homingJobs.at(ids.front()).sequence.phase;
+    for (auto id : ids)
+    {
+        auto& md = *findMd(m_mds, id);
+        auto& job = m_homingJobs.at(id);
+        if (job.sequence.phase != phase || m_pendingDisables.contains(id) ||
+            !candle_ros2::driveDisabled(md.m_mdRegisters.state.value))
+        {
+            stopDrive(md, "homing phase barrier lost disabled state");
+            return;
+        }
+    }
+    for (auto id : ids)
+    {
+        auto& md = *findMd(m_mds, id);
+        if (phase == GripperHoming::Phase::Opening)
+            completeHomingZero(md);
+        else if (phase == GripperHoming::Phase::Closing)
+        {
+            if (!m_homingJobs.at(id).sequence.startReopening(m_positionTrackers.at(id).continuousPosition()))
+                stopDrive(md, "homing reopening transition failed; calibration required");
+        }
+        else if (phase == GripperHoming::Phase::Ready)
+            completeHomingCalibration(md);
+        else
+            stopDrive(md, "invalid homing group phase");
+        if (!m_homingGroup) return;
+    }
+    if (phase == GripperHoming::Phase::Ready)
+    {
+        finishHoming(true);
+        return;
+    }
+    for (auto id : ids)
+        if (!prepareHomingSearch(*findMd(m_mds, id))) { finishHoming(false); return; }
+    RCLCPP_INFO(get_logger(), "Homing group: %s %zu drives together",
+        phase == GripperHoming::Phase::Opening ? "closing" : "reopening", ids.size());
+    for (auto id : ids)
+        if (!enableHomingSearch(*findMd(m_mds, id))) { finishHoming(false); return; }
+}
+
 void MdNode::tickHoming(mab::MD& md, double position, double velocity, double torque)
 {
-    auto& job = *m_homingJob;
+    auto& job = m_homingJobs.at(md.m_canId);
     const auto now = std::chrono::steady_clock::now();
     const double dt = std::chrono::duration<double>(now - job.lastUpdate).count();
     job.lastUpdate = now;
+    if (job.waitingForGroup)
+    {
+        // Passive rebound may resume while peers are still releasing. Keep
+        // checking the original settling window and release deadline, rather
+        // than freezing the first settled position or restarting the timeout.
+        job.sequence.control.state = ImpedanceHome::State::Releasing;
+        if (!candle_ros2::driveDisabled(md.m_mdRegisters.state.value) ||
+            job.sequence.control.updateRelease(position, velocity, torque, dt) == ImpedanceHome::State::Failed)
+            stopDrive(md, "homing phase barrier lost disabled/settled feedback before release deadline");
+        return;
+    }
     const bool releasing = job.sequence.control.state == ImpedanceHome::State::Releasing;
     if (releasing)
     {
@@ -1780,21 +1875,8 @@ void MdNode::tickHoming(mab::MD& md, double position, double velocity, double to
     if (releasing)
     {
         if (state != ImpedanceHome::State::Ready) return;
-        if (job.sequence.phase == GripperHoming::Phase::Opening)
-            completeHomingZero(md);
-        else if (job.sequence.phase == GripperHoming::Phase::Closing)
-        {
-            RCLCPP_INFO(get_logger(), "Drive %d closing homing released at %.5f rad; reopening for unloaded settling",
-                        md.m_canId, position);
-            if (!job.sequence.startReopening(position))
-                stopDrive(md, "homing reopening transition failed; calibration required");
-            else
-                enableHomingSearch(md);
-        }
-        else if (job.sequence.phase == GripperHoming::Phase::Ready)
-            completeHomingCalibration(md);
-        else
-            stopDrive(md, "invalid homing release phase; calibration required");
+        job.waitingForGroup = true;
+        RCLCPP_INFO(get_logger(), "Drive %d homing phase settled; waiting for group", md.m_canId);
         return;
     }
     // Verify the search command before clearing it or accepting a reference.
@@ -1809,13 +1891,13 @@ void MdNode::tickHoming(mab::MD& md, double position, double velocity, double to
                 md.m_canId, stage, position, torque);
     // Disable asynchronously: braking may exceed a control tick, but no zero or
     // new command is allowed before confirmed disabled feedback and release dwell.
-    if (!m_homingJob->sequence.beginRelease())
+    if (!m_homingJobs.at(md.m_canId).sequence.beginRelease())
     {
         stopDrive(md, "homing release transition failed; calibration required");
         return;
     }
     m_pendingDisables.try_emplace(md.m_canId, md);
-    m_homingJob->lastUpdate = std::chrono::steady_clock::now();
+    m_homingJobs.at(md.m_canId).lastUpdate = std::chrono::steady_clock::now();
 }
 
 void MdNode::completeHomingZero(mab::MD& md)
@@ -1838,40 +1920,51 @@ void MdNode::completeHomingZero(mab::MD& md)
     const double raw = *zeroPosition;
     m_positionTrackers.at(md.m_canId).resetAtZero();
     m_positionTrackers.at(md.m_canId).observe(raw);
-    if (!m_homingJob->sequence.startClosing(raw))
+    if (!m_homingJobs.at(md.m_canId).sequence.startClosing(raw))
     {
         stopDrive(md, "homing zero-to-close transition failed; calibration required");
         return;
     }
     RCLCPP_INFO(get_logger(), "Drive %d open reference zeroed; seeking closed stop (travel margin %.3f rad)",
                 md.m_canId, homingTravelMarginRad);
-    enableHomingSearch(md);
 }
 
-bool MdNode::enableHomingSearch(mab::MD& md)
+bool MdNode::prepareHomingSearch(mab::MD& md)
 {
     // Each new search starts with a fresh command in the current encoder frame.
     // The previous phase has already confirmed disabled and unloaded feedback.
-    const auto command = m_homingJob->sequence.control.command();
-    const bool closing = m_homingJob->sequence.phase == GripperHoming::Phase::Closing;
+    const auto command = m_homingJobs.at(md.m_canId).sequence.control.command();
+    const bool closing = m_homingJobs.at(md.m_canId).sequence.phase == GripperHoming::Phase::Closing;
     const double speed = closing ? gripperVelocityLimitRadS : gripperOpenVelocityLimitRadS;
     if (!configureGripper(md, 0.0, homeConfig.damping, speed, homeConfig.torque) ||
         md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
-        !setGripperCommand(md, command) ||
-        !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
-        !setGripperCommand(md, command) || !verifyGripperCommand(md, command))
+        !setGripperCommand(md, command))
     {
         stopDrive(md, "homing stage setup failed; calibration required");
         return false;
     }
-    m_homingJob->lastUpdate = std::chrono::steady_clock::now();
-    m_homingJob->lastVerification = m_homingJob->lastUpdate;
+    return true;
+}
+
+bool MdNode::enableHomingSearch(mab::MD& md)
+{
+    const auto command = m_homingJobs.at(md.m_canId).sequence.control.command();
+    if (!candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
+        !setGripperCommand(md, command) || !verifyGripperCommand(md, command))
+    {
+        stopDrive(md, "homing stage enable/readback failed; calibration required");
+        return false;
+    }
+    auto& job = m_homingJobs.at(md.m_canId);
+    job.waitingForGroup = false;
+    job.lastUpdate = std::chrono::steady_clock::now();
+    job.lastVerification = job.lastUpdate;
     return true;
 }
 
 void MdNode::completeHomingCalibration(mab::MD& md)
 {
-    const auto calibration = m_homingJob->sequence.calibration();
+    const auto calibration = m_homingJobs.at(md.m_canId).sequence.calibration();
     if (!calibration)
     {
         stopDrive(md, "homing calibration incomplete; calibration required");
@@ -1892,7 +1985,6 @@ void MdNode::completeHomingCalibration(mab::MD& md)
     release.state = ImpedanceClose::State::TorqueHold;
     m_softCloseJobs.insert_or_assign(md.m_canId, SoftCloseJob{release, std::chrono::steady_clock::now(), true});
     m_gripperCalibrations.insert_or_assign(md.m_canId, *calibration);
-    finishHoming(true);
     RCLCPP_INFO(get_logger(), "Drive %d homing complete: closed stop %.5f rad, travel [%.5f, %.5f] rad; "
                 "reopened at %.5f rad, released at 0 Nm; loaded open stop %.5f rad; normal limits restored", md.m_canId,
                 calibration->closedPosition, calibration->motion.travelMin, calibration->motion.travelMax, position,
@@ -1901,7 +1993,8 @@ void MdNode::completeHomingCalibration(mab::MD& md)
 
 bool MdNode::releasingDisabled(u16 id) const
 {
-    return isHoming(id) && m_homingJob->sequence.control.state == ImpedanceHome::State::Releasing;
+    return isHoming(id) && (m_homingJobs.at(id).waitingForGroup ||
+        m_homingJobs.at(id).sequence.control.state == ImpedanceHome::State::Releasing);
 }
 
 double MdNode::normalizedSpeedToRadS(double normalizedSpeed)
