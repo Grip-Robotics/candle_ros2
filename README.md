@@ -24,8 +24,10 @@ The independent `open_timeout_s` deadline (0.5 s) releases commanded torque,
 Kp and Kd to zero regardless of final position. This remains a bounded opening
 attempt, not confirmation of a fully open jaw. Release stays passive through
 rebound or manual displacement until a new explicit command. Sustained opening
-resistance with insufficient motion still causes an obstruction stop, including
-near zero; stale/invalid feedback and hardware faults still stop the drive.
+resistance with insufficient motion releases effort without a fault when within
+`open_obstruction_tolerance_rad` (1 degree) of the calibrated open target. Outside
+that band it still causes an obstruction stop. This band does not waive
+stale/invalid feedback or hardware faults.
 Closing endpoint recognition and calibration tolerances are unchanged.
 Homing alone uses effort-qualified stop searches and disabled unloaded releases.
 
@@ -333,6 +335,7 @@ The node accepts `bus:=USB|SPI`, `data_rate:=1M|2M|5M|8M`,
 | `close_contact_velocity_rad_s` | 0.03 | Object-window average velocity/range threshold; instantaneous/position-derived threshold for normal opening and closed-endpoint settling |
 | `close_contact_duration_s` | 0.15 | Consecutive contact or settled-endpoint evidence required |
 | `close_timeout_s` | 2.0 | No-object closing/reacquisition torque-capture deadline |
+| `open_obstruction_tolerance_rad` | 0.017453292519943295 | Opening resistance inside this 1-degree band releases effort without a jam fault; closing is unchanged |
 | `open_timeout_s` | 0.5 | Normal-opening passive-release deadline, including after calibration; timeout leaves the endpoint unconfirmed |
 | `close_feedback_timeout_s` | 0.25 | Maximum interval between valid control samples |
 | `joint_state_publish_period_ms` | 50 | Batched feedback and close control period |
@@ -881,3 +884,13 @@ object retention, or the internal firmware cause of a fault.
 - [Motion modes](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/MD/motion.html)
 - [Safety and watchdog](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/MD/safety.html)
 - [CANdleTool](https://mabrobotics.github.io/MD80-x-CANdle-Documentation/CANdle-SDK/CANdleTool.html)
+
+### Startup reboot before discovery
+
+`/md/startup_reboot` (`Generic`) accepts an explicit unique list of drive IDs, once
+per process and only before any MD is registered. It logs state and fault registers,
+confirms all selected drives disabled or in latched FAULT, reboots each once, and
+requires disabled/idle, zero quick status and target torque, and a 1–250 ms watchdog.
+There is no enable, zero, flash-save or homing in this service. The caller must add
+and home drives afterward. Missing communication, a persistent fault or a failed
+reboot acknowledgment prevents success; the service never loops resets.
