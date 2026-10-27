@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include "candle_ros2/impedance_close.hpp"
+#include "candle_ros2/impedance_home.hpp"
 
 struct candleParams_S
 {
@@ -13,13 +15,12 @@ struct candleParams_S
     double      gripper_impedance_kp;
     double      gripper_impedance_kd;
     double      gripper_velocity_limit_rad_s;
+    double      gripper_open_velocity_limit_rad_s;
     double      gripper_torque_limit_nm;
-    double      soft_close_fast_torque_limit_nm;
     double      soft_close_slow_torque_limit_nm;
-    double      soft_close_profile_acceleration_rad_s2;
-    double      soft_close_profile_deceleration_rad_s2;
-    double      soft_close_closed_tol_rad;
-    int         soft_close_fast_duration_ms;
+    ImpedanceClose::Config close;
+    ImpedanceHome::Config home;
+    bool        homing_required;
     int         joint_state_publish_period_ms;
     int         health_publish_period_ms;
     int         md_can_response_timeout_100us;
