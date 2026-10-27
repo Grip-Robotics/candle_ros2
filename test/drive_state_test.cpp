@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <utility>
 #include <vector>
 #include "candle_ros2/drive_state.hpp"
@@ -29,6 +30,79 @@ struct Drive
         return readResult;
     }
 };
+
+struct LimitDrive
+{
+    enum class Error_t { OK, Failed };
+    struct Register
+    {
+        float value = 0;
+        Register& operator=(float next) { value = next; return *this; }
+    };
+    struct { Register profileVelocity, maxVelocity, maxTorque; } m_mdRegisters;
+    std::array<float, 3> hardware{10, 10, 2};
+    std::optional<std::array<float, 3>> forcedReadback;
+    Error_t writeResult = Error_t::OK, readResult = Error_t::OK;
+    unsigned writes = 0, reads = 0;
+    Error_t writeRegisters(Register& profile, Register& ceiling, Register& torque)
+    {
+        ++writes;
+        if (writeResult == Error_t::OK) hardware = {profile.value, ceiling.value, torque.value};
+        return writeResult;
+    }
+    Error_t readRegisters(Register& profile, Register& ceiling, Register& torque)
+    {
+        ++reads;
+        const auto values = forcedReadback.value_or(hardware);
+        profile = values[0]; ceiling = values[1]; torque = values[2];
+        return readResult;
+    }
+};
+}
+
+TEST(DriveStateTest, GripperVelocityCeilingDoesNotFollowOpeningClosingOrHomingRamp)
+{
+    LimitDrive md;
+    // The shared configuration path serves opening, closing, homing and init.
+    // Reconfiguring a slower target must not reinstate the old 10 rad/s trip.
+    for (const auto [ramp, torque] : {std::pair{10.f, 2.f}, {2.f, 2.f},
+                                      {10.f, 1.f}, {2.f, 2.f}})
+    {
+        ASSERT_TRUE(candle_ros2::configureGripperLimits(md, ramp, torque));
+        EXPECT_FLOAT_EQ(md.hardware[0], ramp);
+        EXPECT_FLOAT_EQ(md.hardware[1], 1500.f);
+        EXPECT_FLOAT_EQ(md.hardware[2], torque);
+    }
+    EXPECT_EQ(md.writes, 4u);
+    EXPECT_EQ(md.reads, 4u);
+}
+
+TEST(DriveStateTest, GripperLimitsRequireSuccessfulWriteAndReadback)
+{
+    LimitDrive md;
+    md.writeResult = LimitDrive::Error_t::Failed;
+    EXPECT_FALSE(candle_ros2::configureGripperLimits(md, 10, 2));
+    EXPECT_EQ(md.reads, 0u);
+    EXPECT_FLOAT_EQ(md.hardware[1], 10.f);
+    md.writeResult = LimitDrive::Error_t::OK;
+    md.readResult = LimitDrive::Error_t::Failed;
+    EXPECT_FALSE(candle_ros2::configureGripperLimits(md, 10, 2));
+    EXPECT_EQ(md.reads, 1u);
+}
+
+TEST(DriveStateTest, GripperLimitsRejectClampedStaleAndNonfiniteReadback)
+{
+    for (const auto readback : {std::array<float, 3>{10, 10, 2},
+                               {10, 1500, 3}, {2, 1500, 2},
+                               {NAN, 1500, 2}, {10, NAN, 2}, {10, 1500, NAN},
+                               {10, INFINITY, 2}})
+    {
+        LimitDrive md;
+        md.forcedReadback = readback;
+        EXPECT_FALSE(candle_ros2::configureGripperLimits(md, 10, 2));
+        EXPECT_EQ(md.writes, 1u);
+        EXPECT_EQ(md.reads, 1u);
+    }
 }
 
 TEST(DriveStateTest, StateFlagsDoNotHideDisabledQuickStopOrFault)

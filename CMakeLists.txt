@@ -67,7 +67,7 @@ rosidl_get_typesupport_target(cpp_typesupport_target
 
 file(GLOB_RECURSE pds_sources "src/pds_modules/*.cpp")
 
-add_library(${md_node_name} STATIC src/md_node.cpp)
+add_library(${md_node_name} STATIC src/md_node.cpp src/md_diagnostics.cpp)
 target_include_directories(${md_node_name} PUBLIC include)
 ament_target_dependencies(${md_node_name} rclcpp rclcpp_components sensor_msgs)
 target_link_libraries(${md_node_name} ${cpp_typesupport_target} candle)
@@ -112,6 +112,28 @@ if(BUILD_TESTING)
     include)
   ament_add_gtest(drive_state_test test/drive_state_test.cpp)
   target_include_directories(drive_state_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(impedance_home_test test/impedance_home_test.cpp)
+  target_include_directories(impedance_home_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(md_node_test test/md_node_test.cpp)
+  target_link_libraries(md_node_test md_node)
+  ament_target_dependencies(md_node_test rclcpp sensor_msgs)
+  target_include_directories(md_node_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(transport_test test/transport_test.cpp)
+  target_link_libraries(transport_test candle)
+  target_include_directories(transport_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include)
+  ament_add_gtest(command_safety_test test/command_safety_test.cpp)
+  target_include_directories(command_safety_test BEFORE PRIVATE
+    CANdle-SDK/commons/googletest/googletest/include
+    include)
+  ament_add_gtest(gripper_homing_test test/gripper_homing_test.cpp)
+  target_include_directories(gripper_homing_test BEFORE PRIVATE
     CANdle-SDK/commons/googletest/googletest/include
     include)
 endif()

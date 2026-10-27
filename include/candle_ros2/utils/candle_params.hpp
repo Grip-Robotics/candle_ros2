@@ -21,6 +21,7 @@ struct candleParams_S
     ImpedanceClose::Config close;
     ImpedanceHome::Config home;
     bool        homing_required;
+    double      homing_travel_margin_rad = 0.5;
     int         joint_state_publish_period_ms;
     int         health_publish_period_ms;
     int         md_can_response_timeout_100us;

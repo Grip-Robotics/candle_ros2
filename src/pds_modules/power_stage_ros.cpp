@@ -41,22 +41,21 @@ void PowerStageRos::publishStatus()
 
     msg.header.stamp = m_parentNode->get_clock()->now();
 
-    m_powerStage->getEnabled(msg.enabled);
-
-    mab::socketIndex_E sck;
-    m_powerStage->getBindBrakeResistor(sck);
+    mab::socketIndex_E sck = mab::socketIndex_E::UNASSIGNED;
+    if (m_powerStage->getEnabled(msg.enabled) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getBindBrakeResistor(sck) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getBrakeResistorTriggerVoltage(msg.trigger_voltage) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getOutputVoltage(msg.output_voltage) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getAutostart(msg.autostart) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getLoadCurrent(msg.load_current) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getPower(msg.power) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getTotalDeliveredEnergy(msg.energy) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getOcdLevel(msg.ocd_level) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getOcdDelay(msg.ocd_delay) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getTemperature(msg.temperature) != mab::PdsModule::error_E::OK ||
+        m_powerStage->getTemperatureLimit(msg.temperature_limit) != mab::PdsModule::error_E::OK)
+        return;
     msg.brake_resistor_socket = static_cast<uint8_t>(sck);
-
-    m_powerStage->getBrakeResistorTriggerVoltage(msg.trigger_voltage);
-    m_powerStage->getOutputVoltage(msg.output_voltage);
-    m_powerStage->getAutostart(msg.autostart);
-    m_powerStage->getLoadCurrent(msg.load_current);
-    m_powerStage->getPower(msg.power);
-    m_powerStage->getTotalDeliveredEnergy(msg.energy);
-    m_powerStage->getOcdLevel(msg.ocd_level);
-    m_powerStage->getOcdDelay(msg.ocd_delay);
-    m_powerStage->getTemperature(msg.temperature);
-    m_powerStage->getTemperatureLimit(msg.temperature_limit);
 
     pubData->publish(msg);
 }

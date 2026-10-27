@@ -25,10 +25,10 @@ TEST(ImpedanceHome, OpeningTorqueCrossesZeroAndStopRequiresFullPositionDwell)
             EXPECT_DOUBLE_EQ(home.command().kd, .5);
             EXPECT_DOUBLE_EQ(home.command().torque, direction * 1.0);
         }
-        // Position alone identifies the stop; no minimum torque or velocity gate.
+        // Position dwell requires directional effort, but not the noisy velocity estimate.
         for (int i = 0; i < 24; ++i)
-            EXPECT_EQ(home.update(direction * .1, 8, i % 2 ? .3 : 0, .01), ImpedanceHome::State::Searching);
-        EXPECT_EQ(home.update(direction * .1, 8, 0, .01), ImpedanceHome::State::Found);
+            EXPECT_EQ(home.update(direction * .1, 8, direction * .7, .01), ImpedanceHome::State::Searching);
+        EXPECT_EQ(home.update(direction * .1, 8, direction * .7, .01), ImpedanceHome::State::Found);
         EXPECT_DOUBLE_EQ(home.command().torque, 0);
         EXPECT_DOUBLE_EQ(home.command().kp, 0);
         EXPECT_DOUBLE_EQ(home.command().kd, 0);
@@ -51,7 +51,7 @@ TEST(ImpedanceHome, GuardsNeverProduceHomeAndSettingsAreBounded)
     for (int i = 0; i < 210; ++i) home.update(-.1 - i * .001, 0, 0, .01);
     EXPECT_EQ(home.state, ImpedanceHome::State::Failed);
     for (const auto& sample : std::vector<std::array<double, 4>>{
-             {-.97, 0, -1, .01}, {-.09, 0, 0, .01},
+             {-.09, 0, 0, .01},
              {-.1, 0, -2.11, .01}, {-.1, 0, 2.11, .01}, {-.1, 0, -1, .3},
              {NAN, 0, 0, .01}, {-.1, NAN, 0, .01}, {-.1, 0, NAN, .01},
              {-.1, 0, 0, NAN}, {-.1, 0, 0, 0}, {-.1, 0, 0, -.01}})
@@ -77,7 +77,7 @@ TEST(ImpedanceHome, GuardsNeverProduceHomeAndSettingsAreBounded)
     EXPECT_THROW(ImpedanceHome(NAN, -1, {}, motion), std::invalid_argument);
     EXPECT_THROW(ImpedanceHome(-.1, 0, {}, motion), std::invalid_argument);
     ImpedanceHome delayed(-.1, -1, {}, motion);
-    for (int i = 0; i < 4; ++i) delayed.update(-.1, 0, 0, .2);
+    for (int i = 0; i < 4; ++i) delayed.update(-.1, 0, -1, .2);
     EXPECT_EQ(delayed.state, ImpedanceHome::State::Searching); // No catch-up dwell.
     EXPECT_NEAR(delayed.settledTime, .04, 1e-12);
 }
@@ -145,7 +145,7 @@ TEST(ImpedanceHome, ReleaseStillRejectsBadFeedbackMotionAndTorqueThatNeverSettle
     {
         ImpedanceHome unsettled(-.2, -1, {}, motion);
         unsettled.beginRelease();
-        for (int i = 0; i < 210; ++i)
+        for (int i = 0; i < 310; ++i)
             unsettled.updateRelease(loaded ? -.2 : -.2 + i * .001, 0, loaded ? .2 : 0, .01);
         EXPECT_EQ(unsettled.state, ImpedanceHome::State::Failed);
     }
@@ -155,18 +155,19 @@ TEST(ImpedanceCloseTest, AbsoluteTravelLimitsDoNotMoveWithTargetsOrSettlingToler
 {
     auto config = ImpedanceClose::Config{};
     EXPECT_DOUBLE_EQ(config.travelMin, -0.05);
-    EXPECT_DOUBLE_EQ(config.travelMax, 0.75);
+    EXPECT_DOUBLE_EQ(config.travelMax, 0.80);
     EXPECT_DOUBLE_EQ(config.tolerance, 0.005);
     EXPECT_DOUBLE_EQ(config.closedHoldTorque, 0.25);
+    EXPECT_TRUE(config.travelLimitsEnabled);
     for (double direction : {1.0, -1.0})
     {
-        config.travelMin = direction > 0.0 ? -0.05 : -0.75;
-        config.travelMax = direction > 0.0 ? 0.75 : 0.05;
+        config.travelMin = direction > 0.0 ? -0.05 : -0.80;
+        config.travelMax = direction > 0.0 ? 0.80 : 0.05;
         for (double position : {direction * -0.05, direction * -0.049999,
-                                direction * 0.749999, direction * 0.75})
+                                direction * 0.75, direction * 0.7615,
+                                direction * 0.799999, direction * 0.80})
             EXPECT_TRUE(config.withinTravel(position));
-        for (double position : {direction * -0.050001, direction * 0.750001,
-                                direction * 0.80,
+        for (double position : {direction * -0.050001, direction * 0.800001,
                                 std::numeric_limits<double>::quiet_NaN(),
                                 std::numeric_limits<double>::infinity()})
             EXPECT_FALSE(config.withinTravel(position));
@@ -176,7 +177,8 @@ TEST(ImpedanceCloseTest, AbsoluteTravelLimitsDoNotMoveWithTargetsOrSettlingToler
                       ImpedanceClose::State::Closing);
         ImpedanceClose closing(direction * 0.743, direction * 0.75, 1.5, config);
         EXPECT_DOUBLE_EQ(closing.closed, direction * 0.75);
-        EXPECT_FALSE(closing.config.withinTravel(direction * 0.750001));
+        EXPECT_TRUE(closing.config.withinTravel(direction * 0.7615));
+        EXPECT_FALSE(closing.config.withinTravel(direction * 0.800001));
         for (int i = 0; i < 10; ++i)
             EXPECT_EQ(closing.update(direction * 0.743, 0.0, direction * 0.1, 0.05),
                       ImpedanceClose::State::Closing);
@@ -319,13 +321,61 @@ TEST(ImpedanceCloseTest, OpeningRampsAtItsOwnSpeedWithLeadBoundAndNoIntegral)
                 EXPECT_DOUBLE_EQ(motion.command().kd, 0);
                 continue;
             }
-            ASSERT_EQ(motion.state, ImpedanceClose::State::Closed);
+            ASSERT_EQ(motion.state, ImpedanceClose::State::TorqueHold);
+            EXPECT_GE(motion.elapsed, config.openTimeout);
             EXPECT_NEAR(motion.target, 0.0, 1e-12);
             EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
-            EXPECT_DOUBLE_EQ(motion.command().kp, motion.config.kp);
-            EXPECT_DOUBLE_EQ(motion.command().kd, motion.config.kd);
+            EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kd, 0.0);
             motion.update(direction * 0.06, 0.0, 0.0, 0.05);
             EXPECT_LE(std::abs(motion.target - direction * 0.06), config.openLead + 1e-12);
+            EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kd, 0.0);
+        }
+}
+
+TEST(ImpedanceCloseTest, AlreadyOpenReleasesAtDeadlineWithoutSearchTorqueOrClosingFloor)
+{
+    auto config = ImpedanceClose::Config{};
+    config.openLead = .14;
+    config.kp = 30.0;
+    config.kd = .2;
+    config.ki = 5.0;
+    config.closedHoldTorque = .25;
+    for (double direction : {-1.0, 1.0})
+        for (double position : {0.0, direction * .002, -direction * .002})
+        {
+            // Position near zero does not finish opening before the deadline.
+            // Reopening an already-open jaw must never start a -1 Nm stop search.
+            ImpedanceClose opening(position, 0.0, 10.0, config, true, -direction);
+            for (int i = 0; i < 50; ++i)
+            {
+                opening.update(position, 0.0, 0.0, .01);
+                EXPECT_DOUBLE_EQ(opening.command().torque, 0.0);
+                EXPECT_DOUBLE_EQ(opening.integralTorque, 0.0);
+                EXPECT_FALSE(opening.hasObject);
+            }
+            ASSERT_EQ(opening.state, ImpedanceClose::State::TorqueHold);
+            EXPECT_GE(opening.elapsed, config.openTimeout);
+            EXPECT_DOUBLE_EQ(opening.command().kp, 0.0);
+            EXPECT_DOUBLE_EQ(opening.command().kd, 0.0);
+
+            // Release remains passive after rebound, without another search.
+            for (int i = 0; i < 60; ++i)
+            {
+                EXPECT_EQ(opening.update(direction * .06, direction * .2, 0.0, .01),
+                          ImpedanceClose::State::TorqueHold);
+                EXPECT_DOUBLE_EQ(opening.command().torque, 0.0);
+                EXPECT_DOUBLE_EQ(opening.command().kp, 0.0);
+                EXPECT_DOUBLE_EQ(opening.command().kd, 0.0);
+            }
+            for (bool stale : {false, true})
+            {
+                auto failed = opening;
+                EXPECT_EQ(failed.update(stale ? position : NAN, 0.0, 0.0,
+                                        stale ? .3 : .01), ImpedanceClose::State::Failed);
+            }
         }
 }
 
@@ -1205,5 +1255,60 @@ TEST(ImpedanceCloseTest, UnloadedClosingPlantKeepsBrakingAndSettlesWithoutRunawa
             EXPECT_LT(peakPosition, 0.75);
             EXPECT_GT(position, 0.73);
             EXPECT_LT(std::abs(velocity), 0.05);
+        }
+}
+
+TEST(ImpedanceCloseTest, DisabledTravelLimitsStillRequireFinitePositions)
+{
+    auto config = ImpedanceClose::Config{};
+    config.travelLimitsEnabled = false;
+    for (double position : {-1000.0, -.105768, 1.5, 1000.0})
+        EXPECT_TRUE(config.withinTravel(position));
+    for (double position : {static_cast<double>(NAN), static_cast<double>(INFINITY),
+                            -static_cast<double>(INFINITY)})
+        EXPECT_FALSE(config.withinTravel(position));
+    ImpedanceClose close(-.105768, .75, 2.0, config);
+    EXPECT_DOUBLE_EQ(close.closed, .75);
+    EXPECT_DOUBLE_EQ(close.config.lead, .04);
+    EXPECT_EQ(close.update(NAN, 0, 0, .01), ImpedanceClose::State::Failed);
+}
+
+TEST(ImpedanceCloseTest, NormalOpeningDeadlineDoesNotDependOnEndpointTolerance)
+{
+    for (double tolerance : {.001, .005, .02})
+        for (double position : {0.0, .002, .013, .04})
+        {
+            auto config = ImpedanceClose::Config{};
+            config.tolerance = tolerance;
+            config.objectMargin = .03;
+            ImpedanceClose motion(position, 0.0, 10.0, config, true, -1.0);
+            for (int i = 0; i < 49; ++i)
+                EXPECT_EQ(motion.update(position, 0.0, 0.0, .01),
+                          ImpedanceClose::State::Closing);
+            EXPECT_EQ(motion.update(position, 0.0, 0.0, .01),
+                      ImpedanceClose::State::TorqueHold);
+            EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kd, 0.0);
+            EXPECT_FALSE(motion.hasObject);
+        }
+}
+
+TEST(ImpedanceCloseTest, OpeningRetainsResistanceStopIncludingRecordedDrive113Values)
+{
+    // October 5: drive 113 stopped near 0.01285 rad, 0.0221 rad/s,
+    // with -0.382 Nm opening torque. Removing position acceptance must
+    // not conceal that sustained-resistance event or exempt points near zero.
+    for (double position : {.01285, .002})
+        for (double direction : {-1.0, 1.0})
+        {
+            ImpedanceClose motion(direction * position, 0.0, 10.0, {}, true, -direction);
+            motion.update(direction * position, 0.0, 0.0, .01);
+            for (int i = 0; i < 16; ++i)
+                motion.update(direction * position, direction * .0221,
+                              -direction * .382, .01);
+            EXPECT_EQ(motion.state, ImpedanceClose::State::Contact);
+            EXPECT_LT(motion.elapsed, motion.config.openTimeout);
+            EXPECT_FALSE(motion.hasObject);
         }
 }

@@ -30,6 +30,9 @@
 #include "candle_ros2/position_tracker.hpp"
 #include "candle_ros2/impedance_close.hpp"
 #include "candle_ros2/drive_state.hpp"
+#include "candle_ros2/gripper_homing.hpp"
+#include "candle_ros2/command_safety.hpp"
+#include "candle_ros2/drive_diagnostics.hpp"
 
 /* CANdle-SDK */
 #include "candle.hpp"
@@ -38,6 +41,7 @@
 
 class MdNode : public rclcpp::Node
 {
+    friend class MdNodeTestAccess;
   public:
     MdNode(const rclcpp::NodeOptions&   options,
            std::shared_ptr<mab::Candle> candle,
@@ -50,6 +54,7 @@ class MdNode : public rclcpp::Node
         ImpedanceClose control;
         std::chrono::steady_clock::time_point lastUpdate;
         bool opening;
+        std::chrono::steady_clock::time_point lastVerification = std::chrono::steady_clock::now();
     };
 
     struct RecoveryContext
@@ -61,13 +66,14 @@ class MdNode : public rclcpp::Node
     struct HomingJob
     {
         u16 id;
-        ImpedanceHome control;
+        GripperHoming sequence;
         std::chrono::steady_clock::time_point lastUpdate;
         std::shared_ptr<rmw_request_id_t> header; // Null for automatic power recovery.
     };
-    std::optional<HomingJob> m_homingJob; // One mechanical-stop search at a time.
+    std::optional<HomingJob> m_homingJob; // One complete open/close/reopen sequence at a time.
+    std::unordered_map<u16, GripperHoming::Calibration> m_gripperCalibrations;
     std::unordered_set<u16> m_homingRequired;
-    std::unordered_set<u16> m_autoHomePending;
+    candle_ros2::RecoveryHomingPolicy m_autoHoming;
 
     struct DisableRequest
     {
@@ -99,6 +105,15 @@ class MdNode : public rclcpp::Node
     std::unordered_map<u16, PendingDisable> m_pendingDisables;
     std::vector<DisableRequest> m_disableRequests;
 
+    // Same mutually exclusive callback group as control; no diagnostic worker
+    // accesses the bus or drive state concurrently.
+    std::unordered_map<u16, candle_ros2::DriveDiagnosticHistory> m_diagnostics;
+    size_t m_diagnosticCursor = 0;
+    uint64_t m_diagnosticSequence = 0;
+    bool m_diagnosticStartupReady = false;
+    bool m_diagnosticPollingDisabled = false;
+    std::chrono::steady_clock::time_point m_lastDiagnosticRead{};
+
     std::string jointNamePrefix;
     double      gripperOpenPositionRad;
     double      gripperClosedPositionRad;
@@ -110,6 +125,7 @@ class MdNode : public rclcpp::Node
     float       softCloseSlowTorqueLimitNm;
     ImpedanceClose::Config closeConfig;
     ImpedanceHome::Config homeConfig;
+    double homingTravelMarginRad;
     bool homingRequired;
     int         jointStatePublishPeriodMs;
     int         healthPublishPeriodMs;
@@ -148,9 +164,16 @@ class MdNode : public rclcpp::Node
 
     void publishJointStates();
     void publishHealth();
+    void recordDiagnosticFeedback(mab::MD& md, bool valid, double logicalPosition);
+    void captureDiagnosticFault(mab::MD& md, const std::string& reason);
+    void publishDiagnostics();
+    void flushDiagnosticFaults();
+    std::string readDiagnosticRegisters(mab::MD& md, int group, uint64_t faultSequence);
     void tickSoftClose(mab::MD& md, double position, double velocity, double torque);
+    bool releasingDisabled(u16 id) const;
     bool startImpedanceMotion(mab::MD& md, double speed, bool opening = false);
-    void stopDrive(mab::MD& md, const std::string& reason);
+    void stopDrive(mab::MD& md, const std::string& reason, bool recovering = false,
+                   bool diagnosticFault = true);
     bool prepareDriveDisabled(mab::MD& md);
     void tickDisableJobs();
     void tickRecoveryJobs();
@@ -159,6 +182,9 @@ class MdNode : public rclcpp::Node
     void tickHoming(mab::MD& md, double position, double velocity, double torque);
     void finishHoming(bool success);
     void completeHomingZero(mab::MD& md);
+    bool enableHomingSearch(mab::MD& md);
+    void completeHomingCalibration(mab::MD& md);
+    bool withinCalibratedTravel(u16 id, double position) const;
     void cbHome(std::shared_ptr<rmw_request_id_t> header,
                 std::shared_ptr<candle_ros2::srv::Generic::Request> req);
 
@@ -198,6 +224,7 @@ class MdNode : public rclcpp::Node
         mab::MD& md, double kp, double kd, double velocityLimit, double torqueLimit);
     bool setGripperTarget(mab::MD& md, double targetPos);
     bool setGripperCommand(mab::MD& md, const ImpedanceClose::Command& command);
+    bool verifyGripperCommand(mab::MD& md, const ImpedanceClose::Command& command);
     bool writeRawTarget(mab::MD& md, double rawTargetPos);
     bool moveGripper(mab::MD& md, double targetPos);
     bool resetDriveErrorsIfNeeded(mab::MD& md);
