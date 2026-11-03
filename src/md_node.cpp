@@ -1172,7 +1172,7 @@ bool MdNode::setGripperCommand(mab::MD& md, const ImpedanceClose::Command& comma
     return true;
 }
 
-bool MdNode::verifyGripperCommand(mab::MD& md, const ImpedanceClose::Command& command)
+bool MdNode::verifyGripperCommand(mab::MD& md, const ImpedanceClose::Command& command, double expectedTorqueLimit)
 {
     const auto tracker = m_positionTrackers.find(md.m_canId);
     if (tracker == m_positionTrackers.end()) return false;
@@ -1180,13 +1180,46 @@ bool MdNode::verifyGripperCommand(mab::MD& md, const ImpedanceClose::Command& co
     const auto same = [](double actual, double expected) {
         return std::isfinite(actual) && std::abs(actual - expected) <= 1e-5 * std::max(1.0, std::abs(expected));
     };
-    if (md.readRegisters(r.canID, r.state, r.motionModeStatus, r.motorImpPidKp, r.motorImpPidKd,
-                         r.targetPosition, r.targetVelocity, r.targetTorque) != mab::MD::Error_t::OK ||
-        r.canID.value != md.m_canId ||
-        !candle_ros2::driveEnabled(r.state.value) || r.motionModeStatus.value != mab::MdMode_E::IMPEDANCE ||
-        !same(r.motorImpPidKp.value, command.kp) || !same(r.motorImpPidKd.value, command.kd) ||
-        !same(r.targetPosition.value, tracker->second.logicalToRaw(command.position)) ||
-        !same(r.targetVelocity.value, 0.0) || !same(r.targetTorque.value, command.torque))
+    // Keep each synchronous MD request <=32 bytes. Also verify the output cap
+    // after enable, not just configuration RAM before the transition.
+    const double torqueLimit = expectedTorqueLimit >= 0.0 ? expectedTorqueLimit :
+        (isHoming(md.m_canId) ? homeConfig.torque :
+         std::min(gripperTorqueLimitNm, softCloseSlowTorqueLimitNm));
+    const bool readOk =
+        md.readRegisters(r.canID, r.state, r.motionModeStatus, r.canWatchdog, r.maxTorque) == mab::MD::Error_t::OK &&
+        md.readRegisters(r.motorImpPidKp, r.motorImpPidKd, r.targetPosition, r.targetVelocity, r.targetTorque) == mab::MD::Error_t::OK &&
+        md.readRegister(r.maxVelocity) == mab::MD::Error_t::OK;
+    const bool matches = readOk && r.canID.value == md.m_canId &&
+        candle_ros2::driveEnabled(r.state.value) && r.motionModeStatus.value == mab::MdMode_E::IMPEDANCE &&
+        r.canWatchdog.value > 0 && r.canWatchdog.value <= 250 &&
+        same(r.maxTorque.value, torqueLimit) &&
+        same(r.maxVelocity.value, candle_ros2::gripperFirmwareVelocityCeilingRadS) &&
+        same(r.motorImpPidKp.value, command.kp) && same(r.motorImpPidKd.value, command.kd) &&
+        same(r.targetPosition.value, tracker->second.logicalToRaw(command.position)) &&
+        same(r.targetVelocity.value, 0.0) && same(r.targetTorque.value, command.torque);
+    candle_ros2::DiagnosticJson evidence;
+    evidence.string("event", "command_readback"); evidence.integer("schema", 1);
+    evidence.integer("drive_id", md.m_canId); evidence.integer("ros_ns", get_clock()->now().nanoseconds());
+    evidence.boolean("read_ok", readOk); evidence.boolean("matches", matches);
+    evidence.number("expected_torque_nm", command.torque);
+    evidence.number("expected_kp", command.kp); evidence.number("expected_kd", command.kd);
+    evidence.number("expected_raw_position_rad", tracker->second.logicalToRaw(command.position));
+    evidence.number("expected_max_torque_nm", torqueLimit);
+    if (readOk)
+    {
+        evidence.integer("can_id", r.canID.value); evidence.integer("state", r.state.value);
+        evidence.integer("mode", r.motionModeStatus.value); evidence.integer("watchdog_ms", r.canWatchdog.value);
+        evidence.number("kp", r.motorImpPidKp.value); evidence.number("kd", r.motorImpPidKd.value);
+        evidence.number("target_raw_position_rad", r.targetPosition.value);
+        evidence.number("target_velocity_rad_s", r.targetVelocity.value);
+        evidence.number("target_torque_nm", r.targetTorque.value);
+        evidence.number("max_torque_nm", r.maxTorque.value); evidence.number("max_velocity_rad_s", r.maxVelocity.value);
+    }
+    // During startup these readbacks are otherwise completely absent. Normal
+    // motion logs only mismatches to keep production log volume bounded.
+    if (isHoming(md.m_canId) || !matches)
+        RCLCPP_INFO(get_logger(), "CANDLE_DIAG %s", evidence.str().c_str());
+    if (!matches)
     {
         stopDrive(md, "impedance command/state readback mismatch; explicit enable required");
         return false;
@@ -1655,7 +1688,7 @@ bool MdNode::startHoming(mab::MD& md, std::shared_ptr<rmw_request_id_t> header)
         !setGripperCommand(md, sequence.control.command()) ||
         !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
         !setGripperCommand(md, sequence.control.command()) ||
-        !verifyGripperCommand(md, sequence.control.command()))
+        !verifyGripperCommand(md, sequence.control.command(), homeConfig.torque))
     {
         stopDrive(md, "homing setup failed; reference remains invalid");
         return false;
@@ -1727,11 +1760,20 @@ void MdNode::tickHoming(mab::MD& md, double position, double velocity, double to
         return;
     }
     const auto appliedCommand = job.sequence.control.command();
+    if (!releasing && now - job.lastVerification >= std::chrono::milliseconds(100))
+    {
+        if (!verifyGripperCommand(md, appliedCommand)) return;
+        job.lastVerification = now;
+    }
+    const auto searchPhase = job.sequence.phase;
     const auto state = job.sequence.update(position, velocity, torque, dt);
     if (state == ImpedanceHome::State::Failed)
     {
         RCLCPP_ERROR(get_logger(), "Drive %d homing failed at %.5f rad, velocity %.3f, torque %.3f, elapsed %.3f",
                      md.m_canId, position, velocity, torque, job.sequence.control.elapsed);
+        // Preserve which search failed; GripperHoming::fail changes phase to
+        // Failed before the node captures the evidence.
+        job.sequence.phase = searchPhase;
         stopDrive(md, "homing search/release/feedback failed; calibration required");
         return;
     }
@@ -1823,6 +1865,7 @@ bool MdNode::enableHomingSearch(mab::MD& md)
         return false;
     }
     m_homingJob->lastUpdate = std::chrono::steady_clock::now();
+    m_homingJob->lastVerification = m_homingJob->lastUpdate;
     return true;
 }
 
@@ -1839,7 +1882,8 @@ void MdNode::completeHomingCalibration(mab::MD& md)
         md.setMotionMode(mab::MdMode_E::IMPEDANCE) != mab::MD::Error_t::OK ||
         !setGripperCommand(md, {position, 0.0, 0.0, 0.0}) ||
         !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE) ||
-        !setGripperCommand(md, {position, 0.0, 0.0, 0.0}))
+        !setGripperCommand(md, {position, 0.0, 0.0, 0.0}) ||
+        !verifyGripperCommand(md, {position, 0.0, 0.0, 0.0}, closeConfig.torqueLimit))
     {
         stopDrive(md, "homing final release setup failed; calibration required");
         return;
@@ -1914,7 +1958,7 @@ bool MdNode::startImpedanceMotion(mab::MD& md, double speed, bool opening)
         !setGripperCommand(md, hold) ||
         !configureGripper(md, hold.kp, hold.kd, speed, torqueLimit) ||
         (!alreadyReady && !candle_ros2::enableDrive(md, mab::MdMode_E::IMPEDANCE)) ||
-        !setGripperCommand(md, hold) || (opening && !verifyGripperCommand(md, hold)))
+        !setGripperCommand(md, hold) || !verifyGripperCommand(md, hold, torqueLimit))
     {
         stopDrive(md, "impedance motion setup failed; explicit enable required");
         return false;
@@ -1970,9 +2014,11 @@ void MdNode::tickSoftClose(mab::MD& md, double position, double velocity, double
     }
     // Handle reference loss/reset from fresh state before checking command
     // readback; a reset must not retain an old calibration behind a fault latch.
-    if (opening && previous == ImpedanceClose::State::Closing &&
-        now - job.lastVerification >= std::chrono::milliseconds(100))
+    // Stagger the six drives instead of issuing six verification batches together.
+    if (now - job.lastVerification >= std::chrono::milliseconds(100) &&
+        now - m_lastCommandVerification >= std::chrono::milliseconds(jointStatePublishPeriodMs))
     {
+        m_lastCommandVerification = now;
         if (!verifyGripperCommand(md, previousCommand)) return;
         job.lastVerification = now;
     }

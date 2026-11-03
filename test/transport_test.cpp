@@ -376,3 +376,34 @@ TEST(PdsTransport, FailedPropertyReadDoesNotLeaveStaleOrPartialResults)
 }
 
 }
+
+TEST_F(MdTransport, RejectsWrongAdapterEnvelopeEvenWithValidMotorAck)
+{
+    mab::MD md(113, candle.get());
+    for (const u8 header : {2, 9, 0})
+    {
+        syncReply({header, 1, 0xA0, 0});
+        EXPECT_EQ(md.disable(), MdError::TRANSFER_FAILED);
+    }
+}
+
+TEST_F(MdTransport, InitializationRejectsStaleOrMalformedVersionReply)
+{
+    for (const Bytes reply : {Bytes{4, 1, 'r', 4, 5, 2}, Bytes{2, 0, 'r', 4, 5, 2},
+                              Bytes{2, 1, 'r', 4, 5}, Bytes{2, 1, 'r', 4, 5, 0}})
+    {
+        auto connection = std::make_unique<ScriptedBus>();
+        connection->reply = [reply](Bytes) { return std::make_pair(reply, BusError::OK); };
+        mab::Candle candidate(mab::CAN_DATARATE_1M, std::move(connection));
+        EXPECT_NE(candidate.init(), mab::candleTypes::Error_t::OK);
+    }
+}
+
+TEST_F(MdTransport, RejectsWrongResetAndVersionEnvelopes)
+{
+    syncReply({4, 1, 'r', 4, 5, 2});
+    EXPECT_FALSE(candle->getCandleVersion().has_value());
+    EXPECT_NE(candle->reset(), mab::candleTypes::Error_t::OK);
+    syncReply({9, 1});
+    EXPECT_EQ(candle->reset(), mab::candleTypes::Error_t::OK);
+}

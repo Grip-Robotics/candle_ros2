@@ -1,0 +1,114 @@
+CANdle command-execution audit — 2026-10-05
+
+Conclusion
+Commands can be acknowledged while the motor produces almost no reported torque.
+The two failed startups do not establish why the firmware/output stage did this.
+The new reboot sequence is a plausible trigger, not a proven root cause. Increasing
+homing effort, extending its timeout, or repeatedly retrying movement is not an
+evidence-supported repair. An offline-tested candidate closes verification and
+logging gaps; it is not a demonstrated cure for the physical fault.
+
+Observed sequence (UTC; add two hours for Zurich local time)
+- 09:25:00 and 09:26:14: drive 111 homed successfully, closing stops 0.88373 and
+  0.87705 rad, reported closing torque about +1 Nm.
+- 10:12:20: after startup reboot, 111 timed out on closing homing. Opening search
+  had worked. In 37 recorded closing samples: commanded +1 Nm, measured torque
+  -0.00713 to +0.000739 Nm, position 0 to 0.000192 rad, state 39, mode 4, all
+  recorded command writes acknowledged. This is not evidence of a normal loaded
+  mechanical stop: reported effort was effectively absent.
+- 10:15:50: 111 succeeded on the next operator startup (0.92499 rad). Five drives
+  homed, then 342 failed initial OPENING at 10:16:06: commanded -1 Nm, position
+  about 0.26434 rad, measured torque about -0.008 Nm, state 39/mode 4.
+  Therefore neither drive 111 specifically nor the zero-to-close transition alone
+  explains both failures.
+- 10:27:10: a further operator startup verified homing on all six; Docker reported
+  healthy. Image remained sha256:21df0f8791fe96671818dd7dfaaba25dd4fc3d749614d32322f9ed00a131cd78.
+  The candidate audit code was NOT running. This is an intermittent baseline
+  failure, not evidence that the candidate fixes it.
+
+Successful and failed searches used the same 1 Nm effort, 0.5 damping and 2 Nm cap.
+The e05c5c5..adddd70 source change added startup reboot and the separate one-degree
+normal-opening jam exemption, but did not change the homing search controller.
+
+Command path and confirmed gaps
+1. ROS admission: reference, calibration and fault gates reject commands before
+   motion when prerequisites are missing. A false service result at this layer
+   differs from a write failure or failure to produce movement.
+2. Setup: configure impedance, limits and targets; enable; reassert targets.
+   Existing homing verified command registers at setup and inferred contact;
+   periodic verification was only present during normal opening. Normal closing
+   acceptance lacked equivalent command readback. Limits were checked before
+   enable, not included in post-enable command verification.
+3. Transport: serialized synchronous USB/CAN exchange checks MD reply framing,
+   but the outer adapter response type was not checked in several legacy paths.
+   An ACK-shaped wrong-type response could be accepted. This is a reproducible
+   software defect, but the recordings do not prove it caused these two failures.
+   Checking the envelope still cannot identify every stale same-type reply.
+4. Execution: state 39 / impedance mode / successful writes establish neither
+   motor current nor motion. Existing feedback monitoring eventually stopped the
+   failed homing searches at two seconds. It did not obtain the detailed evidence
+   needed to distinguish lost targets, ineffective limits, or an output-stage issue.
+5. Diagnostics: optional register snapshots were suppressed throughout homing,
+   leaving all six cached diagnostic groups null at 111's fault. The generic
+   failure overwrote the original search phase before fault capture.
+6. Mission reporting: state_machine_node._report_grasp_when_close_succeeds emits
+   'grasped' when the close service reports acceptance, before physical completion.
+   This is a separate confirmed reporting/interface problem. It is NOT fixed by
+   the command-readback changes and must not be interpreted as object capture.
+7. Calibration plausibility: 345 was accepted with closing travel 0.12418 rad in
+   one startup and 0.83571 rad in the next. A premature stop, obstruction or altered
+   mechanical condition needs checking. The existing minimum-span check does not
+   prove full travel. A per-drive commissioned span range would detect this; no
+   arbitrary shared threshold was introduced without mechanical measurements.
+
+Candidate changes
+- Verify both opening and closing at acceptance; periodically verify homing,
+  closing and holds, as well as opening.
+- Check CAN ID, enabled state, mode, watchdog, gains, targets, torque cap and
+  velocity ceiling. Verify the final unloaded homing handoff too.
+- Keep verification reads at <=32 MD bytes (<=37 bytes with USB envelope), with
+  three reads per verification. Stagger normal-drive verifications using a global
+  minimum interval equal to the configured feedback period; each drive becomes
+  eligible after 100 ms. This is not a hard 100 ms detection guarantee.
+- During active homing search, collect one diagnostic group per 200 ms: protection,
+  commands, supply/limits (including motor current limit and torque constant), and
+  temperatures. Do not poll during release, pending disable, or inter-drive gaps.
+  A group may be up to about 1.2 seconds old; timestamps are retained. Very early
+  failures may still precede a full snapshot cycle.
+- Log actual/expected command readbacks and preserve the failing homing phase.
+- Reject wrong adapter response types for CAN, version/init and reset exchanges.
+
+Validation and limits
+Offline container build succeeded. Colcon reports 171 checks, zero errors/failures
+(the aggregate includes test-suite wrapper results). Regression cases cover wrong
+adapter envelopes, malformed version replies, closing torque-cap loss, invalid
+watchdog, overwritten homing commands with a distinct homing cap, bounded diagnostic
+reads and suppression during release. All 21 initialization integration tests passed; results are recorded
+separately in command-audit-integration.log.
+No USB device or physical hardware was supplied to the test containers. No restart,
+reboot, homing, arm or gripper command was issued by this audit. Production image and
+GRIP dependency pin remain unchanged. Added traffic needs live timing validation:
+nominal verification uses three synchronous reads; transport timeouts can delay a
+callback. Tests demonstrate software behavior, not motor-output reliability.
+
+Next experiment needed to establish the actual cause
+Use the candidate during a supervised startup and compare a passing and failed
+search: expected vs actual targets/gains/limits, motor current configuration,
+DC supply and protection status, plus reported torque/velocity. If targets/limits
+change, repair the precise setup or transport transition. If registers remain
+correct with missing output, investigate firmware enable behavior, persisted boot
+configuration and power-stage/current feedback with the motor vendor. A prior
+repository bench report (docs/validation/2026-09-18-velocity-ceiling.md) showed a
+runtime maxVelocity readback differing from effective boot-loaded behavior; it is
+relevant precedent, not proof of the same mechanism here. Do not save temporary
+homing parameters to flash. Validate repeated cold starts and all-six open/close
+cycles, realistic bus latency and failure propagation before declaring reliability.
+
+Evidence in /home/jonas/grip
+- reports/startup111-2026-10-05/{driver.log,driver-retry.log,driver-audit-latest.log,
+  comparison.txt,summary.json}
+- logs/physical/20261005T092439.620985Z-664808/pipeline.log
+- logs/physical/20261005T092554.077465Z-692016/pipeline.log
+  These pipeline files contain earlier Docker history; use embedded timestamps.
+- reports/incident-2026-10-05/command-audit-{build.log,test.log,test-results.txt,
+  integration.log}
