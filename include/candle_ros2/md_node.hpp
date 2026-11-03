@@ -193,6 +193,11 @@ class MdNode : public rclcpp::Node
     void cbVelocityCmd(const candle_ros2::msg::VelocityPidCmd& msg);
     void cbImpedanceCmd(const candle_ros2::msg::ImpedanceCmd& msg);
 
+    rclcpp::Service<candle_ros2::srv::Generic>::SharedPtr srvStartupReboot;
+    bool m_startupRebootAttempted = false;
+    void cbStartupReboot(const std::shared_ptr<candle_ros2::srv::Generic::Request> req,
+                         std::shared_ptr<candle_ros2::srv::Generic::Response> rsp);
+
     void cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request> req,
                  std::shared_ptr<candle_ros2::srv::AddDevices::Response>      rsp);
     void cbInitDevices(const std::shared_ptr<candle_ros2::srv::InitDevices::Request> req,

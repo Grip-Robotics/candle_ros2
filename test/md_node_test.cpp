@@ -15,6 +15,7 @@ using Bytes = std::vector<u8>;
 class RegisterBus final : public mab::I_CommunicationInterface
 {
   public:
+    size_t resets = 0;
     size_t writes = 0;
     size_t reads = 0, largestReadFrame = 0;
     std::vector<size_t> readRequestSizes;
@@ -87,6 +88,13 @@ class RegisterBus final : public mab::I_CommunicationInterface
                 if (rejectZero && address == schema.runZero.m_regAddress)
                     return {{4, 1, 0xA0, 0}, TIMEOUT};
                 std::copy_n(request.begin() + offset + 2, bytes.size(), bytes.begin());
+                if (address == schema.runReset.m_regAddress) {
+                    ++resets;
+                    set(schema.state, static_cast<u16>(64));
+                    set(schema.motionModeStatus, static_cast<u8>(0));
+                    set(schema.quickStatus, static_cast<u16>(0));
+                    set(schema.targetTorque, 0.0f);
+                }
                 if (address == schema.state.m_regAddress) ++stateWrites;
                 if (address == schema.motionModeCommand.m_regAddress) ++modeWrites;
                 if (address == schema.runZero.m_regAddress) ++zeroWrites;
@@ -138,6 +146,16 @@ candleParams_S testParams()
 class MdNodeTestAccess
 {
   public:
+    static auto startupReboot(MdNode& node, std::vector<u16> ids, bool clearDrives = false)
+    {
+        if (clearDrives) node.m_mds.clear();
+        auto request = std::make_shared<candle_ros2::srv::Generic::Request>();
+        auto response = std::make_shared<candle_ros2::srv::Generic::Response>();
+        request->device_ids = ids;
+        node.cbStartupReboot(request, response);
+        return response;
+    }
+
     static void seedDrive(MdNode& node)
     {
         node.m_mds.emplace_back(113, node.m_candle.get());
@@ -967,4 +985,26 @@ TEST_F(MdNodeCallbacks, OpeningStillStopsOnStaleFeedbackWithoutRehoming)
     MdNodeTestAccess::loseCommunication(*node);
     EXPECT_FALSE(MdNodeTestAccess::autoHomePending(*node));
 }
+}
+
+TEST_F(MdNodeCallbacks, StartupRebootRefusesRegisteredDrivesAndInvalidIdsWithoutWrites)
+{
+    const auto writes = bus->writes;
+    EXPECT_FALSE(MdNodeTestAccess::startupReboot(*node, {113})->success[0]);
+    EXPECT_FALSE(MdNodeTestAccess::startupReboot(*node, {113,113}, true)->success[0]);
+    EXPECT_FALSE(MdNodeTestAccess::startupReboot(*node, {0})->success[0]);
+    EXPECT_EQ(bus->writes, writes);
+}
+TEST_F(MdNodeCallbacks, StartupRebootClearsFaultBeforeRegistrationAndCannotRepeat)
+{
+    bus->set(bus->schema.state, static_cast<u16>(8));
+    bus->set(bus->schema.quickStatus, static_cast<u16>(1));
+    bus->set(bus->schema.canWatchdog, static_cast<u16>(100));
+    ASSERT_TRUE(MdNodeTestAccess::startupReboot(*node, {113}, true)->success[0]);
+    EXPECT_EQ(bus->resets, 1u);
+    EXPECT_EQ(bus->state(), 64u);
+    EXPECT_EQ(bus->modeWrites, 0u);
+    EXPECT_EQ(bus->zeroWrites, 0u);
+    EXPECT_FALSE(MdNodeTestAccess::startupReboot(*node, {113})->success[0]);
+    EXPECT_EQ(bus->resets, 1u);
 }

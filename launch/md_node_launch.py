@@ -62,6 +62,7 @@ def generate_launch_description():
         DeclareLaunchArgument("close_contact_duration_s", default_value="0.15"),
         DeclareLaunchArgument("close_timeout_s", default_value="2.0"),
         DeclareLaunchArgument("open_timeout_s", default_value="0.5"),
+        DeclareLaunchArgument("open_obstruction_tolerance_rad", default_value="0.017453292519943295"),
         DeclareLaunchArgument("close_feedback_timeout_s", default_value="0.25"),
         DeclareLaunchArgument("joint_state_publish_period_ms", default_value="50"),
         DeclareLaunchArgument("health_publish_period_ms", default_value="200"),
@@ -191,6 +192,9 @@ def generate_launch_description():
                         ),
                         "close_timeout_s": ParameterValue(
                             LaunchConfiguration("close_timeout_s"), value_type=float
+                        ),
+                        "open_obstruction_tolerance_rad": ParameterValue(
+                            LaunchConfiguration("open_obstruction_tolerance_rad"), value_type=float
                         ),
                         "open_timeout_s": ParameterValue(
                             LaunchConfiguration("open_timeout_s"), value_type=float

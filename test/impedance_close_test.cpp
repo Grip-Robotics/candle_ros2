@@ -1294,11 +1294,11 @@ TEST(ImpedanceCloseTest, NormalOpeningDeadlineDoesNotDependOnEndpointTolerance)
         }
 }
 
-TEST(ImpedanceCloseTest, OpeningRetainsResistanceStopIncludingRecordedDrive113Values)
+TEST(ImpedanceCloseTest, OpeningReleasesRecordedDrive113ResistanceInsideOneDegree)
 {
     // October 5: drive 113 stopped near 0.01285 rad, 0.0221 rad/s,
     // with -0.382 Nm opening torque. Removing position acceptance must
-    // not conceal that sustained-resistance event or exempt points near zero.
+    // release it inside the explicitly allowed one-degree endpoint band.
     for (double position : {.01285, .002})
         for (double direction : {-1.0, 1.0})
         {
@@ -1307,8 +1307,44 @@ TEST(ImpedanceCloseTest, OpeningRetainsResistanceStopIncludingRecordedDrive113Va
             for (int i = 0; i < 16; ++i)
                 motion.update(direction * position, direction * .0221,
                               -direction * .382, .01);
-            EXPECT_EQ(motion.state, ImpedanceClose::State::Contact);
+            EXPECT_EQ(motion.state, ImpedanceClose::State::Closed);
+            EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
+            EXPECT_DOUBLE_EQ(motion.command().kd, 0.0);
             EXPECT_LT(motion.elapsed, motion.config.openTimeout);
             EXPECT_FALSE(motion.hasObject);
         }
+}
+
+TEST(ImpedanceCloseTest, OpeningJamBandIsInclusiveRelativeToTargetAndDoesNotHideFaults)
+{
+    const auto config = ImpedanceClose::Config{};
+    for (double sign : {-1.0, 1.0})
+        for (double factor : {.999, 1.0, 1.001, 2.0})
+        {
+            const double position = sign * factor * config.openObstructionTolerance;
+            ImpedanceClose motion(position, 0.0, 10.0, config, true, -sign);
+            for (int i = 0; i < 16; ++i)
+                motion.update(position, 0.0, -sign * .4, .01);
+            EXPECT_EQ(motion.state, factor <= 1.0 ? ImpedanceClose::State::Closed
+                                                 : ImpedanceClose::State::Contact);
+            if (factor <= 1.0)
+            {
+                EXPECT_DOUBLE_EQ(motion.command().kp, 0.0);
+                EXPECT_DOUBLE_EQ(motion.command().kd, 0.0);
+                EXPECT_DOUBLE_EQ(motion.command().torque, 0.0);
+                EXPECT_EQ(motion.update(position + sign * .1, 0.0, 0.0, .01),
+                          ImpedanceClose::State::Closed);
+                EXPECT_EQ(motion.update(position, 0.0, 0.0, .3), ImpedanceClose::State::Failed);
+            }
+        }
+    // The band follows a configured nonzero target rather than encoder zero.
+    ImpedanceClose shifted(.41285, .4, 10.0, config, true, -1.0);
+    for (int i = 0; i < 16; ++i) shifted.update(.41285, 0.0, -.382, .01);
+    EXPECT_EQ(shifted.state, ImpedanceClose::State::Closed);
+    for (double invalid : {-1.0, double(NAN), double(INFINITY)})
+    {
+        auto bad = config; bad.openObstructionTolerance = invalid;
+        EXPECT_THROW(ImpedanceClose(.1, 0.0, 10.0, bad, true), std::invalid_argument);
+    }
 }

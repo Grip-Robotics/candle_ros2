@@ -33,6 +33,7 @@ candle_config:
     close_timeout_s: 2.0
     # Endpoint confirmation or this deadline releases torque/PD; timeout is unconfirmed.
     open_timeout_s: 0.5
+    open_obstruction_tolerance_rad: 0.017453292519943295  # 1 degree
     close_feedback_timeout_s: 0.25
     joint_state_publish_period_ms: 10
     health_publish_period_ms: 200
