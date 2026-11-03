@@ -856,7 +856,11 @@ void MdNode::cbAddMd(const std::shared_ptr<candle_ros2::srv::AddDevices::Request
         // A missing drive therefore blocks this single-threaded node only
         // for the bounded host timeout, not 10x the intended CAN window.
         md.m_timeout = static_cast<u32>(mdCanResponseTimeout100us);
-        if (md.init() != mab::MD::Error_t::OK)
+        // MD::init() queries the adapter version by reconfiguring its CAN bus.
+        // Register drives through fresh identity reads on the established bus;
+        // reconfiguration here can make the next CAN request time out.
+        auto& hardwareVersion = md.m_mdRegisters.legacyHardwareVersion;
+        if (md.readRegister(hardwareVersion) != mab::MD::Error_t::OK || hardwareVersion.value == 0)
         {
             rsp->success.push_back(false);
             continue;

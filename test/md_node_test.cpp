@@ -15,7 +15,7 @@ using Bytes = std::vector<u8>;
 class RegisterBus final : public mab::I_CommunicationInterface
 {
   public:
-    size_t resets = 0;
+    size_t resets = 0, adapterConfigurations = 0;
     size_t writes = 0;
     size_t reads = 0, largestReadFrame = 0;
     std::vector<size_t> readRequestSizes;
@@ -64,8 +64,10 @@ class RegisterBus final : public mab::I_CommunicationInterface
     Error_t transfer(Bytes, u32) override { return OK; }
     std::pair<Bytes, Error_t> transfer(Bytes request, u32, size_t) override
     {
-        if (request[0] == 2)
+        if (request[0] == 2) {
+            ++adapterConfigurations;
             return {{2, 1, 'r', 4, 5, 2}, OK};
+        }
         if (request.size() < 7 || request[0] != 4)
             return {{}, TRANSMITTER_ERROR};
         const bool writing = request[5] == 0x40;
@@ -190,6 +192,17 @@ candleParams_S testParams()
 class MdNodeTestAccess
 {
   public:
+    static auto addDrive(MdNode& node, u16 id)
+    {
+        node.m_mds.clear();
+        node.m_positionTrackers.clear();
+        auto request = std::make_shared<candle_ros2::srv::AddDevices::Request>();
+        auto response = std::make_shared<candle_ros2::srv::AddDevices::Response>();
+        request->device_ids = {id};
+        node.cbAddMd(request, response);
+        return response;
+    }
+
     static auto startupReboot(MdNode& node, std::vector<u16> ids, bool clearDrives = false)
     {
         if (clearDrives) node.m_mds.clear();
@@ -673,6 +686,41 @@ class MdNodeCallbacks : public ::testing::Test
         }
     }
 };
+
+TEST_F(MdNodeCallbacks, RegistrationReadsIdentityWithoutReconfiguringBusOrEnablingDrive)
+{
+    bus->set(bus->schema.legacyHardwareVersion, u8{5});
+    const auto result = MdNodeTestAccess::addDrive(*node, 113);
+    ASSERT_EQ(result->success.size(), 1u);
+    EXPECT_TRUE(result->success[0]);
+    EXPECT_EQ(result->total_devices, 1u);
+    EXPECT_EQ(bus->adapterConfigurations, 1u); // Initial adapter handshake only.
+    EXPECT_EQ(bus->reads, 1u);
+    EXPECT_EQ(bus->writes, 0u);
+    EXPECT_TRUE(MdNodeTestAccess::needsHome(*node));
+}
+
+TEST_F(MdNodeCallbacks, RegistrationRejectsMissingHardwareIdentity)
+{
+    bus->set(bus->schema.legacyHardwareVersion, u8{0});
+    const auto result = MdNodeTestAccess::addDrive(*node, 113);
+    ASSERT_EQ(result->success.size(), 1u);
+    EXPECT_FALSE(result->success[0]);
+    EXPECT_EQ(result->total_devices, 0u);
+    EXPECT_EQ(bus->adapterConfigurations, 1u);
+    EXPECT_EQ(bus->writes, 0u);
+}
+
+TEST_F(MdNodeCallbacks, RegistrationRejectsTimeout)
+{
+    bus->set(bus->schema.legacyHardwareVersion, u8{5});
+    bus->rejectAllReads = true;
+    const auto result = MdNodeTestAccess::addDrive(*node, 113);
+    ASSERT_EQ(result->success.size(), 1u);
+    EXPECT_FALSE(result->success[0]);
+    EXPECT_EQ(result->total_devices, 0u);
+    EXPECT_EQ(bus->writes, 0u);
+}
 
 TEST_F(MdNodeCallbacks, DiagnosticsReadWatchdogWarningEvenWhenQuickStatusIsClean)
 {
