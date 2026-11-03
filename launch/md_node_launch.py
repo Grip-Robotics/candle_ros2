@@ -52,6 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
         DeclareLaunchArgument("gripper_travel_min_rad", default_value="-0.05"),
         DeclareLaunchArgument("gripper_travel_max_rad", default_value="0.75"),
+        DeclareLaunchArgument("gripper_travel_limits_enabled", default_value="true"),
         DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
         DeclareLaunchArgument("close_target_lead_rad", default_value="0.04"),
         DeclareLaunchArgument("open_target_lead_rad",
@@ -75,7 +76,7 @@ def generate_launch_description():
         DeclareLaunchArgument("homing_torque_nm", default_value="1.0"),
         DeclareLaunchArgument("homing_damping_nm_s_rad", default_value="0.5"),
         DeclareLaunchArgument("homing_torque_limit_nm", default_value="2.0"),
-        DeclareLaunchArgument("homing_max_travel_rad", default_value="0.85"),
+        DeclareLaunchArgument("homing_travel_margin_rad", default_value="0.5"),
         DeclareLaunchArgument("homing_contact_duration_s", default_value="0.25"),
         DeclareLaunchArgument("homing_timeout_s", default_value="2.0"),
     ]
@@ -167,6 +168,9 @@ def generate_launch_description():
                         "gripper_travel_max_rad": ParameterValue(
                             LaunchConfiguration("gripper_travel_max_rad"), value_type=float
                         ),
+                        "gripper_travel_limits_enabled": ParameterValue(
+                            LaunchConfiguration("gripper_travel_limits_enabled"), value_type=bool
+                        ),
                         "soft_close_fast_duration_ms": ParameterValue(
                             LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int
                         ),
@@ -227,7 +231,7 @@ def generate_launch_description():
                         ),
                         **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
                            for name in ("homing_torque_nm", "homing_damping_nm_s_rad", "homing_torque_limit_nm",
-                                        "homing_max_travel_rad",
+                                        "homing_travel_margin_rad",
                                         "homing_contact_duration_s", "homing_timeout_s")},
                     }
                 ],

@@ -41,9 +41,10 @@ void BrakeResistorRos::publishStatus()
 
     msg.header.stamp = m_parentNode->get_clock()->now();
 
-    m_brakeResistor->getEnabled(msg.enabled);
-    m_brakeResistor->getTemperature(msg.temperature);
-    m_brakeResistor->getTemperatureLimit(msg.temperature_limit);
+    if (m_brakeResistor->getEnabled(msg.enabled) != mab::PdsModule::error_E::OK ||
+        m_brakeResistor->getTemperature(msg.temperature) != mab::PdsModule::error_E::OK ||
+        m_brakeResistor->getTemperatureLimit(msg.temperature_limit) != mab::PdsModule::error_E::OK)
+        return;
 
     pubData->publish(msg);
 }

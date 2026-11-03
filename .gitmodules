@@ -1,3 +1,4 @@
 [submodule "CANdle-SDK"]
 	path = CANdle-SDK
-	url = https://github.com/mabrobotics/CANdle-SDK.git
+	url = https://github.com/Grip-Robotics/candle_ros2.git
+	branch = vendor/candle-sdk-transport-20261001

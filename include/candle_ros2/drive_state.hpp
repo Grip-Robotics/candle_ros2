@@ -8,6 +8,29 @@
 
 namespace candle_ros2
 {
+// MD's documented maxVelocity range is [0.0001, 1500] rad/s; there is no
+// documented off value. Keep target ramps separate from this firmware ceiling.
+// This is a volatile limit, never a speed command or a flash-save operation.
+inline constexpr float gripperFirmwareVelocityCeilingRadS = 1500.0f;
+
+template <class Drive>
+bool configureGripperLimits(Drive& md, float profileVelocity, float torqueLimit)
+{
+    using Error = typename Drive::Error_t;
+    auto& regs = md.m_mdRegisters;
+    regs.profileVelocity = profileVelocity;
+    regs.maxVelocity = gripperFirmwareVelocityCeilingRadS;
+    regs.maxTorque = torqueLimit;
+    if (md.writeRegisters(regs.profileVelocity, regs.maxVelocity, regs.maxTorque) != Error::OK ||
+        md.readRegisters(regs.profileVelocity, regs.maxVelocity, regs.maxTorque) != Error::OK)
+        return false;
+    return std::isfinite(regs.profileVelocity.value) &&
+           std::isfinite(regs.maxVelocity.value) && std::isfinite(regs.maxTorque.value) &&
+           std::abs(regs.profileVelocity.value - profileVelocity) <= 1e-6f &&
+           std::abs(regs.maxVelocity.value - gripperFirmwareVelocityCeilingRadS) <= 1e-6f &&
+           std::abs(regs.maxTorque.value - torqueLimit) <= 1e-6f;
+}
+
 // Call only after zero has been acknowledged with PWM disabled. Some firmware
 // updates the encoder register on its next control tick, not in the command ACK.
 template <class Drive>
