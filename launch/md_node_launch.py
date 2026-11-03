@@ -34,11 +34,25 @@ def generate_launch_description():
     gripper_args = [
         DeclareLaunchArgument("joint_name_prefix", default_value="md_"),
         DeclareLaunchArgument("gripper_open_position_rad", default_value="0.0"),
-        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.83"),
-        DeclareLaunchArgument("gripper_impedance_kp", default_value="5.0"),
+        DeclareLaunchArgument("gripper_closed_position_rad", default_value="0.63"),
+        DeclareLaunchArgument("gripper_impedance_kp", default_value="12.5"),
         DeclareLaunchArgument("gripper_impedance_kd", default_value="0.05"),
         DeclareLaunchArgument("gripper_velocity_limit_rad_s", default_value="3.5"),
-        DeclareLaunchArgument("gripper_torque_limit_nm", default_value="3.5"),
+        DeclareLaunchArgument("gripper_torque_limit_nm", default_value="4.0"),
+        DeclareLaunchArgument("soft_close_fast_torque_limit_nm", default_value="4.0"),
+        DeclareLaunchArgument("soft_close_slow_torque_limit_nm", default_value="4.0"),
+        DeclareLaunchArgument("soft_close_profile_acceleration_rad_s2", default_value="100.0"),
+        DeclareLaunchArgument("soft_close_profile_deceleration_rad_s2", default_value="100.0"),
+        DeclareLaunchArgument("soft_close_closed_tol_rad", default_value="0.005"),
+        DeclareLaunchArgument("soft_close_fast_duration_ms", default_value="300"),
+        DeclareLaunchArgument("joint_state_publish_period_ms", default_value="50"),
+        DeclareLaunchArgument("health_publish_period_ms", default_value="200"),
+        DeclareLaunchArgument("md_can_response_timeout_100us", default_value="100"),
+        DeclareLaunchArgument("md_host_timeout_ms", default_value="20"),
+        DeclareLaunchArgument("encoder_wrap_period_rad", default_value="0.62831853"),
+        DeclareLaunchArgument("position_recovery_max_delta_rad", default_value="0.25"),
+        DeclareLaunchArgument("position_recovery_samples", default_value="3"),
+        DeclareLaunchArgument("position_recovery_retry_ms", default_value="25"),
         DeclareLaunchArgument("init_devices_zero", default_value="false"),
     ]
 
@@ -84,6 +98,53 @@ def generate_launch_description():
                         ),
                         "gripper_torque_limit_nm": ParameterValue(
                             LaunchConfiguration("gripper_torque_limit_nm"), value_type=float
+                        ),
+                        "soft_close_fast_torque_limit_nm": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_torque_limit_nm"),
+                            value_type=float,
+                        ),
+                        "soft_close_slow_torque_limit_nm": ParameterValue(
+                            LaunchConfiguration("soft_close_slow_torque_limit_nm"),
+                            value_type=float,
+                        ),
+                        "soft_close_profile_acceleration_rad_s2": ParameterValue(
+                            LaunchConfiguration("soft_close_profile_acceleration_rad_s2"),
+                            value_type=float,
+                        ),
+                        "soft_close_profile_deceleration_rad_s2": ParameterValue(
+                            LaunchConfiguration("soft_close_profile_deceleration_rad_s2"),
+                            value_type=float,
+                        ),
+                        "soft_close_closed_tol_rad": ParameterValue(
+                            LaunchConfiguration("soft_close_closed_tol_rad"), value_type=float
+                        ),
+                        "soft_close_fast_duration_ms": ParameterValue(
+                            LaunchConfiguration("soft_close_fast_duration_ms"), value_type=int
+                        ),
+                        "joint_state_publish_period_ms": ParameterValue(
+                            LaunchConfiguration("joint_state_publish_period_ms"), value_type=int
+                        ),
+                        "health_publish_period_ms": ParameterValue(
+                            LaunchConfiguration("health_publish_period_ms"), value_type=int
+                        ),
+                        "md_can_response_timeout_100us": ParameterValue(
+                            LaunchConfiguration("md_can_response_timeout_100us"), value_type=int
+                        ),
+                        "md_host_timeout_ms": ParameterValue(
+                            LaunchConfiguration("md_host_timeout_ms"), value_type=int
+                        ),
+                        "encoder_wrap_period_rad": ParameterValue(
+                            LaunchConfiguration("encoder_wrap_period_rad"), value_type=float
+                        ),
+                        "position_recovery_max_delta_rad": ParameterValue(
+                            LaunchConfiguration("position_recovery_max_delta_rad"),
+                            value_type=float,
+                        ),
+                        "position_recovery_samples": ParameterValue(
+                            LaunchConfiguration("position_recovery_samples"), value_type=int
+                        ),
+                        "position_recovery_retry_ms": ParameterValue(
+                            LaunchConfiguration("position_recovery_retry_ms"), value_type=int
                         ),
                         "init_devices_zero": ParameterValue(
                             LaunchConfiguration("init_devices_zero"), value_type=bool
