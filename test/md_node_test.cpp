@@ -21,6 +21,9 @@ class RegisterBus final : public mab::I_CommunicationInterface
     std::vector<size_t> readRequestSizes;
     size_t stateWrites = 0, modeWrites = 0, zeroWrites = 0;
     std::vector<float> torqueCommands;
+    bool emulateFirmware = false;
+    size_t enableWrites = 0;
+    bool rejectEnable = false;
     bool rejectZero = false;
     bool rejectStateRead = false;
     bool rejectAllReads = false;
@@ -86,6 +89,8 @@ class RegisterBus final : public mab::I_CommunicationInterface
             auto& bytes = found->second;
             if (writing)
             {
+                if (rejectEnable && address == schema.state.m_regAddress && request[offset + 2] == 39)
+                    return {{4, 1, 0xA0, 0}, TIMEOUT};
                 if (rejectZero && address == schema.runZero.m_regAddress)
                     return {{4, 1, 0xA0, 0}, TIMEOUT};
                 std::copy_n(request.begin() + offset + 2, bytes.size(), bytes.begin());
@@ -96,7 +101,14 @@ class RegisterBus final : public mab::I_CommunicationInterface
                     set(schema.quickStatus, static_cast<u16>(0));
                     set(schema.targetTorque, 0.0f);
                 }
-                if (address == schema.state.m_regAddress) ++stateWrites;
+                if (address == schema.state.m_regAddress) {
+                    ++stateWrites;
+                    if (state() == 39) ++enableWrites;
+                }
+                if (emulateFirmware && address == schema.motionModeCommand.m_regAddress)
+                    set(schema.motionModeStatus, get(schema.motionModeCommand));
+                if (emulateFirmware && address == schema.runZero.m_regAddress)
+                    set(schema.mainEncoderPosition, 0.0f);
                 if (address == schema.motionModeCommand.m_regAddress) ++modeWrites;
                 if (address == schema.runZero.m_regAddress) ++zeroWrites;
                 if (address == schema.targetTorque.m_regAddress)
@@ -113,6 +125,37 @@ class RegisterBus final : public mab::I_CommunicationInterface
             offset += 2 + bytes.size();
         }
         return {result, OK};
+    }
+};
+
+// Separate register banks on one CAN transport; each drive can lag or fail independently.
+class MultiDriveBus final : public mab::I_CommunicationInterface
+{
+  public:
+    std::unordered_map<u16, RegisterBus> drives;
+    MultiDriveBus()
+    {
+        for (u16 id : {111, 113})
+        {
+            auto& bus = drives[id];
+            bus.emulateFirmware = true;
+            bus.set(bus.schema.canID, static_cast<u32>(id));
+            bus.set(bus.schema.motorTemperature, 25.0f);
+            bus.set(bus.schema.mosfetTemperature, 25.0f);
+            bus.set(bus.schema.motorShutdownTemp, static_cast<u8>(90));
+        }
+    }
+    Error_t connect() override { return OK; }
+    Error_t disconnect() override { return OK; }
+    Error_t transfer(Bytes, u32) override { return OK; }
+    std::pair<Bytes, Error_t> transfer(Bytes request, u32 timeout, size_t size) override
+    {
+        if (!request.empty() && request[0] == 2) return {{2, 1, 'r', 4, 5, 2}, OK};
+        if (request.size() < 5) return {{}, TRANSMITTER_ERROR};
+        const u16 id = request[3] | (static_cast<u16>(request[4]) << 8);
+        auto drive = drives.find(id);
+        if (drive == drives.end()) return {{}, TIMEOUT};
+        return drive->second.transfer(std::move(request), timeout, size);
     }
 };
 
@@ -165,6 +208,42 @@ class MdNodeTestAccess
         node.m_gripperCalibrations.emplace(113, GripperHoming::Calibration{0.75, node.closeConfig, 0.0});
         node.m_autoHoming.activate(113);
     }
+    static void seedGroup(MdNode& node)
+    {
+        for (u16 id : {111, 113})
+        {
+            node.m_mds.emplace_back(id, node.m_candle.get());
+            node.m_positionTrackers.emplace(id, PositionTracker(6.283185307, 0.1, 3));
+            node.m_positionTrackers.at(id).initialize(.25);
+        }
+    }
+    static bool startGroup(MdNode& node, std::vector<u16> ids = {111, 113})
+    { return node.startHomingGroup(ids); }
+    static bool groupActive(const MdNode& node) { return node.m_homingGroup.has_value(); }
+    static const auto& homeJob(const MdNode& node, u16 id) { return node.m_homingJobs.at(id); }
+    static bool calibrated(const MdNode& node, u16 id) { return node.m_gripperCalibrations.contains(id); }
+    static double closedStop(const MdNode& node, u16 id) { return node.m_gripperCalibrations.at(id).closedPosition; }
+    static bool acceptsMotion(const MdNode& node, u16 id) { return node.canAcceptPositionCommand(id); }
+    static bool autoHomePending(const MdNode& node, u16 id) { return node.m_autoHoming.pending(id); }
+    static void groupTick(MdNode& node)
+    {
+        for (auto& [id, job] : node.m_homingJobs)
+            job.lastUpdate = std::chrono::steady_clock::now() - std::chrono::milliseconds(20);
+        node.publishJointStates();
+    }
+    static void queueGroupRelease(MdNode& node, u16 id)
+    {
+        node.m_homingJobs.at(id).sequence.control.state = ImpedanceHome::State::Releasing;
+        node.m_pendingDisables.try_emplace(id, *std::find_if(node.m_mds.begin(), node.m_mds.end(),
+            [id](const auto& md) { return md.m_canId == id; }));
+    }
+    static void stageBarrier(MdNode& node, u16 id)
+    {
+        node.m_homingJobs.at(id).waitingForGroup = true;
+        node.m_homingJobs.at(id).sequence.control.state = ImpedanceHome::State::Ready;
+    }
+    static void expireGroup(MdNode& node)
+    { node.m_homingGroup->started -= std::chrono::seconds(60); node.tickHomingGroup(); }
     static void hold(MdNode& node)
     {
         ImpedanceClose controller(0.25, 0.75, 2.0, node.closeConfig);
@@ -226,10 +305,10 @@ class MdNodeTestAccess
         node.homeConfig.torque = 1.5; // Deliberately different from normal closing.
         diagnosticHoming(node, true);
         auto& md = node.m_mds.front();
-        const auto command = node.m_homingJob->sequence.control.command();
+        const auto command = node.m_homingJobs.at(113).sequence.control.command();
         node.configureGripper(md, command.kp, command.kd, 2.0, node.homeConfig.torque);
         node.setGripperCommand(md, command);
-        node.m_homingJob->lastVerification -= std::chrono::milliseconds(101);
+        node.m_homingJobs.at(113).lastVerification -= std::chrono::milliseconds(101);
     }
     static void tickHoming(MdNode& node)
     { node.tickHoming(node.m_mds.front(), .25, 0.0, 0.0); }
@@ -274,8 +353,9 @@ class MdNodeTestAccess
         // automatic recovery when an ordinary release starts.
         GripperHoming sequence(.25, -1, node.homeConfig, node.closeConfig, .5);
         sequence.control.state = ImpedanceHome::State::Releasing;
-        node.m_homingJob.emplace(MdNode::HomingJob{
-            113, sequence, std::chrono::steady_clock::now(), nullptr});
+        node.m_homingJobs.insert_or_assign(113, MdNode::HomingJob{
+            113, sequence, std::chrono::steady_clock::now()});
+        node.m_homingGroup.emplace(MdNode::HomingGroup{{113}, nullptr});
         node.m_homingRequired.insert(113);
         node.m_motionInhibited.insert(113);
         node.m_pendingDisables.try_emplace(113, node.m_mds.front());
@@ -318,10 +398,11 @@ class MdNodeTestAccess
     }
     static void diagnosticHoming(MdNode& node, bool active)
     {
-        if (!active) { node.m_homingJob.reset(); return; }
+        if (!active) { node.m_homingJobs.clear(); node.m_homingGroup.reset(); return; }
         GripperHoming sequence(.25, -1, node.homeConfig, node.closeConfig, .5);
-        node.m_homingJob.emplace(MdNode::HomingJob{
-            113, sequence, std::chrono::steady_clock::now(), nullptr});
+        node.m_homingJobs.insert_or_assign(113, MdNode::HomingJob{
+            113, sequence, std::chrono::steady_clock::now()});
+        node.m_homingGroup.emplace(MdNode::HomingGroup{{113}, nullptr});
     }
     static void pendingDiagnosticDisable(MdNode& node)
     { node.m_pendingDisables.try_emplace(113, node.m_mds.front()); }
@@ -354,6 +435,174 @@ class MdNodeTestAccess
 
 namespace
 {
+class ParallelHoming : public ::testing::Test
+{
+  protected:
+    MultiDriveBus* bus = nullptr;
+    std::shared_ptr<mab::Candle> candle;
+    std::shared_ptr<MdNode> node;
+    static void SetUpTestSuite() { if (!rclcpp::ok()) rclcpp::init(0, nullptr); }
+    static void TearDownTestSuite() { rclcpp::shutdown(); }
+    void SetUp() override
+    {
+        Logger::g_m_verbosity = Logger::Verbosity_E::SILENT;
+        auto transport = std::make_unique<MultiDriveBus>();
+        bus = transport.get();
+        candle = std::make_shared<mab::Candle>(mab::CAN_DATARATE_1M, std::move(transport));
+        ASSERT_EQ(candle->init(), mab::candleTypes::Error_t::OK);
+        rclcpp::NodeOptions options;
+        options.start_parameter_services(false).start_parameter_event_publisher(false);
+        node = std::make_shared<MdNode>(options, candle, testParams());
+        MdNodeTestAccess::seedGroup(*node);
+    }
+    void TearDown() override { node.reset(); candle.reset(); }
+    void expectGroupStopped()
+    {
+        EXPECT_FALSE(MdNodeTestAccess::groupActive(*node));
+        for (u16 id : {111, 113})
+        {
+            EXPECT_EQ(bus->drives.at(id).state(), 64u);
+            EXPECT_FALSE(MdNodeTestAccess::calibrated(*node, id));
+            EXPECT_FALSE(MdNodeTestAccess::acceptsMotion(*node, id));
+            EXPECT_FALSE(MdNodeTestAccess::autoHomePending(*node, id));
+        }
+    }
+};
+
+TEST_F(ParallelHoming, RejectsEmptyDuplicateUnknownAndOverlappingRequestsBeforeMotion)
+{
+    EXPECT_FALSE(MdNodeTestAccess::startGroup(*node, {}));
+    EXPECT_FALSE(MdNodeTestAccess::startGroup(*node, {111, 111}));
+    EXPECT_FALSE(MdNodeTestAccess::startGroup(*node, {111, 999}));
+    for (auto& [id, drive] : bus->drives) EXPECT_EQ(drive.writes, 0u);
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    EXPECT_FALSE(MdNodeTestAccess::startGroup(*node, {113}));
+    EXPECT_TRUE(MdNodeTestAccess::groupActive(*node));
+}
+
+TEST_F(ParallelHoming, UnhealthyMemberPreventsEveryEnable)
+{
+    auto& bad = bus->drives.at(113);
+    bad.set(bad.schema.motorTemperature, 95.0f);
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node)); // Accepted request, failed preflight.
+    expectGroupStopped();
+    for (auto& [id, drive] : bus->drives) EXPECT_EQ(drive.enableWrites, 0u);
+}
+
+TEST_F(ParallelHoming, CommunicationLossAbortsPeersAndDoesNotQueueAutomaticRetry)
+{
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    bus->drives.at(113).rejectAllReads = true;
+    MdNodeTestAccess::groupTick(*node);
+    expectGroupStopped();
+    bus->drives.at(113).rejectAllReads = false;
+    MdNodeTestAccess::feedback(*node);
+    expectGroupStopped();
+}
+
+TEST_F(ParallelHoming, ExplicitDisableOfOneMemberStopsWholeGroup)
+{
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    MdNodeTestAccess::explicitDisable(*node);
+    expectGroupStopped();
+}
+
+TEST_F(ParallelHoming, PartialEnableFailureStopsAlreadyEnabledPeers)
+{
+    bus->drives.at(113).rejectEnable = true;
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    EXPECT_EQ(bus->drives.at(111).enableWrites, 1u);
+    expectGroupStopped();
+}
+
+TEST_F(ParallelHoming, FailedReleaseDisableAbortsOtherActiveMotor)
+{
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    MdNodeTestAccess::queueGroupRelease(*node, 113);
+    bus->drives.at(113).rejectStateRead = true;
+    MdNodeTestAccess::pollDisable(*node);
+    expectGroupStopped();
+}
+
+TEST_F(ParallelHoming, PassiveReboundAtBarrierRequiresAnotherSettlingDwell)
+{
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    auto& drive = bus->drives.at(111);
+    drive.set(drive.schema.state, static_cast<u16>(64));
+    drive.set(drive.schema.mainEncoderPosition, .30f); // Drift from settled .25.
+    MdNodeTestAccess::stageBarrier(*node, 111);
+    bus->drives.at(113).set(bus->drives.at(113).schema.state, static_cast<u16>(64));
+    MdNodeTestAccess::stageBarrier(*node, 113);
+    MdNodeTestAccess::groupTick(*node);
+    ASSERT_TRUE(MdNodeTestAccess::groupActive(*node));
+    EXPECT_EQ(drive.state(), 64u);
+    EXPECT_EQ(drive.zeroWrites, 0u);
+    EXPECT_EQ(MdNodeTestAccess::homeJob(*node, 111).sequence.control.state, ImpedanceHome::State::Releasing);
+    EXPECT_FALSE(MdNodeTestAccess::acceptsMotion(*node, 111));
+    // The release deadline remains the original one, even after new rebound.
+    for (int i = 0; i < 140; ++i)
+    {
+        drive.set(drive.schema.mainEncoderPosition, i % 2 == 0 ? .30f : .32f);
+        MdNodeTestAccess::groupTick(*node);
+    }
+    ASSERT_TRUE(MdNodeTestAccess::groupActive(*node));
+    for (int i = 0; i < 20 && MdNodeTestAccess::groupActive(*node); ++i)
+    {
+        drive.set(drive.schema.mainEncoderPosition, i % 2 == 0 ? .30f : .32f);
+        MdNodeTestAccess::groupTick(*node);
+    }
+    expectGroupStopped();
+}
+
+TEST_F(ParallelHoming, GroupDeadlineStopsEveryMember)
+{
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    MdNodeTestAccess::expireGroup(*node);
+    expectGroupStopped();
+}
+
+TEST_F(ParallelHoming, UnevenDrivesWaitDisabledAtEveryPhaseAndKeepDistinctCalibration)
+{
+    ASSERT_TRUE(MdNodeTestAccess::startGroup(*node));
+    std::unordered_set<int> waitedPhases;
+    std::unordered_map<int, int> ticks;
+    for (int tick = 0; tick < 250 && MdNodeTestAccess::groupActive(*node); ++tick)
+    {
+        const auto phase = MdNodeTestAccess::homeJob(*node, 111).sequence.phase;
+        const auto phaseTicks = ++ticks[static_cast<int>(phase)];
+        for (u16 id : {111, 113})
+        {
+            auto& drive = bus->drives.at(id);
+            const auto& job = MdNodeTestAccess::homeJob(*node, id);
+            const auto position = phase == GripperHoming::Phase::Opening ? .25f :
+                                  phase == GripperHoming::Phase::Closing ? (id == 111 ? .65f : .85f) : .0f;
+            drive.set(drive.schema.mainEncoderPosition, position);
+            float effort = drive.state() == 39 ? drive.get(drive.schema.targetTorque) : 0.0f;
+            if (id == 113 && phaseTicks <= 8) effort = 0.0f; // Slower stop contact.
+            drive.set(drive.schema.motorTorque, effort);
+            if (job.waitingForGroup)
+            {
+                waitedPhases.insert(static_cast<int>(phase));
+                EXPECT_EQ(drive.state(), 64u);
+                EXPECT_FALSE(MdNodeTestAccess::acceptsMotion(*node, id));
+            }
+        }
+        MdNodeTestAccess::groupTick(*node);
+    }
+    EXPECT_FALSE(MdNodeTestAccess::groupActive(*node));
+    ASSERT_TRUE(MdNodeTestAccess::calibrated(*node, 111));
+    ASSERT_TRUE(MdNodeTestAccess::calibrated(*node, 113));
+    EXPECT_NEAR(MdNodeTestAccess::closedStop(*node, 111), .65, 1e-6);
+    EXPECT_NEAR(MdNodeTestAccess::closedStop(*node, 113), .85, 1e-6);
+    EXPECT_GE(waitedPhases.size(), 3u);
+    for (u16 id : {111, 113})
+    {
+        EXPECT_EQ(bus->drives.at(id).zeroWrites, 1u);
+        EXPECT_TRUE(MdNodeTestAccess::acceptsMotion(*node, id));
+        EXPECT_FLOAT_EQ(bus->drives.at(id).get(bus->drives.at(id).schema.targetTorque), 0.0f);
+    }
+}
+
 class MdNodeCallbacks : public ::testing::Test
 {
   protected:

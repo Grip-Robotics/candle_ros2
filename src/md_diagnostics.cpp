@@ -36,8 +36,8 @@ void MdNode::recordDiagnosticFeedback(mab::MD& md, bool valid, double logicalPos
     if (isHoming(md.m_canId))
     {
         sample.operation = 1;
-        sample.phase = static_cast<int>(m_homingJob->sequence.phase);
-        home = &m_homingJob->sequence.control;
+        sample.phase = static_cast<int>(m_homingJobs.at(md.m_canId).sequence.phase);
+        home = &m_homingJobs.at(md.m_canId).sequence.control;
         // Mechanical searches intentionally do not enforce learned travel.
         sample.travelMin = sample.travelMax = NAN;
         sample.travelLimitsEnabled = false;
@@ -80,8 +80,8 @@ void MdNode::captureDiagnosticFault(mab::MD& md, const std::string& reason)
     const ImpedanceHome* home = nullptr;
     if (isHoming(md.m_canId))
     {
-        home = &m_homingJob->sequence.control;
-        fault.phaseAtCapture = static_cast<int>(m_homingJob->sequence.phase);
+        home = &m_homingJobs.at(md.m_canId).sequence.control;
+        fault.phaseAtCapture = static_cast<int>(m_homingJobs.at(md.m_canId).sequence.phase);
     }
     else if (const auto closing = m_softCloseJobs.find(md.m_canId); closing != m_softCloseJobs.end())
     {
@@ -288,20 +288,24 @@ void MdNode::publishDiagnostics()
 {
     flushDiagnosticFaults();
     if (m_mds.empty() || m_diagnosticPollingDisabled || !m_pendingDisables.empty()) return;
-    if (m_homingJob)
+    if (!m_homingJobs.empty())
     {
-        // One bounded read per 200ms, for the active search only. Previously
-        // startup faults had no command/limit/protection snapshots at all.
+        // One bounded read globally per 200 ms, rotating across active searches.
         const auto now = std::chrono::steady_clock::now();
         if (now - m_lastDiagnosticRead < std::chrono::milliseconds(200)) return;
-        if (m_homingJob->sequence.control.state != ImpedanceHome::State::Searching) return;
-        m_lastDiagnosticRead = now;
-        auto md = findMd(m_mds, m_homingJob->id);
-        if (md == m_mds.end()) return;
-        const auto group = m_homingJob->diagnosticGroup++ % candle_ros2::DriveDiagnosticHistory::registerGroupCount;
-        auto record = readDiagnosticRegisters(*md, group, 0);
-        m_diagnostics[md->m_canId].registers[group] = record;
-        RCLCPP_INFO(get_logger(), "CANDLE_DIAG %s", record.c_str());
+        for (size_t i = 0; i < m_mds.size(); ++i)
+        {
+            auto& md = m_mds[m_diagnosticCursor++ % m_mds.size()];
+            auto job = m_homingJobs.find(md.m_canId);
+            if (job == m_homingJobs.end() || job->second.waitingForGroup ||
+                job->second.sequence.control.state != ImpedanceHome::State::Searching) continue;
+            m_lastDiagnosticRead = now;
+            const auto group = job->second.diagnosticGroup++ % candle_ros2::DriveDiagnosticHistory::registerGroupCount;
+            auto record = readDiagnosticRegisters(md, group, 0);
+            m_diagnostics[md.m_canId].registers[group] = record;
+            RCLCPP_INFO(get_logger(), "CANDLE_DIAG %s", record.c_str());
+            break;
+        }
         return;
     }
     if (!m_diagnosticStartupReady)
