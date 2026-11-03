@@ -66,10 +66,10 @@ class PositionTracker
         if (m_state != State::Tracking)
             return std::nullopt;
 
-        const double delta = std::remainder(rawPosition - m_lastRawPosition, m_wrapPeriodRad);
-        m_continuousPosition += delta;
+        // Powered readings already contain accumulated turns. Only recovery
+        // may change the calibration offset; sparse normal motion is not a wrap.
+        m_continuousPosition = rawPosition + m_rawOffset;
         m_lastRawPosition = rawPosition;
-        m_rawOffset       = m_continuousPosition - rawPosition;
         return m_continuousPosition;
     }
 
